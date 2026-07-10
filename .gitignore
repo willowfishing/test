@@ -1,0 +1,12 @@
+build/
+*.o
+*.a
+*.so
+.DS_Store
+__pycache__/
+*.pyc
+lex.yy.cpp~
+yacc.tab.cpp~
+yacc.tab.h~
+test_simple/
+write_*.py
