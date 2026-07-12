@@ -180,3 +180,15 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     }
     release_locks(lock_manager_, txn);
 }
+bool TransactionManager::check_write_write_conflict(Transaction *txn, const std::string &tab_name, const Rid &rid) {
+    for (auto &entry : txn_map) {
+        Transaction *other = entry.second;
+        if (other == nullptr || other == txn || other->get_state() != TransactionState::GROWING) continue;
+        auto write_set = other->get_write_set();
+        for (auto iter = write_set->rbegin(); iter != write_set->rend(); ++iter) {
+            WriteRecord *wr = *iter;
+            if (wr->GetTableName() == tab_name && wr->GetRid() == rid) return true;
+        }
+    }
+    return false;
+}

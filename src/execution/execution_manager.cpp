@@ -135,7 +135,6 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
                     } else {
                         context->txn_->set_isolation_level(IsolationLevel::SNAPSHOT);
                         txn_mgr_->set_concurrency_mode(static_cast<ConcurrencyMode>(2));
-                        txn_mgr_->capture_snapshot(context->txn_);
                     }
                 }
                 break;
