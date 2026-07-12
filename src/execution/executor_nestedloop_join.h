@@ -14,7 +14,6 @@ private:
     std::vector<Condition> fed_conds_;
     bool isend;
     std::unique_ptr<RmRecord> left_record_;
-    bool need_new_left;
 
 public:
     NestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left, std::unique_ptr<AbstractExecutor> right, 
@@ -30,7 +29,6 @@ public:
         cols_.insert(cols_.end(), right_cols.begin(), right_cols.end());
         isend = false;
         fed_conds_ = std::move(conds);
-        need_new_left = true;
     }
 
     size_t tupleLen() const override { return len_; }
@@ -39,71 +37,82 @@ public:
     void beginTuple() override {
         left_->beginTuple();
         right_->beginTuple();
-        need_new_left = true;
         isend = false;
+        // Get first left record
+        left_record_ = left_->Next();
+        if (left_record_ == nullptr) {
+            isend = true;
+            return;
+        }
+        right_->beginTuple();
     }
 
     void nextTuple() override {
-        if (need_new_left) {
-            left_->nextTuple();
-            left_record_ = left_->Next();
-            if (left_record_ == nullptr) {
-                isend = true;
-                return;
-            }
-            need_new_left = false;
-            right_->beginTuple();
-        }
+        // Try to advance right
         right_->nextTuple();
-        if (right_->is_end()) {
-            need_new_left = true;
-            if (!left_->is_end()) {
-                nextTuple();  // recurse to get next left
-            } else {
-                isend = true;
-            }
+        if (!right_->is_end()) return;  // still have right records
+        
+        // Right exhausted, advance left
+        left_->nextTuple();
+        left_record_ = left_->Next();
+        if (left_record_ == nullptr) {
+            isend = true;
+            return;
         }
+        right_->beginTuple();  // restart right scan
     }
 
     bool is_end() const override { return isend; }
 
     std::unique_ptr<RmRecord> Next() override {
-        if (isend) return nullptr;
-        auto left_rec = left_record_ ? std::make_unique<RmRecord>(left_->tupleLen()) : nullptr;
-        if (left_rec && left_record_) {
-            memcpy(left_rec->data, left_record_->data, left_->tupleLen());
-        }
+        if (isend || left_record_ == nullptr) return nullptr;
         auto right_rec = right_->Next();
         if (right_rec == nullptr) return nullptr;
         
         // Check join condition
-        bool match = true;
-        for (auto &cond : fed_conds_) {
-            auto lhs_col = get_col(cols_, cond.lhs_col);
-            auto rhs_col = get_col(cols_, cond.rhs_col);
-            char *lhs_data = nullptr;
-            char *rhs_data = nullptr;
-            if (lhs_col->tab_name == left_->cols()[0].tab_name) {
-                lhs_data = (left_rec ? left_rec->data : left_record_->data) + lhs_col->offset;
-            } else {
-                lhs_data = right_rec->data + lhs_col->offset - left_->tupleLen();
+        if (!fed_conds_.empty()) {
+            bool match = true;
+            for (auto &cond : fed_conds_) {
+                auto lhs_col = get_col(cols_, cond.lhs_col);
+                auto rhs_col = get_col(cols_, cond.rhs_col);
+                char *lhs_data = nullptr;
+                char *rhs_data = nullptr;
+                if (lhs_col->tab_name == left_->cols()[0].tab_name) {
+                    lhs_data = left_record_->data + lhs_col->offset;
+                } else {
+                    lhs_data = right_rec->data + rhs_col->offset - left_->tupleLen();
+                }
+                if (rhs_col->tab_name == left_->cols()[0].tab_name) {
+                    rhs_data = left_record_->data + rhs_col->offset;
+                } else {
+                    rhs_data = right_rec->data + rhs_col->offset - left_->tupleLen();
+                }
+                int cmp = 0;
+                if (lhs_col->type == TYPE_INT) {
+                    cmp = (*(int*)lhs_data > *(int*)rhs_data) - (*(int*)lhs_data < *(int*)rhs_data);
+                } else if (lhs_col->type == TYPE_FLOAT) {
+                    float lf = *(float*)lhs_data, rf = *(float*)rhs_data;
+                    cmp = (lf > rf) - (lf < rf);
+                } else {
+                    cmp = strncmp(lhs_data, rhs_data, std::min(lhs_col->len, rhs_col->len));
+                }
+                switch (cond.op) {
+                    case OP_EQ: match = (cmp == 0); break;
+                    case OP_NE: match = (cmp != 0); break;
+                    case OP_LT: match = (cmp < 0); break;
+                    case OP_GT: match = (cmp > 0); break;
+                    case OP_LE: match = (cmp <= 0); break;
+                    case OP_GE: match = (cmp >= 0); break;
+                }
+                if (!match) break;
             }
-            if (rhs_col->tab_name == left_->cols()[0].tab_name) {
-                rhs_data = (left_rec ? left_rec->data : left_record_->data) + rhs_col->offset;
-            } else {
-                rhs_data = right_rec->data + rhs_col->offset - left_->tupleLen();
-            }
-            int cmp = compare_col(lhs_data, rhs_data, lhs_col->type, lhs_col->len, rhs_col->len);
-            if (!check_compare(cmp, cond.op)) { match = false; break; }
+            if (!match) return nullptr;
         }
         
-        if (match) {
-            auto join_rec = std::make_unique<RmRecord>(len_);
-            memcpy(join_rec->data, left_record_->data, left_->tupleLen());
-            memcpy(join_rec->data + left_->tupleLen(), right_rec->data, right_->tupleLen());
-            return join_rec;
-        }
-        return nullptr;
+        auto join_rec = std::make_unique<RmRecord>(len_);
+        memcpy(join_rec->data, left_record_->data, left_->tupleLen());
+        memcpy(join_rec->data + left_->tupleLen(), right_rec->data, right_->tupleLen());
+        return join_rec;
     }
 
 private:
@@ -116,18 +125,6 @@ private:
             return (va > vb) - (va < vb);
         } else {
             return strncmp(a, b, std::min(len_a, len_b));
-        }
-    }
-    
-    static bool check_compare(int cmp, CompOp op) {
-        switch(op) {
-            case OP_EQ: return cmp == 0;
-            case OP_NE: return cmp != 0;
-            case OP_LT: return cmp < 0;
-            case OP_GT: return cmp > 0;
-            case OP_LE: return cmp <= 0;
-            case OP_GE: return cmp >= 0;
-            default: return false;
         }
     }
 
