@@ -53,7 +53,10 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
     if (page_handle.page_hdr->num_records == file_hdr_.num_records_per_page - 1) {
         release_page_handle(page_handle);
     }
+    int fd = page_handle.page->get_page_id().fd;
     buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+    // Force flush the data page to disk
+    buffer_pool_manager_->flush_all_pages(fd);
     disk_manager_->write_page(fd_, RM_FILE_HDR_PAGE, (char*)&file_hdr_, sizeof(file_hdr_));
 }
 
@@ -79,8 +82,7 @@ RmPageHandle RmFileHandle::fetch_page_handle(int page_no) const {
 }
 
 RmPageHandle RmFileHandle::create_new_page_handle() {
-    page_id_t new_page_no = file_hdr_.num_pages;
-    PageId page_id = {fd_, new_page_no};
+    PageId page_id = {fd_, INVALID_PAGE_ID};
     Page* page = buffer_pool_manager_->new_page(&page_id);
     if (page == nullptr) { throw InternalError("Failed to create new page"); }
     file_hdr_.num_pages++;
