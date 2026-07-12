@@ -74,6 +74,23 @@ void SmManager::show_tables(Context* context) {
     outfile.close();
 }
 
+
+void SmManager::show_index(const std::string& tab_name, Context* context) {
+    TabMeta &tab = db_.get_table(tab_name);
+    std::fstream outfile;
+    outfile.open("output.txt", std::ios::out | std::ios::app);
+    for (auto &index : tab.indexes) {
+        std::string cols_str = "(";
+        for (size_t i = 0; i < index.cols.size(); i++) {
+            if (i > 0) cols_str += ",";
+            cols_str += index.cols[i].name;
+        }
+        cols_str += ")";
+        outfile << "| " << tab_name << " | unique | " << cols_str << " |\n";
+    }
+    outfile.close();
+}
+
 void SmManager::desc_table(const std::string& tab_name, Context* context) {
     TabMeta &tab = db_.get_table(tab_name);
     std::vector<std::string> captions = {"Field", "Type", "Index"};
