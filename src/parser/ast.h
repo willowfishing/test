@@ -77,6 +77,11 @@ struct ColDef : public Field {
             col_name(std::move(col_name_)), type_len(std::move(type_len_)) {}
 };
 
+/* show index from tablename */
+struct ShowIndex : public TreeNode {
+    std::string tab_name;
+    ShowIndex(std::string tab_name_) : tab_name(std::move(tab_name_)) {}
+};
 struct CreateTable : public TreeNode {
     std::string tab_name;
     std::vector<std::shared_ptr<Field>> fields;
