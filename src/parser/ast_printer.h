@@ -79,6 +79,9 @@ private:
             std::cout << "HELP\n";
         } else if (auto x = std::dynamic_pointer_cast<ShowTables>(node)) {
             std::cout << "SHOW_TABLES\n";
+        } else if (auto x = std::dynamic_pointer_cast<ShowIndex>(node)) {
+            std::cout << "SHOW_INDEX\n";
+            print_val(x->tab_name, offset);
         } else if (auto x = std::dynamic_pointer_cast<CreateTable>(node)) {
             std::cout << "CREATE_TABLE\n";
             print_val(x->tab_name, offset);
@@ -149,6 +152,9 @@ private:
             print_node_list(x->cols, offset);
             print_val_list(x->tabs, offset);
             print_node_list(x->conds, offset);
+        } else if (auto x = std::dynamic_pointer_cast<ExplainStmt>(node)) {
+            std::cout << "EXPLAIN\n";
+            print_node(x->select, offset);
         } else if (auto x = std::dynamic_pointer_cast<TxnBegin>(node)) {
             std::cout << "BEGIN\n";
         } else if (auto x = std::dynamic_pointer_cast<TxnCommit>(node)) {

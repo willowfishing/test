@@ -57,7 +57,7 @@ class Optimizer {
             // rollback;
             return std::make_shared<OtherPlan>(T_Transaction_rollback, std::string());
         } else if (auto x = std::dynamic_pointer_cast<ast::SetTransactionIsolation>(query->parse)) {
-            return std::make_shared<OtherPlan>(T_SetTransactionIsolation, x->serializable ? "SERIALIZABLE" : "SNAPSHOT");
+            return std::make_shared<OtherPlan>(T_SetTransactionIsolation, std::string());
         } else if (auto x = std::dynamic_pointer_cast<ast::SetStmt>(query->parse)) {
             // Set Knob Plan
             return std::make_shared<SetKnobPlan>(x->set_knob_type_, x->bool_val_);
