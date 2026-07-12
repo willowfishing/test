@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "ix_defs.h"
 #include "transaction/transaction.h"
+#include <map>
 
 enum class Operation { FIND = 0, INSERT, DELETE };  // 三种操作：查找、插入、删除
 
@@ -168,12 +169,27 @@ class IxIndexHandle {
     int fd_;                                    // 存储B+树的文件
     IxFileHdr* file_hdr_;                       // 存了root_page，但其初始化为2（第0页存FILE_HDR_PAGE，第1页存LEAF_HEADER_PAGE）
     std::mutex root_latch_;
+    std::map<std::string, Rid> entries_;
 
    public:
     IxIndexHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, int fd);
 
+    void flush() {
+        char *data = new char[file_hdr_->tot_len_];
+        file_hdr_->serialize(data);
+        disk_manager_->write_page(fd_, IX_FILE_HDR_PAGE, data, file_hdr_->tot_len_);
+        delete[] data;
+        buffer_pool_manager_->flush_all_pages(fd_);
+    }
+
     // for search
     bool get_value(const char *key, std::vector<Rid> *result, Transaction *transaction);
+
+    void get_all_rids(std::vector<Rid> *result) const {
+        for (const auto &entry : entries_) {
+            result->push_back(entry.second);
+        }
+    }
 
     std::pair<IxNodeHandle *, bool> find_leaf_page(const char *key, Operation operation, Transaction *transaction,
                                                  bool find_first = false);
