@@ -1,0 +1,8 @@
+failure
+failure
+failure
+| order_id | amount | region |
+| 2 | 230.000000 | Shanghai |
+| 1 | 150.000000 | Beijing |
+| 4 | 120.000000 | Shenzhen |
+| 3 | 89.989998 | Guangzhou |

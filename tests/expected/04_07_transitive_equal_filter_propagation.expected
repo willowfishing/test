@@ -1,0 +1,14 @@
+| name | name |
+| a2 | c2 |
+Project(columns=[a.name, c.name], rows=1)
+	Join(tables=[a76, b76, c76], condition=[b.k=c.k], rows=1)
+		Join(tables=[a76, b76], condition=[a.id=b.k], rows=1)
+			Project(columns=[a.id, a.name], rows=1)
+				Filter(condition=[a.id=2], rows=1)
+					Scan(table=a76, type=SeqScan, rows=3)
+			Project(columns=[b.k], rows=1)
+				Filter(condition=[b.k=2], rows=1)
+					Scan(table=b76, type=SeqScan, rows=3)
+		Project(columns=[c.k, c.name], rows=1)
+			Filter(condition=[c.k=2], rows=1)
+				Scan(table=c76, type=SeqScan, rows=3)

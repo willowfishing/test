@@ -1,0 +1,14 @@
+| id | id |
+| 1 | 101 |
+| 2 | 103 |
+Project(columns=[a.id, b.id], rows=2)
+	Join(tables=[a, b], condition=[a.k=b.k], rows=2)
+		Project(columns=[a.id, a.k], rows=2)
+			Filter(condition=[a.v>4], rows=2)
+				Scan(table=a, type=SeqScan, rows=3)
+		Project(columns=[b.id, b.k], rows=4)
+			Filter(condition=[b.v>5], rows=4)
+				Scan(table=b, type=SeqScan, rows=6)
+Project(columns=[a.id, a.k], rows=2)
+	Filter(condition=[a.id>1, a.v>1], rows=2)
+		Scan(table=a, type=SeqScan, rows=3)

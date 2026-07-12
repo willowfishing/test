@@ -1,0 +1,12 @@
+create table l472 (id int, name char(8));
+create table r472 (id int, keep int, val char(8));
+insert into l472 values (1, 'b1');
+insert into l472 values (2, 'b2');
+insert into l472 values (3, 'b3');
+insert into r472 values (1, 0, 'y1');
+insert into r472 values (2, 1, 'y2');
+insert into r472 values (3, 0, 'y3');
+select l.name, r.val from l472 l join r472 r on r.id = l.id where r.keep = 1;
+explain analyze select l.name, r.val from l472 l join r472 r on r.id = l.id where r.keep = 1;
+drop table r472;
+drop table l472;

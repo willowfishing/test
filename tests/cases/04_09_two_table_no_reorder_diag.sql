@@ -1,0 +1,12 @@
+create table left267 (id int, flag int, name char(8));
+create table right267 (id int, value int);
+insert into left267 values (1, 0, 'a');
+insert into left267 values (2, 0, 'b');
+insert into left267 values (3, 1, 'c');
+insert into right267 values (1, 10);
+insert into right267 values (2, 20);
+insert into right267 values (3, 30);
+select l.name, r.value from right267 r join left267 l on r.id = l.id where l.flag = 1;
+explain analyze select l.name, r.value from right267 r join left267 l on r.id = l.id where l.flag = 1;
+drop table right267;
+drop table left267;

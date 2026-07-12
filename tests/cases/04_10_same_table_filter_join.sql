@@ -1,0 +1,10 @@
+create table a368 (id int, x int, y int, name char(8));
+create table b368 (aid int, tag char(8));
+insert into a368 values (1, 5, 7, 'a1');
+insert into a368 values (2, 9, 4, 'a2');
+insert into b368 values (1, 'b1');
+insert into b368 values (2, 'b2');
+select a.name, b.tag from a368 a join b368 b on a.id = b.aid where a.x < a.y;
+explain analyze select a.name, b.tag from a368 a join b368 b on a.id = b.aid where a.x < a.y;
+drop table b368;
+drop table a368;

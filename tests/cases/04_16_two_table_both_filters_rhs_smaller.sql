@@ -1,0 +1,14 @@
+create table l474 (id int, flag int, name char(8));
+create table r474 (id int, keep int, val char(8));
+insert into l474 values (1, 1, 'd1');
+insert into l474 values (2, 1, 'd2');
+insert into l474 values (3, 1, 'd3');
+insert into l474 values (4, 0, 'd4');
+insert into r474 values (1, 0, 'w1');
+insert into r474 values (2, 0, 'w2');
+insert into r474 values (3, 1, 'w3');
+insert into r474 values (4, 0, 'w4');
+select l.name, r.val from l474 l join r474 r on l.id = r.id where l.flag = 1 and r.keep = 1;
+explain analyze select l.name, r.val from l474 l join r474 r on l.id = r.id where l.flag = 1 and r.keep = 1;
+drop table r474;
+drop table l474;

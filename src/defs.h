@@ -39,6 +39,13 @@ struct Rid {
     friend bool operator!=(const Rid &x, const Rid &y) { return !(x == y); }
 };
 
+template <>
+struct std::hash<Rid> {
+    size_t operator()(const Rid &r) const {
+        return (static_cast<size_t>(r.page_no) << 16) ^ static_cast<size_t>(r.slot_no);
+    }
+};
+
 enum ColType {
     TYPE_INT, TYPE_FLOAT, TYPE_STRING
 };

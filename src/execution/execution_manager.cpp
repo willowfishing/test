@@ -127,15 +127,46 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
             }
             case T_SetTransactionIsolation:
             {
-                auto iso_stmt = std::dynamic_pointer_cast<ast::SetTransactionIsolation>(x);
-                if (iso_stmt != nullptr && context->txn_ != nullptr) {
-                    if (iso_stmt->serializable) {
-                        context->txn_->set_isolation_level(IsolationLevel::SERIALIZABLE);
-                        txn_mgr_->set_concurrency_mode(static_cast<ConcurrencyMode>(0));
-                    } else {
-                        context->txn_->set_isolation_level(IsolationLevel::SNAPSHOT);
-                        txn_mgr_->set_concurrency_mode(static_cast<ConcurrencyMode>(2));
+                auto x = std::dynamic_pointer_cast<OtherPlan>(plan);
+                IsolationLevel level = x->set_txn_isolation_serializable_
+                                           ? IsolationLevel::SERIALIZABLE
+                                           : IsolationLevel::SNAPSHOT_ISOLATION;
+                context->set_isolation_level(level);
+                // Also switch txn_mgr to MVCC mode for SI/SER isolation levels
+                if (level == IsolationLevel::SNAPSHOT_ISOLATION ||
+                    level == IsolationLevel::SERIALIZABLE) {
+                    txn_mgr_->set_concurrency_mode(ConcurrencyMode::MVCC);
+                }
+                break;
+            }
+            case T_StaticCheckpoint:
+            {
+                // Flush log buffer to disk
+                if (log_manager_ != nullptr) {
+                    log_manager_->flush_log_to_disk();
+                }
+                // Flush all dirty pages for all tables and indexes
+                for (auto &entry : sm_manager_->fhs_) {
+                    entry.second->flush();
+                }
+                for (auto &entry : sm_manager_->ihs_) {
+                    entry.second->flush();
+                }
+                // Write restart file with current log file size
+                {
+                    auto *dm = sm_manager_->get_disk_manager();
+                    const std::string restart_file = "db.restart";
+                    int log_file_size = 0;
+                    if (dm->is_file(LOG_FILE_NAME)) {
+                        log_file_size = dm->get_file_size(LOG_FILE_NAME);
                     }
+                    if (dm->is_file(restart_file)) {
+                        dm->destroy_file(restart_file);
+                    }
+                    dm->create_file(restart_file);
+                    int fd = dm->get_file_fd(restart_file);
+                    dm->write_page(fd, 0, reinterpret_cast<const char*>(&log_file_size), sizeof(int));
+                    dm->close_file(fd);
                 }
                 break;
             }

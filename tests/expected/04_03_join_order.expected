@@ -1,0 +1,12 @@
+| name | order_id |
+| Alice | 101 |
+| Alice | 102 |
+| Bob | 103 |
+| Bob | 104 |
+| Carol | 105 |
+Project(columns=[c.name, o.order_id], rows=5)
+	Join(tables=[customers, orders], condition=[c.customer_id=o.customer_id], rows=5)
+		Project(columns=[c.customer_id, c.name], rows=3)
+			Scan(table=customers, type=SeqScan, rows=3)
+		Project(columns=[o.customer_id, o.order_id], rows=15)
+			Scan(table=orders, type=SeqScan, rows=15)

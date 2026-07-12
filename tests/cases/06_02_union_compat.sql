@@ -1,0 +1,10 @@
+create table orders1 (order_id int, amount int, region char(10));
+create table orders2 (order_id int, amount float, region char(20));
+insert into orders1 values (1, 150, 'Beijing');
+insert into orders1 values (2, 230, 'Shanghai');
+insert into orders2 values (3, 89.99, 'Guangzhou');
+insert into orders2 values (4, 120.0, 'Shenzhen');
+select * from (select amount from orders1 union select * from orders2) as all_orders;
+select * from (select amount from orders1 union select region from orders2) as all_orders;
+select * from (select amount from orders1 union select amount from orders2) as all_orders order by order_id asc;
+select * from (select * from orders1 union select * from orders2) as all_orders order by amount desc, order_id asc;

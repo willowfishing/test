@@ -1,0 +1,12 @@
+create table orders1 (order_id int, amount float, region char(10));
+create table orders2 (order_id int, amount float, region char(10));
+create table orders3 (order_id int, amount float, region char(10));
+insert into orders1 values (1, 150.0, 'Beijing');
+insert into orders1 values (2, 230.5, 'Shanghai');
+insert into orders1 values (3, 89.99, 'Guangzhou');
+insert into orders2 values (1, 150.0, 'Beijing');
+insert into orders2 values (4, 120.0, 'Shenzhen');
+insert into orders2 values (5, 560.0, 'Chengdu');
+insert into orders3 values (1, 150.0, 'Beijing');
+insert into orders3 values (6, 199.99, 'Wuhan');
+select * from (select * from orders1 union select * from orders2 union select * from orders3) as all_orders order by amount desc;

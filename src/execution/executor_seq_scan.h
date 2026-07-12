@@ -19,20 +19,19 @@ See the Mulan PSL v2 for more details. */
 
 class SeqScanExecutor : public AbstractExecutor {
    private:
-    std::string tab_name_;              // 表的名称
-    std::vector<Condition> conds_;      // scan的条件
-    RmFileHandle *fh_;                  // 表的数据文件句柄
-    std::vector<ColMeta> cols_;         // scan后生成的记录的字段
-    size_t len_;                        // scan后生成的每条记录的长度
-    std::vector<Condition> fed_conds_;  // 同conds_，两个字段相同
-
+    std::string tab_name_;
+    std::vector<Condition> conds_;
+    RmFileHandle *fh_;
+    std::vector<ColMeta> cols_;
+    size_t len_;
+    std::vector<Condition> fed_conds_;
     Rid rid_;
-    std::unique_ptr<RecScan> scan_;     // table_iterator
+    std::unique_ptr<RecScan> scan_;
     bool use_snapshot_ = false;
     Transaction::SnapshotRecords snapshot_records_;
     size_t snapshot_cursor_ = 0;
-
     SmManager *sm_manager_;
+    bool predicate_saved_ = false;
 
    public:
     SeqScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, Context *context,
@@ -48,13 +47,18 @@ class SeqScanExecutor : public AbstractExecutor {
             col.tab_name = visible;
         }
         len_ = cols_.back().offset + cols_.back().len;
-
         context_ = context;
-
         fed_conds_ = conds_;
     }
 
     void beginTuple() override {
+        // SSI predicate read saved once per scan start
+        if (!predicate_saved_ && context_ != nullptr && context_->txn_ != nullptr &&
+            context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+            context_->txn_->add_predicate_read(tab_name_, fed_conds_);
+            predicate_saved_ = true;
+        }
+
         const auto *snapshot = context_ != nullptr && context_->txn_ != nullptr
                                    ? context_->txn_->get_snapshot_records(tab_name_)
                                    : nullptr;
@@ -65,6 +69,9 @@ class SeqScanExecutor : public AbstractExecutor {
             while (snapshot_cursor_ < snapshot_records_.size()) {
                 rid_ = snapshot_records_[snapshot_cursor_].first;
                 if (eval_conds(cols_, &snapshot_records_[snapshot_cursor_].second, fed_conds_)) {
+                    if (context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+                        context_->txn_->add_read_record(tab_name_, rid_);
+                    }
                     return;
                 }
                 snapshot_cursor_++;
@@ -77,6 +84,10 @@ class SeqScanExecutor : public AbstractExecutor {
             rid_ = scan_->rid();
             auto rec = fh_->get_record(rid_, context_);
             if (eval_conds(cols_, rec.get(), fed_conds_)) {
+                if (context_ != nullptr && context_->txn_ != nullptr &&
+                    context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+                    context_->txn_->add_read_record(tab_name_, rid_);
+                }
                 return;
             }
             scan_->next();
@@ -85,26 +96,29 @@ class SeqScanExecutor : public AbstractExecutor {
 
     void nextTuple() override {
         if (use_snapshot_) {
-            if (snapshot_cursor_ < snapshot_records_.size()) {
-                snapshot_cursor_++;
-            }
+            if (snapshot_cursor_ < snapshot_records_.size()) snapshot_cursor_++;
             while (snapshot_cursor_ < snapshot_records_.size()) {
                 rid_ = snapshot_records_[snapshot_cursor_].first;
                 if (eval_conds(cols_, &snapshot_records_[snapshot_cursor_].second, fed_conds_)) {
+                    if (context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+                        context_->txn_->add_read_record(tab_name_, rid_);
+                    }
                     return;
                 }
                 snapshot_cursor_++;
             }
             return;
         }
-        if (scan_ == nullptr || scan_->is_end()) {
-            return;
-        }
+        if (scan_ == nullptr || scan_->is_end()) return;
         scan_->next();
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
             auto rec = fh_->get_record(rid_, context_);
             if (eval_conds(cols_, rec.get(), fed_conds_)) {
+                if (context_ != nullptr && context_->txn_ != nullptr &&
+                    context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+                    context_->txn_->add_read_record(tab_name_, rid_);
+                }
                 return;
             }
             scan_->next();

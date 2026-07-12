@@ -1,0 +1,17 @@
+create table a76 (id int, name char(8));
+create table b76 (k int);
+create table c76 (k int, name char(8));
+insert into a76 values (1, 'a1');
+insert into a76 values (2, 'a2');
+insert into a76 values (3, 'a3');
+insert into b76 values (1);
+insert into b76 values (2);
+insert into b76 values (3);
+insert into c76 values (1, 'c1');
+insert into c76 values (2, 'c2');
+insert into c76 values (3, 'c3');
+select a.name, c.name from a76 a join b76 b on a.id = b.k join c76 c on b.k = c.k where a.id = 2;
+explain analyze select a.name, c.name from a76 a join b76 b on a.id = b.k join c76 c on b.k = c.k where a.id = 2;
+drop table c76;
+drop table b76;
+drop table a76;

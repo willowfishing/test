@@ -38,6 +38,7 @@ class UpdateExecutor : public AbstractExecutor {
         rids_ = rids;
         context_ = context;
     }
+
     std::unique_ptr<RmRecord> Next() override {
         std::vector<std::unique_ptr<RmRecord>> new_records;
         new_records.reserve(rids_.size());
@@ -46,7 +47,10 @@ class UpdateExecutor : public AbstractExecutor {
                 !context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd())) {
                 throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
             }
-            auto rec = fh_->get_record(rid, context_);
+
+            // Read the current record. If deleted by another committed txn, it's a write-write conflict.
+            auto rec = GetRecordWithConflictCheck(rid, context_);
+
             auto new_rec = std::make_unique<RmRecord>(*rec);
             for (auto &set_clause : set_clauses_) {
                 auto col = tab_.get_col(set_clause.lhs.col_name);
@@ -82,12 +86,20 @@ class UpdateExecutor : public AbstractExecutor {
         }
 
         for (size_t rec_idx = 0; rec_idx < rids_.size(); ++rec_idx) {
-            auto old_rec = fh_->get_record(rids_[rec_idx], context_);
+            auto old_rec = GetRecordWithConflictCheck(rids_[rec_idx], context_);
+
+            // SSI: check rw-dependency before write (only for SERIALIZABLE)
+            if (context_ != nullptr && context_->txn_ != nullptr && context_->txn_mgr_ != nullptr &&
+                context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+                context_->txn_mgr_->CheckSSIRWDependency(context_->txn_, tab_name_, rids_[rec_idx]);
+            }
+
             if (context_ != nullptr && context_->txn_ != nullptr) {
                 context_->txn_->append_write_record(
                     new WriteRecord(WType::UPDATE_TUPLE, tab_name_, rids_[rec_idx], *old_rec));
                 context_->txn_->upsert_snapshot_record(tab_name_, rids_[rec_idx], *new_records[rec_idx]);
             }
+
             for (auto &index : tab_.indexes) {
                 auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
                 std::unique_ptr<char[]> old_key(new char[index.col_tot_len]);
@@ -106,5 +118,23 @@ class UpdateExecutor : public AbstractExecutor {
         return nullptr;
     }
 
+   private:
+    // Helper: get record with write-write conflict detection
+    std::unique_ptr<RmRecord> GetRecordWithConflictCheck(const Rid &rid, Context *context) {
+        try {
+            return fh_->get_record(rid, context);
+        } catch (RMDBError &e) {
+            if (context != nullptr && context->txn_ != nullptr &&
+                (context->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION ||
+                 context->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE)) {
+                throw TransactionAbortException(
+                    context->txn_->get_transaction_id(),
+                    AbortReason::WRITE_CONFLICT);
+            }
+            throw;
+        }
+    }
+
+   public:
     Rid &rid() override { return _abstract_rid; }
 };

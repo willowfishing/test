@@ -1,0 +1,9 @@
+| name | val |
+| c3 | z3 |
+Project(columns=[l.name, r.val], rows=1)
+	Join(tables=[l473, r473], condition=[l.id=r.id], rows=1)
+		Project(columns=[l.id, l.name], rows=3)
+			Scan(table=l473, type=SeqScan, rows=3)
+		Project(columns=[r.id, r.val], rows=3)
+			Filter(condition=[r.keep=1], rows=3)
+				Scan(table=r473, type=SeqScan, rows=9)

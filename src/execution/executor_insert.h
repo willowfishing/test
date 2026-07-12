@@ -17,11 +17,11 @@ See the Mulan PSL v2 for more details. */
 
 class InsertExecutor : public AbstractExecutor {
    private:
-    TabMeta tab_;                   // 表的元数据
-    std::vector<Value> values_;     // 需要插入的数据
-    RmFileHandle *fh_;              // 表的数据文件句柄
-    std::string tab_name_;          // 表名称
-    Rid rid_;                       // 插入的位置，由于系统默认插入时不指定位置，因此当前rid_在插入后才赋值
+    TabMeta tab_;
+    std::vector<Value> values_;
+    RmFileHandle *fh_;
+    std::string tab_name_;
+    Rid rid_;
     SmManager *sm_manager_;
 
    public:
@@ -38,7 +38,6 @@ class InsertExecutor : public AbstractExecutor {
     };
 
     std::unique_ptr<RmRecord> Next() override {
-        // Make record buffer
         RmRecord rec(fh_->get_file_hdr().record_size);
         for (size_t i = 0; i < values_.size(); i++) {
             auto &col = tab_.cols[i];
@@ -64,22 +63,25 @@ class InsertExecutor : public AbstractExecutor {
                 throw RMDBError("Duplicate key");
             }
         }
-        // Insert into record file
         rid_ = fh_->insert_record(rec.data, context_);
         if (context_ != nullptr && context_->txn_ != nullptr) {
             context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, rid_));
             context_->txn_->upsert_snapshot_record(tab_name_, rid_, rec);
+
+            // SSI: check rw-dependency for SERIALIZABLE
+            if (context_->txn_mgr_ != nullptr &&
+                context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+                context_->txn_mgr_->CheckSSIRWDependency(context_->txn_, tab_name_, rid_);
+            }
         }
-        
-        // Insert into index
-        for(size_t i = 0; i < tab_.indexes.size(); ++i) {
-            auto& index = tab_.indexes[i];
+        for (size_t i = 0; i < tab_.indexes.size(); ++i) {
+            auto &index = tab_.indexes[i];
             auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
             std::unique_ptr<char[]> key(new char[index.col_tot_len]);
             int offset = 0;
-            for(size_t i = 0; i < index.col_num; ++i) {
-                memcpy(key.get() + offset, rec.data + index.cols[i].offset, index.cols[i].len);
-                offset += index.cols[i].len;
+            for (size_t j = 0; j < index.col_num; ++j) {
+                memcpy(key.get() + offset, rec.data + index.cols[j].offset, index.cols[j].len);
+                offset += index.cols[j].len;
             }
             ih->insert_entry(key.get(), rid_, context_->txn_);
         }

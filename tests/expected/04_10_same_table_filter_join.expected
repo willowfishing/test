@@ -1,0 +1,9 @@
+| name | tag |
+| a1 | b1 |
+Project(columns=[a.name, b.tag], rows=1)
+	Join(tables=[a368, b368], condition=[a.id=b.aid], rows=1)
+		Project(columns=[a.id, a.name], rows=1)
+			Filter(condition=[a.x<a.y], rows=1)
+				Scan(table=a368, type=SeqScan, rows=2)
+		Project(columns=[b.aid, b.tag], rows=2)
+			Scan(table=b368, type=SeqScan, rows=2)

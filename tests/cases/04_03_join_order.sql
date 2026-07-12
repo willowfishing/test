@@ -1,0 +1,14 @@
+create table orders (order_id int, customer_id int, order_date char(40), total_amount float);
+create table customers (customer_id int, name char(50), email char(100), address char(200));
+insert into customers values (1, 'Alice', 'alice@example.com', 'A Street');
+insert into customers values (2, 'Bob', 'bob@example.com', 'B Street');
+insert into customers values (3, 'Carol', 'carol@example.com', 'C Street');
+insert into orders values (101, 1, '2025-01-01', 500.0);
+insert into orders values (102, 1, '2025-01-02', 1200.0);
+insert into orders values (103, 2, '2025-01-03', 900.0);
+insert into orders values (104, 2, '2025-01-04', 1500.0);
+insert into orders values (105, 3, '2025-01-05', 700.0);
+select c.name, o.order_id from customers c join orders o on c.customer_id = o.customer_id;
+explain analyze select c.name, o.order_id from customers c join orders o on c.customer_id = o.customer_id;
+drop table orders;
+drop table customers;

@@ -17,11 +17,11 @@ See the Mulan PSL v2 for more details. */
 
 class DeleteExecutor : public AbstractExecutor {
    private:
-    TabMeta tab_;                   // 表的元数据
-    std::vector<Condition> conds_;  // delete的条件
-    RmFileHandle *fh_;              // 表的数据文件句柄
-    std::vector<Rid> rids_;         // 需要删除的记录的位置
-    std::string tab_name_;          // 表名称
+    TabMeta tab_;
+    std::vector<Condition> conds_;
+    RmFileHandle *fh_;
+    std::vector<Rid> rids_;
+    std::string tab_name_;
     SmManager *sm_manager_;
 
    public:
@@ -42,12 +42,35 @@ class DeleteExecutor : public AbstractExecutor {
                 !context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd())) {
                 throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
             }
-            auto rec = fh_->get_record(rid, context_);
+
+            // Try to read the record. If it was deleted by another committed txn,
+            // this is a write-write conflict for SI/SER isolation.
+            std::unique_ptr<RmRecord> rec;
+            try {
+                rec = fh_->get_record(rid, context_);
+            } catch (RMDBError &e) {
+                if (context_ != nullptr && context_->txn_ != nullptr &&
+                    (context_->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION ||
+                     context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE)) {
+                    throw TransactionAbortException(
+                        context_->txn_->get_transaction_id(),
+                        AbortReason::WRITE_CONFLICT);
+                }
+                throw;
+            }
+
             if (context_ != nullptr && context_->txn_ != nullptr) {
                 context_->txn_->append_write_record(
                     new WriteRecord(WType::DELETE_TUPLE, tab_name_, rid, *rec));
                 context_->txn_->remove_snapshot_record(tab_name_, rid);
+
+                // SSI: check rw-dependency for SERIALIZABLE mode
+                if (context_->txn_mgr_ != nullptr &&
+                    context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+                    context_->txn_mgr_->CheckSSIRWDependency(context_->txn_, tab_name_, rid);
+                }
             }
+
             for (auto &index : tab_.indexes) {
                 auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
                 std::unique_ptr<char[]> key(new char[index.col_tot_len]);

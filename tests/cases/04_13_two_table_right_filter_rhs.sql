@@ -1,0 +1,14 @@
+create table l471 (id int, name char(8));
+create table r471 (id int, keep int, val char(8));
+insert into l471 values (1, 'a1');
+insert into l471 values (2, 'a2');
+insert into l471 values (3, 'a3');
+insert into l471 values (4, 'a4');
+insert into r471 values (1, 0, 'x1');
+insert into r471 values (2, 0, 'x2');
+insert into r471 values (3, 1, 'x3');
+insert into r471 values (4, 0, 'x4');
+select l.name, r.val from l471 l join r471 r on l.id = r.id where r.keep = 1;
+explain analyze select l.name, r.val from l471 l join r471 r on l.id = r.id where r.keep = 1;
+drop table r471;
+drop table l471;

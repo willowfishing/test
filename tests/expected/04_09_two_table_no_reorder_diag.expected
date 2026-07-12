@@ -1,0 +1,9 @@
+| name | value |
+| c | 30 |
+Project(columns=[l.name, r.value], rows=1)
+	Join(tables=[left267, right267], condition=[r.id=l.id], rows=1)
+		Project(columns=[r.id, r.value], rows=3)
+			Scan(table=right267, type=SeqScan, rows=3)
+		Project(columns=[l.id, l.name], rows=3)
+			Filter(condition=[l.flag=1], rows=3)
+				Scan(table=left267, type=SeqScan, rows=9)

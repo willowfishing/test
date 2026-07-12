@@ -1,0 +1,4 @@
+| id |
+| 1 |
+Project(columns=[t266.id], rows=1)
+	Scan(table=t266, type=SeqScan, rows=3)

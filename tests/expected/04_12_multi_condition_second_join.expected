@@ -1,0 +1,12 @@
+| id |
+| 1 |
+| 2 |
+Project(columns=[a.id], rows=2)
+	Join(tables=[a770, b770, c770], condition=[a.x=c.z, b.id=c.id], rows=2)
+		Join(tables=[a770, b770], condition=[a.id=b.id], rows=2)
+			Project(columns=[a.id, a.x], rows=2)
+				Scan(table=a770, type=SeqScan, rows=2)
+			Project(columns=[b.id], rows=4)
+				Scan(table=b770, type=SeqScan, rows=4)
+		Project(columns=[c.id, c.z], rows=4)
+			Scan(table=c770, type=SeqScan, rows=4)

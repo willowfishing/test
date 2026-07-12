@@ -1,0 +1,12 @@
+create table l473 (id int, name char(8));
+create table r473 (id int, keep int, val char(8));
+insert into l473 values (1, 'c1');
+insert into l473 values (2, 'c2');
+insert into l473 values (3, 'c3');
+insert into r473 values (1, 0, 'z1');
+insert into r473 values (2, 0, 'z2');
+insert into r473 values (3, 1, 'z3');
+select l.name, r.val from l473 l, r473 r where l.id = r.id and r.keep = 1;
+explain analyze select l.name, r.val from l473 l, r473 r where l.id = r.id and r.keep = 1;
+drop table r473;
+drop table l473;

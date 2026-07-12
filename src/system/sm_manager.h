@@ -50,7 +50,9 @@ class SmManager {
 
     RmManager* get_rm_manager() { return rm_manager_; }  
 
-    IxManager* get_ix_manager() { return ix_manager_; }  
+    IxManager* get_ix_manager() { return ix_manager_; }
+
+    DiskManager* get_disk_manager() { return disk_manager_; }  
 
     bool is_dir(const std::string& db_name);
 

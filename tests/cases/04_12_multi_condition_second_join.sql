@@ -1,0 +1,14 @@
+create table a770 (id int, x int);
+create table b770 (id int, y int);
+create table c770 (id int, z int);
+insert into a770 values (1, 5);
+insert into a770 values (2, 8);
+insert into b770 values (1, 5);
+insert into b770 values (2, 9);
+insert into c770 values (1, 5);
+insert into c770 values (2, 8);
+select a.id from a770 a join b770 b on a.id = b.id join c770 c on b.id = c.id where a.x = c.z;
+explain analyze select a.id from a770 a join b770 b on a.id = b.id join c770 c on b.id = c.id where a.x = c.z;
+drop table c770;
+drop table b770;
+drop table a770;

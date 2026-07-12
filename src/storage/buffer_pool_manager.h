@@ -23,6 +23,9 @@ See the Mulan PSL v2 for more details. */
 #include "replacer/lru_replacer.h"
 #include "replacer/replacer.h"
 
+// Forward declaration for WAL
+class LogManager;
+
 class BufferPoolManager {
    private:
     size_t pool_size_;      // buffer_pool中可容纳页面的个数，即帧的个数

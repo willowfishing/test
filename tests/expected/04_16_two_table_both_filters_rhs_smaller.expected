@@ -1,0 +1,10 @@
+| name | val |
+| d3 | w3 |
+Project(columns=[l.name, r.val], rows=1)
+	Join(tables=[l474, r474], condition=[l.id=r.id], rows=1)
+		Project(columns=[l.id, l.name], rows=3)
+			Filter(condition=[l.flag=1], rows=3)
+				Scan(table=l474, type=SeqScan, rows=4)
+		Project(columns=[r.id, r.val], rows=3)
+			Filter(condition=[r.keep=1], rows=3)
+				Scan(table=r474, type=SeqScan, rows=12)

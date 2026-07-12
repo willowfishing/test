@@ -1,0 +1,11 @@
+create table a (id int, k int, v int);
+create table b (id int, k int, v int);
+insert into a values (1, 10, 5);
+insert into a values (2, 20, 9);
+insert into a values (3, 30, 2);
+insert into b values (101, 10, 7);
+insert into b values (102, 20, 3);
+insert into b values (103, 20, 8);
+select a.id, b.id from a join b on a.k = b.k where b.v > 5 and a.v > 4;
+explain analyze select a.id, b.id from a join b on a.k = b.k where b.v > 5 and a.v > 4;
+explain analyze select a.id, a.k from a where a.v > 1 and a.id > 1;

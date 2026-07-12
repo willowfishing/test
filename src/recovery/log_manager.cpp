@@ -9,36 +9,43 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include <cstring>
+#include <unistd.h>
 #include "log_manager.h"
 
-/**
- * @description: 添加日志记录到日志缓冲区中，并返回日志记录号
- * @param {LogRecord*} log_record 要写入缓冲区的日志记录
- * @return {lsn_t} 返回该日志的日志记录号
- */
 lsn_t LogManager::add_log_to_buffer(LogRecord* log_record) {
-    std::unique_lock<std::mutex> lock(latch_);
-    lsn_t lsn = global_lsn_++;
+    std::scoped_lock lock(latch_);
+
+    // Assign LSN
+    lsn_t lsn = global_lsn_.fetch_add(1);
     log_record->lsn_ = lsn;
-    char *dest = log_buffer_.buffer_ + log_buffer_.offset_;
-    log_record->serialize(dest);
+
+    // Flush if buffer would overflow
+    if (log_buffer_.is_full(log_record->log_tot_len_)) {
+        flush_log_to_disk_unlocked();
+    }
+
+    // Serialize directly to buffer
+    log_record->serialize(log_buffer_.buffer_ + log_buffer_.offset_);
     log_buffer_.offset_ += log_record->log_tot_len_;
-    if (log_buffer_.offset_ > LOG_BUFFER_SIZE - 4096) flush_log_to_disk();
+
     return lsn;
 }
 
-/**
- * @description: 把日志缓冲区的内容刷到磁盘中，由于目前只设置了一个缓冲区，因此需要阻塞其他日志操作
- */
-void LogManager::flush_log_to_disk() {
+void LogManager::flush_log_to_disk_unlocked() {
     if (log_buffer_.offset_ == 0) return;
-    int fd = disk_manager_->open_file(LOG_FILE_NAME);
-    if (fd < 0) return;
-    off_t file_size = lseek(fd, 0, SEEK_END);
-    if (file_size < 0) { disk_manager_->close_file(fd); return; }
-    ssize_t written = write(fd, log_buffer_.buffer_, log_buffer_.offset_);
-    if (written > 0) { persist_lsn_ = global_lsn_ - 1; }
-    memset(log_buffer_.buffer_, 0, LOG_BUFFER_SIZE);
+
+    disk_manager_->write_log(log_buffer_.buffer_, log_buffer_.offset_);
+
+    // fsync for durability
+    if (disk_manager_->GetLogFd() != -1) {
+        fsync(disk_manager_->GetLogFd());
+    }
+
+    persist_lsn_ = global_lsn_.load() - 1;
     log_buffer_.offset_ = 0;
-    disk_manager_->close_file(fd);
+}
+
+void LogManager::flush_log_to_disk() {
+    std::scoped_lock lock(latch_);
+    flush_log_to_disk_unlocked();
 }

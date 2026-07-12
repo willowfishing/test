@@ -1,0 +1,8 @@
+| customer_id | name | email | address | order_id | customer_id | order_date | total_amount |
+| 1 | Alice | alice@example.com | A Street | 102 | 1 | 2025-01-02 | 1200.000000 |
+| 2 | Bob | bob@example.com | B Street | 104 | 2 | 2025-01-04 | 1500.000000 |
+Project(columns=[*], rows=2)
+	Join(tables=[customers, orders], condition=[c.customer_id=o.customer_id], rows=2)
+		Scan(table=customers, type=SeqScan, rows=3)
+		Filter(condition=[o.total_amount>1000], rows=6)
+			Scan(table=orders, type=SeqScan, rows=15)

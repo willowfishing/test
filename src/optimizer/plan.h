@@ -50,7 +50,8 @@ typedef enum PlanTag{
     T_Limit,
     T_SemiJoin,
     T_Union,
-    T_Explain
+    T_Explain,
+    T_StaticCheckpoint
 } PlanTag;
 
 // 查询执行计划
@@ -292,10 +293,17 @@ class OtherPlan : public Plan
         OtherPlan(PlanTag tag, std::string tab_name)
         {
             Plan::tag = tag;
-            tab_name_ = std::move(tab_name);            
+            tab_name_ = std::move(tab_name);
+        }
+        OtherPlan(PlanTag tag, std::string tab_name, bool serializable)
+        {
+            Plan::tag = tag;
+            tab_name_ = std::move(tab_name);
+            set_txn_isolation_serializable_ = serializable;
         }
         ~OtherPlan(){}
         std::string tab_name_;
+        bool set_txn_isolation_serializable_ = true;  // for T_SetTransactionIsolation
 };
 
 // Set Knob Plan

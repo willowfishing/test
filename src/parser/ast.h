@@ -372,8 +372,11 @@ struct SetStmt : public TreeNode {
     SetKnobType set_knob_type_;
     bool bool_val_;
 
-    SetStmt(SetKnobType &type, bool bool_value) : 
+    SetStmt(SetKnobType &type, bool bool_value) :
         set_knob_type_(type), bool_val_(bool_value) { }
+};
+
+struct StaticCheckpoint : public TreeNode {
 };
 
 // Semantic value

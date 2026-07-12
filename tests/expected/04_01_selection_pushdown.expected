@@ -1,0 +1,6 @@
+| a | b |
+| 2 | 8 |
+| 4 | 6 |
+Project(columns=[t.a, t.b], rows=2)
+	Filter(condition=[t.a>1, t.b<10], rows=2)
+		Scan(table=t, type=SeqScan, rows=5)

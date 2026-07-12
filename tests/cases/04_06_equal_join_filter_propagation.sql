@@ -1,0 +1,12 @@
+create table a75 (id int, name char(8));
+create table b75 (aid int, val char(8));
+insert into a75 values (1, 'a1');
+insert into a75 values (2, 'a2');
+insert into a75 values (3, 'a3');
+insert into b75 values (1, 'b1');
+insert into b75 values (2, 'b2');
+insert into b75 values (3, 'b3');
+select a.name, b.val from a75 a join b75 b on a.id = b.aid where a.id = 2;
+explain analyze select a.name, b.val from a75 a join b75 b on a.id = b.aid where a.id = 2;
+drop table b75;
+drop table a75;

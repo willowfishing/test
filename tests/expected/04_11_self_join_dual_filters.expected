@@ -1,0 +1,10 @@
+| name | name |
+| a | b |
+Project(columns=[l.name, r.name], rows=1)
+	Join(tables=[t469], condition=[l.grp=r.grp], rows=1)
+		Project(columns=[l.grp, l.name], rows=2)
+			Filter(condition=[l.score>70], rows=2)
+				Scan(table=t469, type=SeqScan, rows=3)
+		Project(columns=[r.grp, r.name], rows=2)
+			Filter(condition=[r.score<70], rows=2)
+				Scan(table=t469, type=SeqScan, rows=6)
