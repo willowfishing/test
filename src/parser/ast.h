@@ -42,8 +42,7 @@ enum AggType {
 };
 
 enum SetKnobType {
-    EnableNestLoop, EnableSortMerge,
-    IsolationLevelSnapshot, IsolationLevelSerializable
+    EnableNestLoop, EnableSortMerge
 };
 
 // Base class for tree nodes

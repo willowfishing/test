@@ -12,7 +12,6 @@ See the Mulan PSL v2 for more details. */
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
-#include "transaction/transaction_manager.h"
 #include "index/ix.h"
 #include "system/sm.h"
 
@@ -44,22 +43,6 @@ class DeleteExecutor : public AbstractExecutor {
                 throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
             }
             auto rec = fh_->get_record(rid, context_);
-            // Check write-write conflict for MVCC/SI
-            if (context_ != nullptr && context_->txn_ != nullptr &&
-                context_->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT) {
-                // Check using static txn_map
-                auto &txn_map = TransactionManager::txn_map;
-                for (auto &entry : txn_map) {
-                    Transaction *other = entry.second;
-                    if (other == nullptr || other == context_->txn_ || other->get_state() != TransactionState::GROWING) continue;
-                    auto write_set = other->get_write_set();
-                    for (auto iter = write_set->rbegin(); iter != write_set->rend(); ++iter) {
-                        if ((*iter)->GetTableName() == tab_name_ && (*iter)->GetRid() == rid) {
-                            throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
-                        }
-                    }
-                }
-            }
             if (context_ != nullptr && context_->txn_ != nullptr) {
                 context_->txn_->append_write_record(
                     new WriteRecord(WType::DELETE_TUPLE, tab_name_, rid, *rec));

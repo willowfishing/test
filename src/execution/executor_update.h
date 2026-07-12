@@ -13,7 +13,6 @@ See the Mulan PSL v2 for more details. */
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
-#include "transaction/transaction_manager.h"
 #include "index/ix.h"
 #include "system/sm.h"
 
@@ -46,21 +45,6 @@ class UpdateExecutor : public AbstractExecutor {
             if (context_ != nullptr && context_->lock_mgr_ != nullptr && context_->txn_ != nullptr &&
                 !context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd())) {
                 throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
-            }
-            // Check write-write conflict for MVCC/SI
-            if (context_ != nullptr && context_->txn_ != nullptr &&
-                context_->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT) {
-                auto &txn_map = TransactionManager::txn_map;
-                for (auto &entry : txn_map) {
-                    Transaction *other = entry.second;
-                    if (other == nullptr || other == context_->txn_ || other->get_state() != TransactionState::GROWING) continue;
-                    auto write_set = other->get_write_set();
-                    for (auto iter = write_set->rbegin(); iter != write_set->rend(); ++iter) {
-                        if ((*iter)->GetTableName() == tab_name_ && (*iter)->GetRid() == rid) {
-                            throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
-                        }
-                    }
-                }
             }
             auto rec = fh_->get_record(rid, context_);
             auto new_rec = std::make_unique<RmRecord>(*rec);
