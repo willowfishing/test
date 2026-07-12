@@ -65,6 +65,8 @@ public:
 
     void capture_snapshot(Transaction* txn);
 
+    
+
     ConcurrencyMode get_concurrency_mode() { return concurrency_mode_; }
 
     void set_concurrency_mode(ConcurrencyMode concurrency_mode) { concurrency_mode_ = concurrency_mode; }

@@ -19,6 +19,7 @@ See the Mulan PSL v2 for more details. */
 #include "executor_update.h"
 #include "index/ix.h"
 #include "record_printer.h"
+#include "transaction/transaction_manager.h"
 
 const char *help_info = "Supported SQL syntax:\n"
                    "  command ;\n"
@@ -127,6 +128,17 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
             }
             case T_SetTransactionIsolation:
             {
+                auto iso_stmt = std::dynamic_pointer_cast<ast::SetTransactionIsolation>(x);
+                if (iso_stmt != nullptr && context->txn_ != nullptr) {
+                    if (iso_stmt->serializable) {
+                        context->txn_->set_isolation_level(IsolationLevel::SERIALIZABLE);
+                        txn_mgr_->set_concurrency_mode(static_cast<ConcurrencyMode>(0));
+                    } else {
+                        context->txn_->set_isolation_level(IsolationLevel::SNAPSHOT);
+                        txn_mgr_->set_concurrency_mode(static_cast<ConcurrencyMode>(2));
+                        txn_mgr_->capture_snapshot(context->txn_);
+                    }
+                }
                 break;
             }
             default:

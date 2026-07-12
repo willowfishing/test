@@ -83,6 +83,7 @@ class Transaction {
     inline void set_start_ts(timestamp_t start_ts) { start_ts_ = start_ts; }
     inline timestamp_t get_start_ts() { return start_ts_; }
 
+    inline void set_isolation_level(IsolationLevel level) { isolation_level_ = level; }
     inline IsolationLevel get_isolation_level() { return isolation_level_; }
 
     inline TransactionState get_state() { return state_; }
