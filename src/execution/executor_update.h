@@ -55,6 +55,12 @@ public:
         memcpy(new_rec.data, old_rec->data, fh_->get_file_hdr().record_size);
         for (auto &set_clause : set_clauses_) {
             auto col_it = tab_.get_col(set_clause.lhs.col_name);
+            // Convert INT/FLOAT types if needed
+            if (col_it->type == TYPE_FLOAT && set_clause.rhs.type == TYPE_INT) {
+                set_clause.rhs.set_float((float)set_clause.rhs.int_val);
+            } else if (col_it->type == TYPE_INT && set_clause.rhs.type == TYPE_FLOAT) {
+                set_clause.rhs.set_int((int)set_clause.rhs.float_val);
+            }
             set_clause.rhs.init_raw(col_it->len);
             memcpy(new_rec.data + col_it->offset, set_clause.rhs.raw->data, col_it->len);
         }
