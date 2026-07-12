@@ -60,6 +60,16 @@ private:
         return true;
     }
 
+    void skip_to_match() {
+        while (!is_end_) {
+            rid_ = scan_->rid();
+            auto rec = fh_->get_record(rid_, context_);
+            if (check_record(rec.get())) return;
+            scan_->next();
+            is_end_ = scan_->is_end();
+        }
+    }
+
 public:
     SeqScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, Context *context) {
         sm_manager_ = sm_manager;
@@ -78,6 +88,7 @@ public:
     void beginTuple() override {
         scan_ = std::make_unique<RmScan>(fh_);
         is_end_ = scan_->is_end();
+        if (!is_end_) skip_to_match();
     }
 
     void nextTuple() override {
@@ -98,9 +109,7 @@ public:
     std::unique_ptr<RmRecord> Next() override {
         if (is_end_) return nullptr;
         rid_ = scan_->rid();
-        auto rec = fh_->get_record(rid_, context_);
-        if (!check_record(rec.get())) return nullptr;
-        return rec;
+        return fh_->get_record(rid_, context_);
     }
 
     Rid &rid() override { return rid_; }
