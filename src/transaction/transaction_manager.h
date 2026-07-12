@@ -65,6 +65,8 @@ public:
 
     void capture_snapshot(Transaction* txn);
 
+    bool check_write_write_conflict(Transaction *txn, const std::string &tab_name, const Rid &rid);
+
     
 
     ConcurrencyMode get_concurrency_mode() { return concurrency_mode_; }
