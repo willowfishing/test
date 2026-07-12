@@ -73,6 +73,11 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "WHERE" { return WHERE; }
 "UPDATE" { return UPDATE; }
 "SET" { return SET; }
+"TRANSACTION" { return TRANSACTION; }
+"ISOLATION" { return ISOLATION; }
+"LEVEL" { return LEVEL; }
+"SNAPSHOT" { return SNAPSHOT; }
+"SERIALIZABLE" { return SERIALIZABLE; }
 "SELECT" { return SELECT; }
 "INT" { return INT; }
 "CHAR" { return CHAR; }
@@ -80,6 +85,20 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "INDEX" { return INDEX; }
 "AND" { return AND; }
 "JOIN" {return JOIN;}
+"SEMI" { return SEMI; }
+"ON" { return ON; }
+"GROUP" { return GROUP; }
+"HAVING" { return HAVING; }
+"LIMIT" { return LIMIT; }
+"AS" { return AS; }
+"EXPLAIN" { return EXPLAIN; }
+"ANALYZE" { return ANALYZE; }
+"UNION" { return UNION; }
+"MAX" { return MAX; }
+"MIN" { return MIN; }
+"COUNT" { return COUNT; }
+"SUM" { return SUM; }
+"AVG" { return AVG; }
 "EXIT" { return EXIT; }
 "HELP" { return HELP; }
 "ORDER" { return ORDER; }

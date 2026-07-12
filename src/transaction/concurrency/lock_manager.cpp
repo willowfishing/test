@@ -18,8 +18,7 @@ See the Mulan PSL v2 for more details. */
  * @param {int} tab_fd
  */
 bool LockManager::lock_shared_on_record(Transaction* txn, const Rid& rid, int tab_fd) {
-    
-    return true;
+    return lock_exclusive_on_record(txn, rid, tab_fd);
 }
 
 /**
@@ -30,7 +29,25 @@ bool LockManager::lock_shared_on_record(Transaction* txn, const Rid& rid, int ta
  * @param {int} tab_fd 记录所在的表的fd
  */
 bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int tab_fd) {
-
+    if (txn == nullptr) {
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(latch_);
+    LockDataId lock_data_id(tab_fd, rid, LockDataType::RECORD);
+    auto &queue = lock_table_[lock_data_id];
+    for (const auto &request : queue.request_queue_) {
+        if (request.granted_ && request.txn_id_ == txn->get_transaction_id() &&
+            request.lock_mode_ == LockMode::EXLUCSIVE) {
+            return true;
+        }
+        if (request.granted_ && request.txn_id_ != txn->get_transaction_id()) {
+            return false;
+        }
+    }
+    queue.request_queue_.emplace_back(txn->get_transaction_id(), LockMode::EXLUCSIVE);
+    queue.request_queue_.back().granted_ = true;
+    queue.group_lock_mode_ = GroupLockMode::X;
+    txn->get_lock_set()->insert(lock_data_id);
     return true;
 }
 
@@ -41,7 +58,6 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
  * @param {int} tab_fd 目标表的fd
  */
 bool LockManager::lock_shared_on_table(Transaction* txn, int tab_fd) {
-    
     return true;
 }
 
@@ -52,7 +68,6 @@ bool LockManager::lock_shared_on_table(Transaction* txn, int tab_fd) {
  * @param {int} tab_fd 目标表的fd
  */
 bool LockManager::lock_exclusive_on_table(Transaction* txn, int tab_fd) {
-    
     return true;
 }
 
@@ -63,7 +78,6 @@ bool LockManager::lock_exclusive_on_table(Transaction* txn, int tab_fd) {
  * @param {int} tab_fd 目标表的fd
  */
 bool LockManager::lock_IS_on_table(Transaction* txn, int tab_fd) {
-    
     return true;
 }
 
@@ -74,7 +88,6 @@ bool LockManager::lock_IS_on_table(Transaction* txn, int tab_fd) {
  * @param {int} tab_fd 目标表的fd
  */
 bool LockManager::lock_IX_on_table(Transaction* txn, int tab_fd) {
-    
     return true;
 }
 
@@ -85,6 +98,21 @@ bool LockManager::lock_IX_on_table(Transaction* txn, int tab_fd) {
  * @param {LockDataId} lock_data_id 要释放的锁ID
  */
 bool LockManager::unlock(Transaction* txn, LockDataId lock_data_id) {
-   
+    if (txn == nullptr) {
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(latch_);
+    auto iter = lock_table_.find(lock_data_id);
+    if (iter == lock_table_.end()) {
+        return true;
+    }
+    auto &queue = iter->second.request_queue_;
+    queue.remove_if([&](const LockRequest &request) {
+        return request.txn_id_ == txn->get_transaction_id();
+    });
+    txn->get_lock_set()->erase(lock_data_id);
+    if (queue.empty()) {
+        lock_table_.erase(iter);
+    }
     return true;
 }

@@ -9,10 +9,16 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include <netinet/in.h>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <memory>
+#include <pthread.h>
 #include <readline/history.h>
 #include <readline/readline.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <string>
 #include <unistd.h>
 #include <atomic>
 
@@ -122,7 +128,8 @@ void *client_handler(void *sock_fd) {
         bool finish_analyze = false;
         pthread_mutex_lock(buffer_mutex);
         YY_BUFFER_STATE buf = yy_scan_string(data_recv);
-        if (yyparse() == 0) {
+        int parse_ret = yyparse();
+        if (parse_ret == 0) {
             if (ast::parse_tree != nullptr) {
                 try {
                     // analyze and rewrite
@@ -167,6 +174,17 @@ void *client_handler(void *sock_fd) {
                     outfile.close();
                 }
             }
+        } else {
+            yy_delete_buffer(buf);
+            finish_analyze = true;
+            pthread_mutex_unlock(buffer_mutex);
+            std::string str = "failure\n";
+            memcpy(data_send, str.c_str(), str.length());
+            offset = str.length();
+            std::fstream outfile;
+            outfile.open("output.txt", std::ios::out | std::ios::app);
+            outfile << str;
+            outfile.close();
         }
         if(finish_analyze == false) {
             yy_delete_buffer(buf);

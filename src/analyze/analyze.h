@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include <cassert>
 #include <cstring>
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -34,6 +35,20 @@ class Query{
     std::vector<SetClause> set_clauses;
     //insert 的values值
     std::vector<Value> values;
+    std::vector<std::shared_ptr<ast::SelectItem>> select_items;
+    std::vector<TabCol> group_cols;
+    std::vector<std::shared_ptr<ast::HavingExpr>> having_conds;
+    std::vector<std::pair<TabCol, bool>> order_cols;
+    bool has_aggregate = false;
+    bool has_group = false;
+    bool has_limit = false;
+    int limit = -1;
+    bool is_semi_join = false;
+    std::vector<Condition> semi_conds;
+    std::vector<std::shared_ptr<ast::TableRef>> table_refs;
+    std::map<std::string, std::string> alias_to_table;
+    std::vector<std::shared_ptr<Query>> union_queries;
+    std::vector<ColMeta> union_cols;
 
     Query(){}
 
@@ -53,8 +68,8 @@ private:
     TabCol check_column(const std::vector<ColMeta> &all_cols, TabCol target);
     void get_all_cols(const std::vector<std::string> &tab_names, std::vector<ColMeta> &all_cols);
     void get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds, std::vector<Condition> &conds);
-    void check_clause(const std::vector<std::string> &tab_names, std::vector<Condition> &conds);
+    void check_clause(const std::vector<std::string> &tab_names, std::vector<Condition> &conds,
+                      const std::map<std::string, std::string> *alias_to_table = nullptr);
     Value convert_sv_value(const std::shared_ptr<ast::Value> &sv_val);
     CompOp convert_sv_comp_op(ast::SvCompOp op);
 };
-

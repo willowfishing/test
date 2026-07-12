@@ -10,12 +10,15 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <deque>
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "common/common.h"
@@ -56,6 +59,8 @@ struct UndoLog {
 
 class Transaction {
    public:
+    using SnapshotRecords = std::vector<std::pair<Rid, RmRecord>>;
+
     explicit Transaction(txn_id_t txn_id, IsolationLevel isolation_level = IsolationLevel::SERIALIZABLE)
         : state_(TransactionState::DEFAULT), isolation_level_(isolation_level), txn_id_(txn_id) {
         write_set_ = std::make_shared<std::deque<WriteRecord *>>();
@@ -96,6 +101,44 @@ class Transaction {
     inline void append_index_latch_page_set(Page* page) { index_latch_page_set_->push_back(page); }
 
     inline std::shared_ptr<std::unordered_set<LockDataId>> get_lock_set() { return lock_set_; }
+
+    inline void clear_snapshot() { snapshots_.clear(); }
+
+    inline void set_snapshot_records(const std::string &tab_name, SnapshotRecords records) {
+        snapshots_[tab_name] = std::move(records);
+    }
+
+    inline bool has_snapshot(const std::string &tab_name) const {
+        return snapshots_.find(tab_name) != snapshots_.end();
+    }
+
+    inline const SnapshotRecords *get_snapshot_records(const std::string &tab_name) const {
+        auto iter = snapshots_.find(tab_name);
+        if (iter == snapshots_.end()) {
+            return nullptr;
+        }
+        return &iter->second;
+    }
+
+    inline void remove_snapshot_record(const std::string &tab_name, const Rid &rid) {
+        auto iter = snapshots_.find(tab_name);
+        if (iter == snapshots_.end()) {
+            return;
+        }
+        auto &records = iter->second;
+        records.erase(std::remove_if(records.begin(), records.end(), [&](const auto &entry) {
+            return entry.first == rid;
+        }), records.end());
+    }
+
+    inline void upsert_snapshot_record(const std::string &tab_name, const Rid &rid, const RmRecord &record) {
+        auto iter = snapshots_.find(tab_name);
+        if (iter == snapshots_.end()) {
+            return;
+        }
+        remove_snapshot_record(tab_name, rid);
+        snapshots_[tab_name].emplace_back(rid, record);
+    }
 
     inline timestamp_t get_read_ts() const { return read_ts_; }
     inline timestamp_t get_commit_ts() const { return commit_ts_; }
@@ -141,6 +184,7 @@ class Transaction {
   std::atomic<timestamp_t> read_ts_{0};
   /** 提交时间戳 */
   std::atomic<timestamp_t> commit_ts_{INVALID_TS};
+  std::unordered_map<std::string, SnapshotRecords> snapshots_;
   /**
   * @brief 存储撤销日志。
   * 其他撤销日志/表堆将存储 (txn_id, index) 对，因此只能向此vector中追加内容或就地更新内容，而不能删除任何内容。

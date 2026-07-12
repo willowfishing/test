@@ -1,51 +1,387 @@
+/* Copyright (c) 2023 Renmin University of China
+RMDB is licensed under Mulan PSL v2.
+You can use this software according to the terms and conditions of the Mulan PSL v2.
+You may obtain a copy of Mulan PSL v2 at:
+        http://license.coscl.org.cn/MulanPSL2
+THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+See the Mulan PSL v2 for more details. */
+
 #include "analyze.h"
 
+namespace {
+std::string agg_default_name(ast::AggType type) {
+    switch (type) {
+        case ast::AGG_COUNT: return "count";
+        case ast::AGG_MAX: return "max";
+        case ast::AGG_MIN: return "min";
+        case ast::AGG_SUM: return "sum";
+        case ast::AGG_AVG: return "avg";
+        default: return "";
+    }
+}
+
+std::string select_item_name(const std::shared_ptr<ast::SelectItem> &item) {
+    if (!item->alias.empty()) {
+        return item->alias;
+    }
+    if (!item->is_agg && item->col) {
+        return item->col->col_name;
+    }
+    if (item->count_star) {
+        return "count";
+    }
+    return agg_default_name(item->agg_type);
+}
+
+bool same_col(const TabCol &lhs, const TabCol &rhs) {
+    return lhs.tab_name == rhs.tab_name && lhs.col_name == rhs.col_name;
+}
+}
+
+/**
+ * @description: 分析器，进行语义分析和查询重写，需要检查不符合语义规定的部分
+ * @param {shared_ptr<ast::TreeNode>} parse parser生成的结果集
+ * @return {shared_ptr<Query>} Query 
+ */
 std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
 {
     std::shared_ptr<Query> query = std::make_shared<Query>();
     if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(parse))
     {
-        query->tables = std::move(x->tabs);
-        for (auto &sv_sel_col : x->cols) {
-            TabCol sel_col = {.tab_name = sv_sel_col->tab_name, .col_name = sv_sel_col->col_name};
-            query->cols.push_back(sel_col);
+        if (x->table_refs.size() == 1 && !x->table_refs[0]->union_selects.empty()) {
+            auto output_cols = [&](const std::shared_ptr<Query> &subquery) {
+                std::vector<ColMeta> metas;
+                int offset = 0;
+                for (auto &col : subquery->cols) {
+                    auto &tab = sm_manager_->db_.get_table(col.tab_name);
+                    ColMeta meta = *tab.get_col(col.col_name);
+                    meta.tab_name = "";
+                    meta.name = col.col_name;
+                    meta.offset = offset;
+                    offset += meta.len;
+                    metas.push_back(meta);
+                }
+                return metas;
+            };
+
+            for (auto &select : x->table_refs[0]->union_selects) {
+                auto subquery = do_analyze(select);
+                query->union_queries.push_back(subquery);
+                auto sub_cols = output_cols(subquery);
+                if (query->union_cols.empty()) {
+                    query->union_cols = sub_cols;
+                    for (auto &col : query->union_cols) {
+                        query->cols.push_back({.tab_name = "", .col_name = col.name});
+                    }
+                    continue;
+                }
+                if (query->union_cols.size() != sub_cols.size()) {
+                    throw RMDBError("union column count mismatch");
+                }
+                int offset = 0;
+                for (size_t i = 0; i < query->union_cols.size(); ++i) {
+                    auto &dst = query->union_cols[i];
+                    auto &src = sub_cols[i];
+                    if (dst.type == src.type) {
+                        if (dst.type == TYPE_STRING) {
+                            dst.len = std::max(dst.len, src.len);
+                        }
+                    } else if ((dst.type == TYPE_INT && src.type == TYPE_FLOAT) ||
+                               (dst.type == TYPE_FLOAT && src.type == TYPE_INT)) {
+                        dst.type = TYPE_FLOAT;
+                        dst.len = sizeof(float);
+                    } else {
+                        throw RMDBError("union column type mismatch");
+                    }
+                    dst.offset = offset;
+                    offset += dst.len;
+                }
+            }
+            if (x->has_sort) {
+                for (auto &order_item : x->order->items) {
+                    bool found = false;
+                    for (auto &col : query->union_cols) {
+                        if (col.name == order_item->col->col_name) {
+                            query->order_cols.push_back({{.tab_name = "", .col_name = col.name},
+                                                         order_item->orderby_dir == ast::OrderBy_DESC});
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        throw ColumnNotFoundError(order_item->col->col_name);
+                    }
+                }
+            }
+            query->parse = std::move(parse);
+            return query;
         }
+        // 处理表名。查询计划内部使用可见名（别名或表名）区分 self join 的两侧。
+        query->table_refs = x->table_refs;
+        query->has_limit = x->has_limit;
+        query->limit = x->limit;
+        query->is_semi_join = x->is_semi_join;
+        for (auto &ref : x->table_refs) {
+            if (!sm_manager_->db_.is_table(ref->tab_name)) {
+                throw TableNotFoundError(ref->tab_name);
+            }
+            query->tables.push_back(ref->visible_name());
+        }
+
+        // 处理target list，再target list中添加上表名，例如 a.id
+        for (auto &ref : x->table_refs) {
+            query->alias_to_table[ref->visible_name()] = ref->tab_name;
+        }
+        auto resolve_visible = [&](TabCol &col) {
+            if (col.tab_name.empty()) {
+                return;
+            }
+            if (query->alias_to_table.count(col.tab_name)) {
+                return;
+            }
+            for (auto &ref : x->table_refs) {
+                if (ref->tab_name == col.tab_name && ref->alias.empty()) {
+                    col.tab_name = ref->visible_name();
+                    return;
+                }
+            }
+        };
+        
         std::vector<ColMeta> all_cols;
-        get_all_cols(query->tables, all_cols);
-        if (query->cols.empty() || (query->cols.size() == 1 && query->cols[0].col_name == "*")) {
+        for (auto &ref : x->table_refs) {
+            auto cols = sm_manager_->db_.get_table(ref->tab_name).cols;
+            for (auto &col : cols) {
+                col.tab_name = ref->visible_name();
+            }
+            all_cols.insert(all_cols.end(), cols.begin(), cols.end());
+        }
+
+        query->select_items = x->select_items;
+        std::vector<ColMeta> select_check_cols = all_cols;
+        if (query->is_semi_join && !query->tables.empty()) {
+            select_check_cols.clear();
+            auto left_ref = x->table_refs.front();
+            select_check_cols = sm_manager_->db_.get_table(left_ref->tab_name).cols;
+            for (auto &col : select_check_cols) {
+                col.tab_name = left_ref->visible_name();
+            }
+        }
+
+        for (auto &item : x->select_items) {
+            if (item->is_agg) {
+                    query->has_aggregate = true;
+                    if (!item->count_star && item->col) {
+                        TabCol agg_col = {.tab_name = item->col->tab_name, .col_name = item->col->col_name};
+                    resolve_visible(agg_col);
+                    agg_col = check_column(all_cols, agg_col);
+                    item->col->tab_name = agg_col.tab_name;
+                }
+            } else if (item->col) {
+                TabCol sel_col = {.tab_name = item->col->tab_name, .col_name = item->col->col_name};
+                resolve_visible(sel_col);
+                sel_col = check_column(select_check_cols, sel_col);
+                item->col->tab_name = sel_col.tab_name;
+                query->cols.push_back(sel_col);
+            }
+        }
+
+        query->has_group = !x->group_cols.empty();
+        for (auto &group_col : x->group_cols) {
+            TabCol tab_col = {.tab_name = group_col->tab_name, .col_name = group_col->col_name};
+            resolve_visible(tab_col);
+            tab_col = check_column(all_cols, tab_col);
+            query->group_cols.push_back(tab_col);
+            group_col->tab_name = tab_col.tab_name;
+        }
+        query->having_conds = x->having_conds;
+        for (auto &having : query->having_conds) {
+            if (!having->lhs->count_star && having->lhs->col) {
+                TabCol having_col = {.tab_name = having->lhs->col->tab_name, .col_name = having->lhs->col->col_name};
+                resolve_visible(having_col);
+                having_col = check_column(all_cols, having_col);
+                having->lhs->col->tab_name = having_col.tab_name;
+            }
+        }
+        if (!query->having_conds.empty()) {
+            query->has_aggregate = true;
+        }
+
+        if (x->has_sort) {
+            for (auto &order_item : x->order->items) {
+                TabCol order_col = {.tab_name = order_item->col->tab_name, .col_name = order_item->col->col_name};
+                resolve_visible(order_col);
+                order_col = check_column(all_cols, order_col);
+                query->order_cols.push_back({order_col, order_item->orderby_dir == ast::OrderBy_DESC});
+            }
+        }
+
+        if (query->has_aggregate || query->has_group) {
             query->cols.clear();
+            for (auto &item : x->select_items) {
+                query->cols.push_back({.tab_name = "", .col_name = select_item_name(item)});
+                if (!item->is_agg && item->col) {
+                    TabCol sel_col = {.tab_name = item->col->tab_name, .col_name = item->col->col_name};
+                    resolve_visible(sel_col);
+                    bool found = false;
+                    for (auto &group_col : query->group_cols) {
+                        if (same_col(sel_col, group_col)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        throw RMDBError("selected column must appear in group by");
+                    }
+                }
+            }
+        } else if (query->cols.empty()) {
+            // select all columns
             for (auto &col : all_cols) {
                 TabCol sel_col = {.tab_name = col.tab_name, .col_name = col.name};
                 query->cols.push_back(sel_col);
             }
-        } else {
-            for (auto &sel_col : query->cols) {
-                sel_col = check_column(all_cols, sel_col);
+        }
+        //处理where条件
+        get_clause(x->conds, query->conds);
+        for (auto &cond : query->conds) {
+            resolve_visible(cond.lhs_col);
+            if (!cond.is_rhs_val) {
+                resolve_visible(cond.rhs_col);
             }
         }
-        get_clause(x->conds, query->conds);
-        check_clause(query->tables, query->conds);
-    } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
-        query->tables = {x->tab_name};
-        get_clause(x->conds, query->conds);
-        check_clause(query->tables, query->conds);
-        for (auto &sv_set_clause : x->set_clauses) {
-            SetClause set_clause;
-            set_clause.lhs = {.tab_name = "", .col_name = sv_set_clause->col_name};
-            set_clause.rhs = convert_sv_value(sv_set_clause->val);
-            query->set_clauses.push_back(set_clause);
+        check_clause(query->tables, query->conds, &query->alias_to_table);
+        get_clause(x->semi_conds, query->semi_conds);
+        if (query->is_semi_join) {
+            for (auto &cond : query->semi_conds) {
+                resolve_visible(cond.lhs_col);
+                if (!cond.is_rhs_val) {
+                    resolve_visible(cond.rhs_col);
+                }
+            }
+            check_clause(query->tables, query->semi_conds, &query->alias_to_table);
+            std::string left_table = query->tables.front();
+            for (auto &sel_col : query->cols) {
+                if (!sel_col.tab_name.empty() && sel_col.tab_name != left_table) {
+                    throw RMDBError("semi join can only project left table columns");
+                }
+            }
         }
-    } else if (auto x = std::dynamic_pointer_cast<ast::DeleteStmt>(parse)) {
-        query->tables = {x->tab_name};
+    } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
+        if (!sm_manager_->db_.is_table(x->tab_name)) {
+            throw TableNotFoundError(x->tab_name);
+        }
+        auto &tab = sm_manager_->db_.get_table(x->tab_name);
+        for (auto &sv_set_clause : x->set_clauses) {
+            auto lhs_col = check_column(tab.cols, {.tab_name = x->tab_name, .col_name = sv_set_clause->col_name});
+            auto col_meta = tab.get_col(lhs_col.col_name);
+            Value rhs = convert_sv_value(sv_set_clause->val);
+            if (col_meta->type == TYPE_FLOAT && rhs.type == TYPE_INT) {
+                rhs.set_float(static_cast<float>(rhs.int_val));
+                rhs.init_raw(col_meta->len);
+            } else if (col_meta->type != rhs.type) {
+                throw IncompatibleTypeError(coltype2str(col_meta->type), coltype2str(rhs.type));
+            } else {
+                rhs.init_raw(col_meta->len);
+            }
+            query->set_clauses.push_back({.lhs = lhs_col, .rhs = rhs});
+        }
         get_clause(x->conds, query->conds);
         check_clause({x->tab_name}, query->conds);
+
+    } else if (auto x = std::dynamic_pointer_cast<ast::DeleteStmt>(parse)) {
+        if (!sm_manager_->db_.is_table(x->tab_name)) {
+            throw TableNotFoundError(x->tab_name);
+        }
+        //处理where条件
+        get_clause(x->conds, query->conds);
+        check_clause({x->tab_name}, query->conds);        
     } else if (auto x = std::dynamic_pointer_cast<ast::InsertStmt>(parse)) {
-        query->tables = {x->tab_name};
+        if (!sm_manager_->db_.is_table(x->tab_name)) {
+            throw TableNotFoundError(x->tab_name);
+        }
+        // 处理insert 的values值
         for (auto &sv_val : x->vals) {
             query->values.push_back(convert_sv_value(sv_val));
         }
-    } else if (auto x = std::dynamic_pointer_cast<ast::CreateTable>(parse)) {
-        query->tables = {x->tab_name};
+    } else if (auto x = std::dynamic_pointer_cast<ast::UnionStmt>(parse)) {
+        if (x->selects.empty()) {
+            throw RMDBError("empty union");
+        }
+        auto output_cols = [&](const std::shared_ptr<Query> &subquery) {
+            std::vector<ColMeta> metas;
+            int offset = 0;
+            for (auto &col : subquery->cols) {
+                ColMeta meta;
+                if (col.tab_name.empty()) {
+                    meta.tab_name = "";
+                    meta.name = col.col_name;
+                    meta.type = TYPE_INT;
+                    meta.len = sizeof(int);
+                } else {
+                    auto &tab = sm_manager_->db_.get_table(col.tab_name);
+                    meta = *tab.get_col(col.col_name);
+                    meta.tab_name = "";
+                    meta.name = col.col_name;
+                }
+                meta.offset = offset;
+                offset += meta.len;
+                metas.push_back(meta);
+            }
+            return metas;
+        };
+
+        for (auto &select : x->selects) {
+            auto subquery = do_analyze(select);
+            query->union_queries.push_back(subquery);
+            auto sub_cols = output_cols(subquery);
+            if (query->union_cols.empty()) {
+                query->union_cols = sub_cols;
+                query->cols.clear();
+                for (auto &col : query->union_cols) {
+                    query->cols.push_back({.tab_name = "", .col_name = col.name});
+                }
+                continue;
+            }
+            if (query->union_cols.size() != sub_cols.size()) {
+                throw RMDBError("union column count mismatch");
+            }
+            int offset = 0;
+            for (size_t i = 0; i < query->union_cols.size(); ++i) {
+                auto &dst = query->union_cols[i];
+                auto &src = sub_cols[i];
+                if (dst.type == src.type) {
+                    if (dst.type == TYPE_STRING) {
+                        dst.len = std::max(dst.len, src.len);
+                    }
+                } else if ((dst.type == TYPE_INT && src.type == TYPE_FLOAT) ||
+                           (dst.type == TYPE_FLOAT && src.type == TYPE_INT)) {
+                    dst.type = TYPE_FLOAT;
+                    dst.len = sizeof(float);
+                } else {
+                    throw RMDBError("union column type mismatch");
+                }
+                dst.offset = offset;
+                offset += dst.len;
+            }
+        }
+        if (x->has_sort) {
+            for (auto &order_item : x->order->items) {
+                bool found = false;
+                for (auto &col : query->union_cols) {
+                    if (col.name == order_item->col->col_name) {
+                        query->order_cols.push_back({{.tab_name = "", .col_name = col.name},
+                                                     order_item->orderby_dir == ast::OrderBy_DESC});
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    throw ColumnNotFoundError(order_item->col->col_name);
+                }
+            }
+        }
     } else {
         // do nothing
     }
@@ -56,6 +392,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
 
 TabCol Analyze::check_column(const std::vector<ColMeta> &all_cols, TabCol target) {
     if (target.tab_name.empty()) {
+        // Table name not specified, infer table name from column name
         std::string tab_name;
         for (auto &col : all_cols) {
             if (col.name == target.col_name) {
@@ -70,15 +407,22 @@ TabCol Analyze::check_column(const std::vector<ColMeta> &all_cols, TabCol target
         }
         target.tab_name = tab_name;
     } else {
-        bool found = false;
+        bool table_found = false;
+        bool column_found = false;
         for (auto &col : all_cols) {
-            if (col.name == target.col_name && col.tab_name == target.tab_name) {
-                found = true;
-                break;
+            if (col.tab_name == target.tab_name) {
+                table_found = true;
+                if (col.name == target.col_name) {
+                    column_found = true;
+                    break;
+                }
             }
         }
-        if (!found) {
-            throw ColumnNotFoundError(target.tab_name + "." + target.col_name);
+        if (!table_found) {
+            throw TableNotFoundError(target.tab_name);
+        }
+        if (!column_found) {
+            throw ColumnNotFoundError(target.col_name);
         }
     }
     return target;
@@ -86,6 +430,7 @@ TabCol Analyze::check_column(const std::vector<ColMeta> &all_cols, TabCol target
 
 void Analyze::get_all_cols(const std::vector<std::string> &tab_names, std::vector<ColMeta> &all_cols) {
     for (auto &sel_tab_name : tab_names) {
+        // 这里db_不能写成get_db(), 注意要传指针
         const auto &sel_tab_cols = sm_manager_->db_.get_table(sel_tab_name).cols;
         all_cols.insert(all_cols.end(), sel_tab_cols.begin(), sel_tab_cols.end());
     }
@@ -108,15 +453,40 @@ void Analyze::get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv
     }
 }
 
-void Analyze::check_clause(const std::vector<std::string> &tab_names, std::vector<Condition> &conds) {
+void Analyze::check_clause(const std::vector<std::string> &tab_names, std::vector<Condition> &conds,
+                           const std::map<std::string, std::string> *alias_to_table) {
+    // auto all_cols = get_all_cols(tab_names);
     std::vector<ColMeta> all_cols;
-    get_all_cols(tab_names, all_cols);
+    if (alias_to_table == nullptr) {
+        get_all_cols(tab_names, all_cols);
+    } else {
+        for (const auto &tab_name : tab_names) {
+            auto base_it = alias_to_table->find(tab_name);
+            const std::string &base_name = base_it == alias_to_table->end() ? tab_name : base_it->second;
+            auto cols = sm_manager_->db_.get_table(base_name).cols;
+            for (auto &col : cols) {
+                col.tab_name = tab_name;
+            }
+            all_cols.insert(all_cols.end(), cols.begin(), cols.end());
+        }
+    }
+    // Get raw values in where clause
     for (auto &cond : conds) {
+        // Infer table name from column name
         cond.lhs_col = check_column(all_cols, cond.lhs_col);
         if (!cond.is_rhs_val) {
             cond.rhs_col = check_column(all_cols, cond.rhs_col);
         }
-        TabMeta &lhs_tab = sm_manager_->db_.get_table(cond.lhs_col.tab_name);
+        auto base_table = [&](const std::string &tab_name) -> std::string {
+            if (alias_to_table != nullptr) {
+                auto it = alias_to_table->find(tab_name);
+                if (it != alias_to_table->end()) {
+                    return it->second;
+                }
+            }
+            return tab_name;
+        };
+        TabMeta &lhs_tab = sm_manager_->db_.get_table(base_table(cond.lhs_col.tab_name));
         auto lhs_col = lhs_tab.get_col(cond.lhs_col.col_name);
         ColType lhs_type = lhs_col->type;
         ColType rhs_type;
@@ -124,18 +494,18 @@ void Analyze::check_clause(const std::vector<std::string> &tab_names, std::vecto
             cond.rhs_val.init_raw(lhs_col->len);
             rhs_type = cond.rhs_val.type;
         } else {
-            TabMeta &rhs_tab = sm_manager_->db_.get_table(cond.rhs_col.tab_name);
+            TabMeta &rhs_tab = sm_manager_->db_.get_table(base_table(cond.rhs_col.tab_name));
             auto rhs_col = rhs_tab.get_col(cond.rhs_col.col_name);
             rhs_type = rhs_col->type;
         }
+        if (cond.is_rhs_val && lhs_type == TYPE_FLOAT && rhs_type == TYPE_INT) {
+            cond.rhs_val.set_float(static_cast<float>(cond.rhs_val.int_val));
+            cond.rhs_val.raw = nullptr;
+            cond.rhs_val.init_raw(lhs_col->len);
+            rhs_type = TYPE_FLOAT;
+        }
         if (lhs_type != rhs_type) {
-            // Allow INT/FLOAT comparison
-            if ((lhs_type == TYPE_INT || lhs_type == TYPE_FLOAT) &&
-                (rhs_type == TYPE_INT || rhs_type == TYPE_FLOAT)) {
-                // OK, compatible
-            } else {
-                throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
-            }
+            throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
         }
     }
 }

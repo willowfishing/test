@@ -19,9 +19,14 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_projection.h"
 #include "execution/executor_seq_scan.h"
 #include "execution/executor_index_scan.h"
+#include "execution/executor_index_nestedloop_join.h"
 #include "execution/executor_update.h"
+#include "execution/executor_aggregate.h"
 #include "execution/executor_insert.h"
+#include "execution/executor_limit.h"
 #include "execution/executor_delete.h"
+#include "execution/executor_semi_join.h"
+#include "execution/executor_union.h"
 #include "execution/execution_sort.h"
 #include "common/common.h"
 
@@ -63,15 +68,17 @@ class Portal
             return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<TabCol>(), std::unique_ptr<AbstractExecutor>(),plan);
         } else if(auto x = std::dynamic_pointer_cast<SetKnobPlan>(plan)) {
             return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<TabCol>(), std::unique_ptr<AbstractExecutor>(), plan); 
+        } else if(auto x = std::dynamic_pointer_cast<ExplainPlan>(plan)) {
+            return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<TabCol>(), std::unique_ptr<AbstractExecutor>(), plan); 
         } else if (auto x = std::dynamic_pointer_cast<DDLPlan>(plan)) {
             return std::make_shared<PortalStmt>(PORTAL_MULTI_QUERY, std::vector<TabCol>(), std::unique_ptr<AbstractExecutor>(),plan);
         } else if (auto x = std::dynamic_pointer_cast<DMLPlan>(plan)) {
             switch(x->tag) {
                 case T_select:
                 {
-                    std::shared_ptr<ProjectionPlan> p = std::dynamic_pointer_cast<ProjectionPlan>(x->subplan_);
-                    std::unique_ptr<AbstractExecutor> root= convert_plan_executor(p, context);
-                    return std::make_shared<PortalStmt>(PORTAL_ONE_SELECT, std::move(p->sel_cols_), std::move(root), plan);
+                    std::vector<TabCol> sel_cols = output_cols(x->subplan_);
+                    std::unique_ptr<AbstractExecutor> root= convert_plan_executor(x->subplan_, context);
+                    return std::make_shared<PortalStmt>(PORTAL_ONE_SELECT, std::move(sel_cols), std::move(root), plan);
                 }
                     
                 case T_Update:
@@ -160,13 +167,21 @@ class Portal
                                                         x->sel_cols_);
         } else if(auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
             if(x->tag == T_SeqScan) {
-                return std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->conds_, context);
+                return std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->conds_, context,
+                                                         x->visible_name_);
             }
             else {
-                return std::make_unique<IndexScanExecutor>(sm_manager_, x->tab_name_, x->conds_, x->index_col_names_, context);
+                return std::make_unique<IndexScanExecutor>(sm_manager_, x->tab_name_, x->conds_,
+                                                           x->index_col_names_, context, x->visible_name_);
             } 
         } else if(auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
             std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context);
+            if (x->tag == T_IndexNestLoop) {
+                auto right_scan = std::dynamic_pointer_cast<ScanPlan>(x->right_);
+                return std::make_unique<IndexNestedLoopJoinExecutor>(
+                    std::move(left), sm_manager_, right_scan->tab_name_, x->conds_, x->index_col_names_, context,
+                    right_scan->visible_name_);
+            }
             std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_, context);
             std::unique_ptr<AbstractExecutor> join = std::make_unique<NestedLoopJoinExecutor>(
                                 std::move(left), 
@@ -174,9 +189,45 @@ class Portal
             return join;
         } else if(auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
             return std::make_unique<SortExecutor>(convert_plan_executor(x->subplan_, context), 
-                                            x->sel_col_, x->is_desc_);
+                                            x->order_cols_.empty() ? std::vector<std::pair<TabCol, bool>>{{x->sel_col_, x->is_desc_}} : x->order_cols_);
+        } else if(auto x = std::dynamic_pointer_cast<AggregatePlan>(plan)) {
+            return std::make_unique<AggregateExecutor>(convert_plan_executor(x->subplan_, context),
+                                                       x->select_items_, x->group_cols_, x->having_conds_,
+                                                       x->output_cols_);
+        } else if(auto x = std::dynamic_pointer_cast<LimitPlan>(plan)) {
+            return std::make_unique<LimitExecutor>(convert_plan_executor(x->subplan_, context), x->limit_);
+        } else if(auto x = std::dynamic_pointer_cast<SemiJoinPlan>(plan)) {
+            return std::make_unique<SemiJoinExecutor>(convert_plan_executor(x->left_, context),
+                                                      convert_plan_executor(x->right_, context),
+                                                      x->conds_);
+        } else if(auto x = std::dynamic_pointer_cast<UnionPlan>(plan)) {
+            std::vector<std::unique_ptr<AbstractExecutor>> children;
+            for (auto &subplan : x->subplans_) {
+                children.push_back(convert_plan_executor(subplan, context));
+            }
+            return std::make_unique<UnionExecutor>(std::move(children), x->cols_);
         }
         return nullptr;
+    }
+
+    std::vector<TabCol> output_cols(std::shared_ptr<Plan> plan)
+    {
+        if(auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+            return x->sel_cols_;
+        } else if(auto x = std::dynamic_pointer_cast<AggregatePlan>(plan)) {
+            return x->output_cols_;
+        } else if(auto x = std::dynamic_pointer_cast<LimitPlan>(plan)) {
+            return output_cols(x->subplan_);
+        } else if(auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
+            return output_cols(x->subplan_);
+        } else if(auto x = std::dynamic_pointer_cast<UnionPlan>(plan)) {
+            std::vector<TabCol> cols;
+            for (auto &col : x->cols_) {
+                cols.push_back({.tab_name = "", .col_name = col.name});
+            }
+            return cols;
+        }
+        return {};
     }
 
 };

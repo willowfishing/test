@@ -10,6 +10,8 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <algorithm>
+
 #include "execution_defs.h"
 #include "common/common.h"
 #include "index/ix.h"
@@ -52,5 +54,50 @@ class AbstractExecutor {
             throw ColumnNotFoundError(target.tab_name + '.' + target.col_name);
         }
         return pos;
+    }
+
+    int compare_value(const char *lhs, const char *rhs, ColType type, int len) const {
+        if (type == TYPE_INT) {
+            int a = *reinterpret_cast<const int *>(lhs);
+            int b = *reinterpret_cast<const int *>(rhs);
+            return (a > b) - (a < b);
+        }
+        if (type == TYPE_FLOAT) {
+            float a = *reinterpret_cast<const float *>(lhs);
+            float b = *reinterpret_cast<const float *>(rhs);
+            return (a > b) - (a < b);
+        }
+        return memcmp(lhs, rhs, len);
+    }
+
+    bool compare_result(int cmp, CompOp op) const {
+        switch (op) {
+            case OP_EQ: return cmp == 0;
+            case OP_NE: return cmp != 0;
+            case OP_LT: return cmp < 0;
+            case OP_GT: return cmp > 0;
+            case OP_LE: return cmp <= 0;
+            case OP_GE: return cmp >= 0;
+        }
+        return false;
+    }
+
+    bool eval_conds(const std::vector<ColMeta> &rec_cols, const RmRecord *rec,
+                    const std::vector<Condition> &conds) {
+        for (const auto &cond : conds) {
+            auto lhs_col = get_col(rec_cols, cond.lhs_col);
+            const char *lhs = rec->data + lhs_col->offset;
+            const char *rhs = nullptr;
+            if (cond.is_rhs_val) {
+                rhs = cond.rhs_val.raw->data;
+            } else {
+                auto rhs_col = get_col(rec_cols, cond.rhs_col);
+                rhs = rec->data + rhs_col->offset;
+            }
+            if (!compare_result(compare_value(lhs, rhs, lhs_col->type, lhs_col->len), cond.op)) {
+                return false;
+            }
+        }
+        return true;
     }
 };

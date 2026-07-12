@@ -104,6 +104,7 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
             {
                 // 显示开启一个事务
                 context->txn_->set_txn_mode(true);
+                txn_mgr_->capture_snapshot(context->txn_);
                 break;
             }  
             case T_Transaction_commit:
@@ -123,12 +124,26 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
                 context->txn_ = txn_mgr_->get_transaction(*txn_id);
                 txn_mgr_->abort(context->txn_, context->log_mgr_);
                 break;
-            }     
+            }
+            case T_SetTransactionIsolation:
+            {
+                break;
+            }
             default:
                 throw InternalError("Unexpected field type");
                 break;                        
         }
 
+    } else if(auto x = std::dynamic_pointer_cast<ExplainPlan>(plan)) {
+        std::fstream outfile;
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        for (auto &line : x->lines_) {
+            std::string out = line + "\n";
+            memcpy(context->data_send_ + *(context->offset_), out.c_str(), out.length());
+            *(context->offset_) += out.length();
+            outfile << out;
+        }
+        outfile.close();
     } else if(auto x = std::dynamic_pointer_cast<SetKnobPlan>(plan)) {
         switch (x->set_knob_type_)
         {
@@ -151,6 +166,8 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
 // 执行select语句，select语句的输出除了需要返回客户端外，还需要写入output.txt文件中
 void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> sel_cols, 
                             Context *context) {
+    executorTreeRoot->beginTuple();
+
     std::vector<std::string> captions;
     captions.reserve(sel_cols.size());
     for (auto &sel_col : sel_cols) {
@@ -174,7 +191,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     // Print records
     size_t num_rec = 0;
     // 执行query_plan
-    for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
+    for (; !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
         auto Tuple = executorTreeRoot->Next();
         std::vector<std::string> columns;
         for (auto &col : executorTreeRoot->cols()) {

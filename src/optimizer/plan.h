@@ -38,12 +38,19 @@ typedef enum PlanTag{
     T_Transaction_commit,
     T_Transaction_abort,
     T_Transaction_rollback,
+    T_SetTransactionIsolation,
     T_SeqScan,
     T_IndexScan,
     T_NestLoop,
+    T_IndexNestLoop,
     T_SortMerge,    // sort merge join
     T_Sort,
-    T_Projection
+    T_Projection,
+    T_Aggregate,
+    T_Limit,
+    T_SemiJoin,
+    T_Union,
+    T_Explain
 } PlanTag;
 
 // 查询执行计划
@@ -57,13 +64,18 @@ public:
 class ScanPlan : public Plan
 {
     public:
-        ScanPlan(PlanTag tag, SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, std::vector<std::string> index_col_names)
+        ScanPlan(PlanTag tag, SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds,
+                 std::vector<std::string> index_col_names, std::string visible_name = "")
         {
             Plan::tag = tag;
             tab_name_ = std::move(tab_name);
+            visible_name_ = visible_name.empty() ? tab_name_ : std::move(visible_name);
             conds_ = std::move(conds);
             TabMeta &tab = sm_manager->db_.get_table(tab_name_);
             cols_ = tab.cols;
+            for (auto &col : cols_) {
+                col.tab_name = visible_name_;
+            }
             len_ = cols_.back().offset + cols_.back().len;
             fed_conds_ = conds_;
             index_col_names_ = index_col_names;
@@ -72,6 +84,7 @@ class ScanPlan : public Plan
         ~ScanPlan(){}
         // 以下变量同ScanExecutor中的变量
         std::string tab_name_;                     
+        std::string visible_name_;
         std::vector<ColMeta> cols_;                
         std::vector<Condition> conds_;             
         size_t len_;                               
@@ -83,12 +96,14 @@ class ScanPlan : public Plan
 class JoinPlan : public Plan
 {
     public:
-        JoinPlan(PlanTag tag, std::shared_ptr<Plan> left, std::shared_ptr<Plan> right, std::vector<Condition> conds)
+        JoinPlan(PlanTag tag, std::shared_ptr<Plan> left, std::shared_ptr<Plan> right, std::vector<Condition> conds,
+                 std::vector<std::string> index_col_names = {})
         {
             Plan::tag = tag;
             left_ = std::move(left);
             right_ = std::move(right);
             conds_ = std::move(conds);
+            index_col_names_ = std::move(index_col_names);
             type = INNER_JOIN;
         }
         ~JoinPlan(){}
@@ -98,8 +113,25 @@ class JoinPlan : public Plan
         std::shared_ptr<Plan> right_;
         // 连接条件
         std::vector<Condition> conds_;
+        std::vector<std::string> index_col_names_;
         // future TODO: 后续可以支持的连接类型
         JoinType type;
+};
+
+class SemiJoinPlan : public Plan
+{
+    public:
+        SemiJoinPlan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right, std::vector<Condition> conds)
+        {
+            Plan::tag = T_SemiJoin;
+            left_ = std::move(left);
+            right_ = std::move(right);
+            conds_ = std::move(conds);
+        }
+        ~SemiJoinPlan(){}
+        std::shared_ptr<Plan> left_;
+        std::shared_ptr<Plan> right_;
+        std::vector<Condition> conds_;
 };
 
 class ProjectionPlan : public Plan
@@ -127,11 +159,90 @@ class SortPlan : public Plan
             sel_col_ = sel_col;
             is_desc_ = is_desc;
         }
+        SortPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<std::pair<TabCol, bool>> order_cols)
+        {
+            Plan::tag = tag;
+            subplan_ = std::move(subplan);
+            order_cols_ = std::move(order_cols);
+            if (!order_cols_.empty()) {
+                sel_col_ = order_cols_[0].first;
+                is_desc_ = order_cols_[0].second;
+            } else {
+                is_desc_ = false;
+            }
+        }
         ~SortPlan(){}
         std::shared_ptr<Plan> subplan_;
         TabCol sel_col_;
         bool is_desc_;
+        std::vector<std::pair<TabCol, bool>> order_cols_;
         
+};
+
+class LimitPlan : public Plan
+{
+    public:
+        LimitPlan(std::shared_ptr<Plan> subplan, int limit)
+        {
+            Plan::tag = T_Limit;
+            subplan_ = std::move(subplan);
+            limit_ = limit;
+        }
+        ~LimitPlan(){}
+        std::shared_ptr<Plan> subplan_;
+        int limit_;
+};
+
+class AggregatePlan : public Plan
+{
+    public:
+        AggregatePlan(std::shared_ptr<Plan> subplan,
+                      std::vector<std::shared_ptr<ast::SelectItem>> select_items,
+                      std::vector<TabCol> group_cols,
+                      std::vector<std::shared_ptr<ast::HavingExpr>> having_conds,
+                      std::vector<TabCol> output_cols)
+        {
+            Plan::tag = T_Aggregate;
+            subplan_ = std::move(subplan);
+            select_items_ = std::move(select_items);
+            group_cols_ = std::move(group_cols);
+            having_conds_ = std::move(having_conds);
+            output_cols_ = std::move(output_cols);
+        }
+        ~AggregatePlan(){}
+        std::shared_ptr<Plan> subplan_;
+        std::vector<std::shared_ptr<ast::SelectItem>> select_items_;
+        std::vector<TabCol> group_cols_;
+        std::vector<std::shared_ptr<ast::HavingExpr>> having_conds_;
+        std::vector<TabCol> output_cols_;
+};
+
+class ExplainPlan : public Plan
+{
+    public:
+        ExplainPlan(std::vector<std::string> lines)
+        {
+            Plan::tag = T_Explain;
+            lines_ = std::move(lines);
+        }
+        ~ExplainPlan(){}
+        std::vector<std::string> lines_;
+};
+
+class UnionPlan : public Plan
+{
+    public:
+        UnionPlan(std::vector<std::shared_ptr<Plan>> subplans, std::vector<ColMeta> cols)
+        {
+            Plan::tag = T_Union;
+            subplans_ = std::move(subplans);
+            cols_ = std::move(cols);
+            len_ = cols_.empty() ? 0 : cols_.back().offset + cols_.back().len;
+        }
+        ~UnionPlan(){}
+        std::vector<std::shared_ptr<Plan>> subplans_;
+        std::vector<ColMeta> cols_;
+        size_t len_;
 };
 
 // dml语句，包括insert; delete; update; select语句　

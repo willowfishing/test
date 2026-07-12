@@ -21,8 +21,9 @@ using namespace ast;
 %define parse.error verbose
 
 // keywords
-%token SHOW TABLES SHOW_INDEX CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
-WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
+%token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
+WHERE UPDATE SET TRANSACTION ISOLATION LEVEL SNAPSHOT SERIALIZABLE SELECT INT CHAR FLOAT INDEX AND JOIN SEMI ON GROUP HAVING LIMIT AS EXPLAIN ANALYZE UNION EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
+%token MAX MIN COUNT SUM AVG
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
 
@@ -33,7 +34,9 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_CO
 %token <sv_bool> VALUE_BOOL
 
 // specify types for non-terminal symbol
-%type <sv_node> stmt dbStmt ddl dml txnStmt setStmt
+%type <sv_node> stmt dbStmt ddl dml txnStmt setStmt selectStmt
+%type <sv_select_stmt> plainSelectStmt unionSelect
+%type <sv_select_stmts> unionSelectList
 %type <sv_field> field
 %type <sv_fields> fieldList
 %type <sv_type_len> type
@@ -45,12 +48,24 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_CO
 %type <sv_strs> tableList colNameList
 %type <sv_col> col
 %type <sv_cols> colList selector
+%type <sv_select_item> selectItem aggregateItem havingLhs
+%type <sv_select_items> selectItemList newSelector
+%type <sv_table_ref> tableRef
+%type <sv_from> fromList
+%type <sv_join_conds> optJoinOnClause
+%type <sv_having> havingCondition
+%type <sv_havings> havingClause optHavingClause
+%type <sv_cols> optGroupClause
 %type <sv_set_clause> setClause
 %type <sv_set_clauses> setClauses
 %type <sv_cond> condition
 %type <sv_conds> whereClause optWhereClause
 %type <sv_orderby>  order_clause opt_order_clause
+%type <sv_orderby_item> order_item
+%type <sv_orderby_items> order_item_list
 %type <sv_orderby_dir> opt_asc_desc
+%type <sv_agg_type> aggName
+%type <sv_int> optLimitClause
 %type <sv_setKnobType> set_knob_type
 
 %%
@@ -109,12 +124,24 @@ dbStmt:
     {
         $$ = std::make_shared<ShowTables>();
     }
+    |   SHOW INDEX FROM tbName
+    {
+        $$ = std::make_shared<ShowIndex>($4);
+    }
     ;
 
 setStmt:
         SET set_knob_type '=' VALUE_BOOL
     {
         $$ = std::make_shared<SetStmt>($2, $4);
+    }
+    |   SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION
+    {
+        $$ = std::make_shared<SetTransactionIsolation>(false);
+    }
+    |   SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
+    {
+        $$ = std::make_shared<SetTransactionIsolation>(true);
     }
     ;
 
@@ -154,9 +181,51 @@ dml:
     {
         $$ = std::make_shared<UpdateStmt>($2, $4, $5);
     }
-    |   SELECT selector FROM tableList optWhereClause opt_order_clause
+    |   selectStmt
     {
-        $$ = std::make_shared<SelectStmt>($2, $4, $5, $6);
+        $$ = $1;
+    }
+    ;
+
+selectStmt:
+        plainSelectStmt
+    {
+        $$ = $1;
+    }
+    |   EXPLAIN plainSelectStmt
+    {
+        $$ = std::make_shared<ExplainStmt>($2);
+    }
+    |   EXPLAIN ANALYZE plainSelectStmt
+    {
+        $$ = std::make_shared<ExplainStmt>($3);
+    }
+    ;
+
+plainSelectStmt:
+        SELECT newSelector FROM fromList optWhereClause optGroupClause optHavingClause opt_order_clause optLimitClause
+    {
+        $5.insert($5.end(), $4->join_conds.begin(), $4->join_conds.end());
+        $$ = std::make_shared<SelectStmt>($2, $4->table_refs, $5, $6, $7, $8, $9, $4->is_semi_join, $4->semi_conds);
+    }
+    ;
+
+unionSelectList:
+        unionSelect
+    {
+        $$ = std::vector<std::shared_ptr<SelectStmt>>{$1};
+    }
+    |   unionSelectList UNION unionSelect
+    {
+        $1.push_back($3);
+        $$ = $1;
+    }
+    ;
+
+unionSelect:
+        plainSelectStmt
+    {
+        $$ = $1;
     }
     ;
 
@@ -242,7 +311,7 @@ condition:
     ;
 
 optWhereClause:
-        /* epsilon */ { /* ignore*/ }
+        /* epsilon */ { $$ = {}; }
     |   WHERE whereClause
     {
         $$ = $2;
@@ -346,6 +415,79 @@ selector:
     |   colList
     ;
 
+newSelector:
+        '*'
+    {
+        $$ = {};
+    }
+    |   selectItemList
+    ;
+
+selectItemList:
+        selectItem
+    {
+        $$ = std::vector<std::shared_ptr<SelectItem>>{$1};
+    }
+    |   selectItemList ',' selectItem
+    {
+        $$.push_back($3);
+    }
+    ;
+
+selectItem:
+        col
+    {
+        $$ = std::make_shared<SelectItem>($1);
+    }
+    |   col AS colName
+    {
+        $$ = std::make_shared<SelectItem>($1, $3);
+    }
+    |   aggregateItem
+    {
+        $$ = $1;
+    }
+    |   aggregateItem AS colName
+    {
+        $1->alias = $3;
+        $$ = $1;
+    }
+    ;
+
+aggregateItem:
+        aggName '(' col ')'
+    {
+        $$ = std::make_shared<SelectItem>($1, $3, false);
+    }
+    |   COUNT '(' col ')'
+    {
+        $$ = std::make_shared<SelectItem>(AGG_COUNT, $3, false);
+    }
+    |   COUNT '(' '*' ')'
+    {
+        $$ = std::make_shared<SelectItem>(AGG_COUNT, nullptr, true);
+    }
+    ;
+
+aggName:
+        MAX
+    {
+        $$ = AGG_MAX;
+    }
+    |   MIN
+    {
+        $$ = AGG_MIN;
+    }
+    |   SUM
+    {
+        $$ = AGG_SUM;
+    }
+    |   AVG
+    {
+        $$ = AGG_AVG;
+    }
+    ;
+
 tableList:
         tbName
     {
@@ -361,26 +503,151 @@ tableList:
     }
     ;
 
+fromList:
+        tableRef
+    {
+        $$ = std::make_shared<FromClause>();
+        $$->table_refs.push_back($1);
+    }
+    |   fromList ',' tableRef
+    {
+        $$ = $1;
+        $$->table_refs.push_back($3);
+    }
+    |   fromList JOIN tableRef optJoinOnClause
+    {
+        $$ = $1;
+        $$->table_refs.push_back($3);
+        $$->join_conds.insert($$->join_conds.end(), $4.begin(), $4.end());
+    }
+    |   tableRef SEMI JOIN tableRef ON condition
+    {
+        $$ = std::make_shared<FromClause>();
+        $$->table_refs.push_back($1);
+        $$->table_refs.push_back($4);
+        $$->is_semi_join = true;
+        $$->semi_conds.push_back($6);
+    }
+    ;
+
+optJoinOnClause:
+        ON whereClause
+    {
+        $$ = $2;
+    }
+    |   /* epsilon */ { $$ = {}; }
+    ;
+
+tableRef:
+        tbName
+    {
+        $$ = std::make_shared<TableRef>($1, "");
+    }
+    |   tbName tbName
+    {
+        $$ = std::make_shared<TableRef>($1, $2);
+    }
+    |   tbName AS tbName
+    {
+        $$ = std::make_shared<TableRef>($1, $3);
+    }
+    |   '(' unionSelectList ')' AS tbName
+    {
+        $$ = std::make_shared<TableRef>($2, $5);
+    }
+    |   '(' unionSelectList ')' tbName
+    {
+        $$ = std::make_shared<TableRef>($2, $4);
+    }
+    ;
+
 opt_order_clause:
     ORDER BY order_clause      
     { 
         $$ = $3; 
     }
-    |   /* epsilon */ { /* ignore*/ }
+    |   /* epsilon */ { $$ = nullptr; }
     ;
 
 order_clause:
-      col  opt_asc_desc 
+      order_item_list
     { 
-        $$ = std::make_shared<OrderBy>($1, $2);
+        $$ = std::make_shared<OrderBy>($1);
     }
-    ;   
+    ;
+
+order_item_list:
+      order_item
+    {
+        $$ = std::vector<std::shared_ptr<OrderByItem>>{$1};
+    }
+    | order_item_list ',' order_item
+    {
+        $$.push_back($3);
+    }
+    ;
+
+order_item:
+      col opt_asc_desc
+    {
+        $$ = std::make_shared<OrderByItem>($1, $2);
+    }
+    ;
 
 opt_asc_desc:
     ASC          { $$ = OrderBy_ASC;     }
     |  DESC      { $$ = OrderBy_DESC;    }
     |       { $$ = OrderBy_DEFAULT; }
     ;    
+
+optGroupClause:
+    GROUP BY colList
+    {
+        $$ = $3;
+    }
+    |   /* epsilon */ { $$ = {}; }
+    ;
+
+optHavingClause:
+    HAVING havingClause
+    {
+        $$ = $2;
+    }
+    |   /* epsilon */ { $$ = {}; }
+    ;
+
+havingClause:
+    havingCondition
+    {
+        $$ = std::vector<std::shared_ptr<HavingExpr>>{$1};
+    }
+    | havingClause AND havingCondition
+    {
+        $$.push_back($3);
+    }
+    ;
+
+havingCondition:
+    havingLhs op value
+    {
+        $$ = std::make_shared<HavingExpr>($1, $2, $3);
+    }
+    ;
+
+havingLhs:
+    aggregateItem
+    {
+        $$ = $1;
+    }
+    ;
+
+optLimitClause:
+    LIMIT VALUE_INT
+    {
+        $$ = $2;
+    }
+    |   /* epsilon */ { $$ = -1; }
+    ;
 
 set_knob_type:
     ENABLE_NESTLOOP { $$ = EnableNestLoop; }

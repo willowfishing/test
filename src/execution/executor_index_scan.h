@@ -14,11 +14,13 @@ See the Mulan PSL v2 for more details. */
 #include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
+#include "record/rm_scan.h"
 #include "system/sm.h"
 
 class IndexScanExecutor : public AbstractExecutor {
    private:
     std::string tab_name_;                      // 表名称
+    std::string visible_name_;
     TabMeta tab_;                               // 表的元数据
     std::vector<Condition> conds_;              // 扫描条件
     RmFileHandle *fh_;                          // 表的数据文件句柄
@@ -31,15 +33,21 @@ class IndexScanExecutor : public AbstractExecutor {
 
     Rid rid_;
     std::unique_ptr<RecScan> scan_;
+    std::vector<Rid> matched_rids_;
+    size_t cursor_ = 0;
+    bool use_snapshot_ = false;
+    Transaction::SnapshotRecords snapshot_records_;
+    size_t snapshot_cursor_ = 0;
 
     SmManager *sm_manager_;
 
    public:
-    IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, std::vector<std::string> index_col_names,
-                    Context *context) {
+    IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds,
+                    std::vector<std::string> index_col_names, Context *context, std::string visible_name = "") {
         sm_manager_ = sm_manager;
         context_ = context;
         tab_name_ = std::move(tab_name);
+        visible_name_ = visible_name.empty() ? tab_name_ : std::move(visible_name);
         tab_ = sm_manager_->db_.get_table(tab_name_);
         conds_ = std::move(conds);
         // index_no_ = index_no;
@@ -47,15 +55,18 @@ class IndexScanExecutor : public AbstractExecutor {
         index_meta_ = *(tab_.get_index_meta(index_col_names_));
         fh_ = sm_manager_->fhs_.at(tab_name_).get();
         cols_ = tab_.cols;
+        for (auto &col : cols_) {
+            col.tab_name = visible_name_;
+        }
         len_ = cols_.back().offset + cols_.back().len;
         std::map<CompOp, CompOp> swap_op = {
             {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
         };
 
         for (auto &cond : conds_) {
-            if (cond.lhs_col.tab_name != tab_name_) {
+            if (cond.lhs_col.tab_name != visible_name_) {
                 // lhs is on other table, now rhs must be on this table
-                assert(!cond.is_rhs_val && cond.rhs_col.tab_name == tab_name_);
+                assert(!cond.is_rhs_val && cond.rhs_col.tab_name == visible_name_);
                 // swap lhs and rhs
                 std::swap(cond.lhs_col, cond.rhs_col);
                 cond.op = swap_op.at(cond.op);
@@ -65,16 +76,96 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void beginTuple() override {
-        
+        const auto *snapshot = context_ != nullptr && context_->txn_ != nullptr
+                                   ? context_->txn_->get_snapshot_records(tab_name_)
+                                   : nullptr;
+        if (snapshot != nullptr) {
+            use_snapshot_ = true;
+            snapshot_records_ = *snapshot;
+            snapshot_cursor_ = 0;
+            while (snapshot_cursor_ < snapshot_records_.size()) {
+                rid_ = snapshot_records_[snapshot_cursor_].first;
+                if (eval_conds(cols_, &snapshot_records_[snapshot_cursor_].second, fed_conds_)) {
+                    return;
+                }
+                snapshot_cursor_++;
+            }
+            return;
+        }
+        use_snapshot_ = false;
+        matched_rids_.clear();
+        cursor_ = 0;
+        auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols)).get();
+        std::unique_ptr<char[]> key(new char[index_meta_.col_tot_len]);
+        bool can_use_exact = true;
+        int offset = 0;
+        for (auto &index_col : index_meta_.cols) {
+            auto cond_it = std::find_if(fed_conds_.begin(), fed_conds_.end(), [&](const Condition &cond) {
+                return cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.tab_name == visible_name_ &&
+                       cond.lhs_col.col_name == index_col.name;
+            });
+            if (cond_it == fed_conds_.end()) {
+                can_use_exact = false;
+                break;
+            }
+            memcpy(key.get() + offset, cond_it->rhs_val.raw->data, index_col.len);
+            offset += index_col.len;
+        }
+        if (can_use_exact) {
+            ih->get_value(key.get(), &matched_rids_, context_->txn_);
+        } else {
+            ih->get_all_rids(&matched_rids_);
+        }
+        while (cursor_ < matched_rids_.size()) {
+            rid_ = matched_rids_[cursor_];
+            auto rec = fh_->get_record(rid_, context_);
+            if (eval_conds(cols_, rec.get(), fed_conds_)) {
+                return;
+            }
+            cursor_++;
+        }
     }
 
     void nextTuple() override {
-        
+        if (use_snapshot_) {
+            if (snapshot_cursor_ < snapshot_records_.size()) {
+                snapshot_cursor_++;
+            }
+            while (snapshot_cursor_ < snapshot_records_.size()) {
+                rid_ = snapshot_records_[snapshot_cursor_].first;
+                if (eval_conds(cols_, &snapshot_records_[snapshot_cursor_].second, fed_conds_)) {
+                    return;
+                }
+                snapshot_cursor_++;
+            }
+            return;
+        }
+        if (cursor_ < matched_rids_.size()) {
+            cursor_++;
+        }
+        while (cursor_ < matched_rids_.size()) {
+            rid_ = matched_rids_[cursor_];
+            auto rec = fh_->get_record(rid_, context_);
+            if (eval_conds(cols_, rec.get(), fed_conds_)) {
+                return;
+            }
+            cursor_++;
+        }
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        if (use_snapshot_) {
+            return std::make_unique<RmRecord>(snapshot_records_[snapshot_cursor_].second);
+        }
+        return fh_->get_record(rid_, context_);
     }
 
+    bool is_end() const override {
+        return use_snapshot_ ? snapshot_cursor_ >= snapshot_records_.size() : cursor_ >= matched_rids_.size();
+    }
+    size_t tupleLen() const override { return len_; }
+    const std::vector<ColMeta> &cols() const override { return cols_; }
+    std::string getType() override { return "IndexScanExecutor"; }
+    ColMeta get_col_offset(const TabCol &target) override { return *get_col(cols_, target); }
     Rid &rid() override { return rid_; }
 };
