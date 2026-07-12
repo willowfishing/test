@@ -1,10 +1,8 @@
 #include "storage/disk_manager.h"
-
 #include <assert.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
 #include "defs.h"
 
 DiskManager::DiskManager() { memset(fd2pageno_, 0, MAX_FD * (sizeof(std::atomic<page_id_t>) / sizeof(char))); }
@@ -59,6 +57,7 @@ void DiskManager::create_file(const std::string &path) {
 
 void DiskManager::destroy_file(const std::string &path) {
     if (path2fd_.count(path)) { throw FileNotClosedError(path); }
+    if (!is_file(path)) { throw FileNotFoundError(path); }
     if (unlink(path.c_str()) < 0) { throw UnixError(); }
 }
 
