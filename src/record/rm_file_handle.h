@@ -64,7 +64,11 @@ class RmFileHandle {
 
     RmFileHdr get_file_hdr() { return file_hdr_; }
     int GetFd() { return fd_; }
-    void flush() { buffer_pool_manager_->flush_all_pages(fd_); disk_manager_->write_page(fd_, RM_FILE_HDR_PAGE, (char *)&file_hdr_, sizeof(file_hdr_)); }
+
+    void flush() {
+        disk_manager_->write_page(fd_, RM_FILE_HDR_PAGE, reinterpret_cast<char *>(&file_hdr_), sizeof(file_hdr_));
+        buffer_pool_manager_->flush_all_pages(fd_);
+    }
 
     /* 判断指定位置上是否已经存在一条记录，通过Bitmap来判断 */
     bool is_record(const Rid &rid) const {
