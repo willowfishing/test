@@ -129,7 +129,13 @@ void Analyze::check_clause(const std::vector<std::string> &tab_names, std::vecto
             rhs_type = rhs_col->type;
         }
         if (lhs_type != rhs_type) {
-            throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
+            // Allow INT/FLOAT comparison
+            if ((lhs_type == TYPE_INT || lhs_type == TYPE_FLOAT) &&
+                (rhs_type == TYPE_INT || rhs_type == TYPE_FLOAT)) {
+                // OK, compatible
+            } else {
+                throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
+            }
         }
     }
 }

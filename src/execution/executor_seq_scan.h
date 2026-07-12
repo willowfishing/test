@@ -18,26 +18,33 @@ private:
     SmManager *sm_manager_;
     bool is_end_;
 
-    // Check if current record satisfies all conditions
     bool check_record(RmRecord* rec) {
         for (auto &cond : fed_conds_) {
-            if (!cond.is_rhs_val) continue;  // skip column-to-column comparisons for now
+            if (!cond.is_rhs_val) continue;
             auto it = get_col(cols_, cond.lhs_col);
             char *lhs_data = rec->data + it->offset;
-            ColType type = it->type;
-            int len = it->len;
+            ColType lhs_type = it->type;
+            int lhs_len = it->len;
             int cmp = 0;
-            if (type == TYPE_INT) {
+            if (lhs_type == TYPE_INT) {
                 int lhs = *(int*)lhs_data;
-                int rhs = cond.rhs_val.int_val;
+                int rhs;
+                if (cond.rhs_val.type == TYPE_INT)
+                    rhs = cond.rhs_val.int_val;
+                else
+                    rhs = (int)cond.rhs_val.float_val;
                 cmp = (lhs > rhs) - (lhs < rhs);
-            } else if (type == TYPE_FLOAT) {
+            } else if (lhs_type == TYPE_FLOAT) {
                 float lhs = *(float*)lhs_data;
-                float rhs = cond.rhs_val.float_val;
+                float rhs;
+                if (cond.rhs_val.type == TYPE_FLOAT)
+                    rhs = cond.rhs_val.float_val;
+                else
+                    rhs = (float)cond.rhs_val.int_val;
                 cmp = (lhs > rhs) - (lhs < rhs);
-            } else if (type == TYPE_STRING) {
+            } else if (lhs_type == TYPE_STRING) {
                 cmp = strncmp(lhs_data, cond.rhs_val.str_val.c_str(),
-                              std::min(len, (int)cond.rhs_val.str_val.length()));
+                              std::min(lhs_len, (int)cond.rhs_val.str_val.length()));
             }
             bool ok = false;
             switch (cond.op) {
@@ -78,7 +85,6 @@ public:
             scan_->next();
             is_end_ = scan_->is_end();
             if (is_end_) return;
-            // Check conditions - skip non-matching records
             rid_ = scan_->rid();
             auto rec = fh_->get_record(rid_, context_);
             if (check_record(rec.get())) break;
@@ -86,7 +92,6 @@ public:
     }
 
     bool is_end() const override { return is_end_; }
-
     size_t tupleLen() const override { return len_; }
     const std::vector<ColMeta>& cols() const override { return cols_; }
 
