@@ -490,10 +490,10 @@ FastCommand parse_fast_command(const char *raw_sql) {
     if (stmt == "set output_file off") {
         return FastCommand::SetOutputFileOff;
     }
-    if (stmt == "set transaction isolation level snapshot isolation") {
+    if (stmt.find("set transaction isolation level snapshot") != std::string::npos) {
         return FastCommand::SetIsolationSnapshot;
     }
-    if (stmt == "set transaction isolation level serializable") {
+    if (stmt.find("set transaction isolation level serializable") != std::string::npos) {
         return FastCommand::SetIsolationSerializable;
     }
     return FastCommand::None;
