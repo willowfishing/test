@@ -124,6 +124,7 @@ public:
     Transaction* begin(Transaction* txn, LogManager* log_manager, IsolationLevel isolation_level);
 
     void commit(Transaction* txn, LogManager* log_manager);
+    void capture_snapshot(Transaction* txn);
 
     void abort(Transaction* txn, LogManager* log_manager);
 

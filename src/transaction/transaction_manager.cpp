@@ -1806,6 +1806,7 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
         }
         txn->set_state(TransactionState::GROWING);
         txn->set_start_ts(next_timestamp_++);
+    if (txn->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION || txn->get_isolation_level() == IsolationLevel::SERIALIZABLE) { capture_snapshot(txn); }
         txn->set_read_ts(last_commit_ts_.load());
         txn->set_commit_ts(INVALID_TS);
         txn->set_watermark_registered(uses_watermark(isolation_level));
@@ -2402,5 +2403,21 @@ void delete_changed_new_index_entries_bound(const std::vector<rmdb::IndexBinding
         if (memcmp(old_key, new_key, binding.meta->col_tot_len) != 0) {
             binding.ih->delete_entry(new_key, txn);
         }
+    }
+}
+
+void TransactionManager::capture_snapshot(Transaction *txn) {
+    if (txn == nullptr || sm_manager_ == nullptr) return;
+    txn->clear_snapshot();
+    for (auto &entry : sm_manager_->fhs_) {
+        const std::string &tab_name = entry.first;
+        auto &fh = entry.second;
+        Transaction::SnapshotRecords records;
+        for (RmScan scan(fh.get()); !scan.is_end(); scan.next()) {
+            Rid rid = scan.rid();
+            auto record = fh->get_record(rid, nullptr);
+            records.emplace_back(rid, *record);
+        }
+        txn->set_snapshot_records(tab_name, std::move(records));
     }
 }

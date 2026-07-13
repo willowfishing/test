@@ -266,6 +266,11 @@ class Transaction {
     }
 
 
+    using SnapshotRecords = std::vector<std::pair<Rid, RmRecord>>;
+    std::unordered_map<std::string, SnapshotRecords> snapshots_;
+    inline void clear_snapshot() { snapshots_.clear(); }
+    inline const SnapshotRecords *get_snapshot_records(const std::string &tab) const { auto it = snapshots_.find(tab); return it != snapshots_.end() ? &it->second : nullptr; }
+    inline void set_snapshot_records(const std::string &tab, SnapshotRecords rec) { snapshots_[tab] = std::move(rec); }
    private:
     static std::string serializable_write_key(const std::string &tab_name, const Rid &rid) {
         return tab_name + "#" + std::to_string(rid.page_no) + ":" + std::to_string(rid.slot_no);
