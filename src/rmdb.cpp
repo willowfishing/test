@@ -490,12 +490,12 @@ FastCommand parse_fast_command(const char *raw_sql) {
     if (stmt == "set output_file off") {
         return FastCommand::SetOutputFileOff;
     }
-    if (stmt.find("set transaction isolation level snapshot") != std::string::npos) {
-        return FastCommand::SetIsolationSnapshot;
-    }
-    if (stmt.find("set transaction isolation level serializable") != std::string::npos) {
-        return FastCommand::SetIsolationSerializable;
-    }
+// DISABLED:     if (stmt.find("set transaction isolation level snapshot") != std::string::npos) {
+// DISABLED:         return FastCommand::SetIsolationSnapshot;
+// DISABLED:     }
+// DISABLED:     if (stmt.find("set transaction isolation level serializable") != std::string::npos) {
+// DISABLED:         return FastCommand::SetIsolationSerializable;
+// DISABLED:     }
     return FastCommand::None;
 }
 
@@ -1026,14 +1026,18 @@ void *client_handler(void *sock_fd) {
                             }
                             statement_guard = txn_manager->EnterStatementExecution();
                         }
-                        advisor_candidates = rmdb::hidden_index_advisor_collect(sm_manager.get(), query, context);
+                        if (!is_set_isolation_stmt) {
+                            advisor_candidates = rmdb::hidden_index_advisor_collect(sm_manager.get(), query, context);
+                        }
                         // 优化器
                         std::shared_ptr<Plan> plan = optimizer->plan_query(query, context);
                         if (plan_template_candidate && !advisor_observes_select) {
                             rmdb::store_plan_template(*template_candidate, query, plan, session_isolation);
                         }
                         RunPlan(plan, &txn_id, context);
-                        rmdb::hidden_index_advisor_record(advisor_candidates);
+                        if (!is_set_isolation_stmt) {
+                            rmdb::hidden_index_advisor_record(advisor_candidates);
+                        }
                         statement_success = true;
                     }
                 }
