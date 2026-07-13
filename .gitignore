@@ -1,0 +1,8 @@
+build/
+rmdb_client/build/
+*.o
+*.so
+*.out
+.DS_Store
+README.md
+README1.md
