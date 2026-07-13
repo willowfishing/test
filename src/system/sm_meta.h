@@ -42,36 +42,12 @@ struct ColMeta {
 /* 索引元数据 */
 struct IndexMeta {
     std::string tab_name;           // 索引所属表名称
-    std::string index_name;         // 物理索引文件名；旧元数据为空时按表名+列名推导
-    int col_tot_len = 0;            // 物理索引键长度，内部非唯一索引包含隐藏RID后缀
-    int col_num = 0;                // 索引字段数量
+    int col_tot_len;                // 索引字段长度总和
+    int col_num;                    // 索引字段数量
     std::vector<ColMeta> cols;      // 索引包含的字段
-    bool unique = true;             // 用户可见CREATE INDEX保持唯一索引语义
-    bool hidden = false;            // 内部索引对show/drop index不可见
-
-    int logical_col_tot_len() const {
-        int len = 0;
-        for (const auto &col : cols) {
-            len += col.len;
-        }
-        return len;
-    }
-
-    bool matches_cols(const std::vector<std::string> &col_names) const {
-        if (static_cast<size_t>(col_num) != col_names.size()) {
-            return false;
-        }
-        for (size_t i = 0; i < col_names.size(); ++i) {
-            if (cols[i].name != col_names[i]) {
-                return false;
-            }
-        }
-        return true;
-    }
 
     friend std::ostream &operator<<(std::ostream &os, const IndexMeta &index) {
-        os << "@index_meta_v2 " << index.tab_name << " " << (index.index_name.empty() ? "-" : index.index_name)
-           << " " << index.col_tot_len << " " << index.col_num << " " << index.unique << " " << index.hidden;
+        os << index.tab_name << " " << index.col_tot_len << " " << index.col_num;
         for(auto& col: index.cols) {
             os << "\n" << col;
         }
@@ -79,22 +55,7 @@ struct IndexMeta {
     }
 
     friend std::istream &operator>>(std::istream &is, IndexMeta &index) {
-        index = IndexMeta{};
-        std::string first;
-        is >> first;
-        if (first == "@index_meta_v2") {
-            is >> index.tab_name >> index.index_name >> index.col_tot_len >> index.col_num >> index.unique >>
-                index.hidden;
-            if (index.index_name == "-") {
-                index.index_name.clear();
-            }
-        } else {
-            index.tab_name = first;
-            index.index_name.clear();
-            index.unique = true;
-            index.hidden = false;
-            is >> index.col_tot_len >> index.col_num;
-        }
+        is >> index.tab_name >> index.col_tot_len >> index.col_num;
         for(int i = 0; i < index.col_num; ++i) {
             ColMeta col;
             is >> col;
@@ -114,8 +75,8 @@ struct TabMeta {
 
     TabMeta(const TabMeta &other) {
         name = other.name;
-        for(auto col : other.cols) cols.push_back(col);
-        for(auto index : other.indexes) indexes.push_back(index);
+        cols = other.cols;
+        indexes = other.indexes;
     }
 
     /* 判断当前表中是否存在名为col_name的字段 */
@@ -125,54 +86,38 @@ struct TabMeta {
     }
 
     /* 判断当前表上是否建有指定索引，索引包含的字段为col_names */
-    bool is_index(const std::vector<std::string>& col_names, bool include_hidden = false) const {
+    bool is_index(const std::vector<std::string>& col_names) const {
         for(auto& index: indexes) {
-            if ((!include_hidden && index.hidden) || !index.matches_cols(col_names)) {
-                continue;
+            if(index.col_num == col_names.size()) {
+                size_t i = 0;
+                for(; i < index.col_num; ++i) {
+                    if(index.cols[i].name.compare(col_names[i]) != 0)
+                        break;
+                }
+                if(i == index.col_num) return true;
             }
-            return true;
         }
 
         return false;
     }
 
     /* 根据字段名称集合获取索引元数据 */
-    std::vector<IndexMeta>::iterator get_index_meta(const std::vector<std::string>& col_names,
-                                                    bool include_hidden = false) {
+    std::vector<IndexMeta>::iterator get_index_meta(const std::vector<std::string>& col_names) {
         for(auto index = indexes.begin(); index != indexes.end(); ++index) {
-            if (!index->hidden && index->matches_cols(col_names)) return index;
-        }
-        if (include_hidden) {
-            for(auto index = indexes.begin(); index != indexes.end(); ++index) {
-                if (index->hidden && index->matches_cols(col_names)) return index;
+            if((*index).col_num != col_names.size()) continue;
+            auto& index_cols = (*index).cols;
+            size_t i = 0;
+            for(; i < col_names.size(); ++i) {
+                if(index_cols[i].name.compare(col_names[i]) != 0) 
+                    break;
             }
-        }
-        throw IndexNotFoundError(name, col_names);
-    }
-
-    std::vector<IndexMeta>::const_iterator get_index_meta(const std::vector<std::string>& col_names,
-                                                          bool include_hidden = false) const {
-        for(auto index = indexes.begin(); index != indexes.end(); ++index) {
-            if (!index->hidden && index->matches_cols(col_names)) return index;
-        }
-        if (include_hidden) {
-            for(auto index = indexes.begin(); index != indexes.end(); ++index) {
-                if (index->hidden && index->matches_cols(col_names)) return index;
-            }
+            if(i == col_names.size()) return index;
         }
         throw IndexNotFoundError(name, col_names);
     }
 
     /* 根据字段名称获取字段元数据 */
     std::vector<ColMeta>::iterator get_col(const std::string &col_name) {
-        auto pos = std::find_if(cols.begin(), cols.end(), [&](const ColMeta &col) { return col.name == col_name; });
-        if (pos == cols.end()) {
-            throw ColumnNotFoundError(col_name);
-        }
-        return pos;
-    }
-
-    std::vector<ColMeta>::const_iterator get_col(const std::string &col_name) const {
         auto pos = std::find_if(cols.begin(), cols.end(), [&](const ColMeta &col) { return col.name == col_name; });
         if (pos == cols.end()) {
             throw ColumnNotFoundError(col_name);

@@ -27,21 +27,27 @@ See the Mulan PSL v2 for more details. */
 #include "optimizer/planner.h"
 
 class Planner;
+class RecoveryManager;
 
 class QlManager {
    private:
     SmManager *sm_manager_;
     TransactionManager *txn_mgr_;
     Planner *planner_;
+    RecoveryManager *recovery_manager_;
 
    public:
-    QlManager(SmManager *sm_manager, TransactionManager *txn_mgr, Planner *planner) 
-        : sm_manager_(sm_manager),  txn_mgr_(txn_mgr), planner_(planner) {}
+    QlManager(SmManager *sm_manager, TransactionManager *txn_mgr, Planner *planner,
+              RecoveryManager *recovery_manager = nullptr)
+        : sm_manager_(sm_manager), txn_mgr_(txn_mgr), planner_(planner),
+          recovery_manager_(recovery_manager) {}
 
     void run_mutli_query(std::shared_ptr<Plan> plan, Context *context);
     void run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Context *context);
-    void select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> sel_cols,
+    void select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<std::string> captions,
                         Context *context);
+    void explain_analyze(std::unique_ptr<AbstractExecutor> executorTreeRoot,
+                         const std::shared_ptr<Plan> &plan, Context *context);
 
     void run_dml(std::unique_ptr<AbstractExecutor> exec);
 };

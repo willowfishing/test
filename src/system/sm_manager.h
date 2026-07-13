@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include "common/context.h"
 
 class Context;
+class TransactionManager;
 
 struct ColDef {
     std::string name;  // Column name
@@ -48,11 +49,9 @@ class SmManager {
 
     BufferPoolManager* get_bpm() { return buffer_pool_manager_; }
 
-    RmManager* get_rm_manager() { return rm_manager_; }  
+    RmManager* get_rm_manager() { return rm_manager_; }
 
-    IxManager* get_ix_manager() { return ix_manager_; }  
-
-    int hidden_index_count() const;
+    IxManager* get_ix_manager() { return ix_manager_; }
 
     bool is_dir(const std::string& db_name);
 
@@ -66,11 +65,17 @@ class SmManager {
 
     void flush_meta();
 
+    void flush_all_pages();
+
+    void rebuild_all_indexes(TransactionManager *txn_manager);
+
+    // Recreate index files as empty trees without scanning table data. Used
+    // before a full WAL replay so recovery cost stays proportional to WAL.
+    void reset_all_indexes();
+
     void show_tables(Context* context);
 
     void desc_table(const std::string& tab_name, Context* context);
-
-    void show_index(const std::string& tab_name, Context* context);
 
     void create_table(const std::string& tab_name, const std::vector<ColDef>& col_defs, Context* context);
 
@@ -78,10 +83,9 @@ class SmManager {
 
     void create_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context);
 
-    bool create_internal_non_unique_index(const std::string& tab_name, const std::vector<std::string>& col_names,
-                                          Context* context);
-
     void drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context);
-    
+
     void drop_index(const std::string& tab_name, const std::vector<ColMeta>& col_names, Context* context);
+
+    void show_index(const std::string& tab_name, Context* context);
 };

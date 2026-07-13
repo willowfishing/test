@@ -56,18 +56,6 @@ struct Value {
     void init_raw(int len) {
         assert(raw == nullptr);
         raw = std::make_shared<RmRecord>(len);
-        write_raw_data(len);
-    }
-
-    void init_raw(int len, std::shared_ptr<RmRecord> raw_buffer) {
-        assert(raw == nullptr);
-        raw = std::move(raw_buffer);
-        raw->Resize(len);
-        write_raw_data(len);
-    }
-
-private:
-    void write_raw_data(int len) {
         if (type == TYPE_INT) {
             assert(len == sizeof(int));
             *(int *)(raw->data) = int_val;
@@ -92,15 +80,45 @@ struct Condition {
     bool is_rhs_val;  // true if right-hand side is a value (not a column)
     TabCol rhs_col;   // right-hand side column
     Value rhs_val;    // right-hand side value
+    // Text used by EXPLAIN ANALYZE. It is captured before semantic type
+    // coercion so a FLOAT column compared with integer literal 1000 still
+    // prints 1000, while an explicit float literal 1000.0 keeps its suffix.
+    std::string rhs_display;
 };
 
-enum class SetOp { ASSIGN, ADD, SUB, MUL, DIV };
+
+enum class AggFuncType { NONE, COUNT, MAX, MIN, SUM, AVG };
+
+struct QueryExpr {
+    bool is_aggregate{false};
+    AggFuncType agg_type{AggFuncType::NONE};
+    bool aggregate_star{false};
+    TabCol col;
+};
+
+struct SelectItemInfo {
+    QueryExpr expr;
+    std::string alias;
+    std::string output_name;
+};
+
+struct HavingCondition {
+    QueryExpr lhs;
+    CompOp op{OP_EQ};
+    bool is_rhs_val{true};
+    QueryExpr rhs_expr;
+    Value rhs_val;
+};
+
+struct OrderByInfo {
+    TabCol col;
+    bool is_desc{false};
+};
 
 struct SetClause {
     TabCol lhs;
-    SetOp op{SetOp::ASSIGN};
-    bool rhs_is_col{false};
-    TabCol rhs_col;
-    bool rhs_has_val{false};
     Value rhs;
+    bool self_ref{false};
+    TabCol rhs_col;
+    Value delta;
 };

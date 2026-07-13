@@ -10,9 +10,8 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
-#include <algorithm>
-#include <mutex>
-#include <vector>
+#include <map>
+#include <unordered_map>
 
 #include "transaction/transaction.h"
 
@@ -23,9 +22,7 @@ See the Mulan PSL v2 for more details. */
  */
 class Watermark {
 public:
-  explicit Watermark(timestamp_t commit_ts) : commit_ts_(commit_ts), watermark_(commit_ts) {
-    current_reads_.reserve(64);
-  }
+  explicit Watermark(timestamp_t commit_ts) : commit_ts_(commit_ts), watermark_(commit_ts) {}
 
   void AddTxn(timestamp_t read_ts);
 
@@ -40,8 +37,5 @@ public:
 
   timestamp_t watermark_;
 
-  std::vector<timestamp_t> current_reads_;
-
-private:
-  std::mutex latch_;
+  std::map<timestamp_t, int> current_reads_;
 };

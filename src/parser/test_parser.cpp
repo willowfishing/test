@@ -10,9 +10,6 @@ See the Mulan PSL v2 for more details. */
 #undef NDEBUG
 
 #include <cassert>
-#include <iostream>
-#include <string>
-#include <vector>
 
 #include "parser.h"
 
@@ -29,12 +26,29 @@ int main() {
         "insert into tb values (1, 3.14, 'pi');",
         "delete from tb where a = 1;",
         "update tb set a = 1, b = 2.2, c = 'xyz' where x = 2 and y < 1.1 and z > 'abc';",
+        "update tb set a=a+5 where a<3;",
+        "set transaction isolation level snapshot isolation;",
+        "set transaction isolation level serializable;",
+        "set transaction isolation level snapshot isolation",
+        "set transaction isolation level snapshot;",
+        "set session transaction isolation level serializable;",
+        "set session characteristics as transaction isolation level snapshot isolation;",
+        "set transaction isolation level snapshot_isolation;",
+        "set transaction isolation level ser;",
+        std::string("\xEF\xBB\xBF") + "set transaction isolation level serializable;",
         "select * from tb;",
         "select * from tb where x <> 2 and y >= 3. and z <= '123' and b < tb.a;",
         "select x.a, y.b from x, y where x.a = y.b and c = d;",
         "select x.a, y.b from x join y where x.a = y.b and c = d;",
+        "select c.name, o.order_id from customers c join orders o on c.customer_id = o.customer_id;",
+        "select c.name from customers as c, orders as o where c.customer_id = o.customer_id;",
+        "explain analyze select a, b from t where a > 1 and b < 10;",
+        "explain analyze select * from customers c join orders o on c.customer_id = o.customer_id where o.total_amount > 1000;",
+        "select max(a) as max_a, min(b), sum(b), avg(b), count(*), count(c) from tb;",
+        "select a, count(*) as n from tb where b > 0 group by a having count(*) > 1 order by n desc, a asc limit 5;",
         "exit;",
         "help;",
+        "create static_checkpoint;",
         "",
     };
     for (auto &sql : sqls) {

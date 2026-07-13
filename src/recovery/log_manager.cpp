@@ -1,175 +1,248 @@
 /* Copyright (c) 2023 Renmin University of China
-RMDB is licensed under Mulan PSL v2.
-You can use this software according to the terms and conditions of the Mulan PSL v2.
-You may obtain a copy of Mulan PSL v2 at:
-        http://license.coscl.org.cn/MulanPSL2
-THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
-EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
-MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
-See the Mulan PSL v2 for more details. */
+RMDB is licensed under Mulan PSL v2. */
 
-#include <chrono>
-#include <cstring>
 #include "log_manager.h"
 
+#include <algorithm>
+#include <limits>
+#include <stdexcept>
+
+#include "storage/disk_manager.h"
+
 namespace {
-constexpr int kGroupCommitMaxWaitUs = 50;
+
+template <typename T>
+void put(char *dest, int &offset, const T &value) {
+    std::memcpy(dest + offset, &value, sizeof(T));
+    offset += sizeof(T);
 }
 
-/**
- * @description: 添加日志记录到日志缓冲区中，并返回日志记录号
- * @param {LogRecord*} log_record 要写入缓冲区的日志记录
- * @return {lsn_t} 返回该日志的日志记录号（即该记录在日志文件中的字节偏移量）
- */
-lsn_t LogManager::add_log_to_buffer(LogRecord* log_record) {
-    std::unique_lock<std::mutex> lock(latch_);
-    lsn_t lsn = global_lsn_++;
-    log_record->lsn_ = lsn;
+template <typename T>
+T get(const char *src, int &offset) {
+    T value{};
+    std::memcpy(&value, src + offset, sizeof(T));
+    offset += sizeof(T);
+    return value;
+}
 
-    if (active_buffer_->is_full(log_record->log_tot_len_)) {
-        flush_active_buffer_unlocked(lock);
+void put_record(char *dest, int &offset, const RmRecord &record) {
+    const int32_t size = record.size;
+    put(dest, offset, size);
+    if (size > 0) {
+        std::memcpy(dest + offset, record.data, size);
+        offset += size;
     }
+}
 
-    // Track the file offset where this record will be written.
-    log_record->lsn_ = active_start_offset_ + active_buffer_->offset_;
-    log_record->serialize(active_buffer_->buffer_ + active_buffer_->offset_);
-    active_buffer_->offset_ += log_record->log_tot_len_;
-    next_log_offset_ = active_start_offset_ + active_buffer_->offset_;
-    ++append_epoch_;
-    group_flush_cv_.notify_one();
+void get_record(const char *src, int &offset, RmRecord &record) {
+    const int32_t size = get<int32_t>(src, offset);
+    if (size < 0) throw std::runtime_error("negative record length in log");
+    record = RmRecord(size);
+    if (size > 0) {
+        std::memcpy(record.data, src + offset, size);
+        offset += size;
+    }
+}
+
+void put_string(char *dest, int &offset, const std::string &value) {
+    if (value.size() > UINT32_MAX) throw std::runtime_error("log string is too large");
+    const uint32_t size = static_cast<uint32_t>(value.size());
+    put(dest, offset, size);
+    if (size > 0) {
+        std::memcpy(dest + offset, value.data(), size);
+        offset += static_cast<int>(size);
+    }
+}
+
+void get_string(const char *src, int &offset, std::string &value) {
+    const uint32_t size = get<uint32_t>(src, offset);
+    value.assign(src + offset, src + offset + size);
+    offset += static_cast<int>(size);
+}
+
+}  // namespace
+
+void InsertLogRecord::serialize(char *dest) const {
+    LogRecord::serialize(dest);
+    int offset = OFFSET_LOG_DATA;
+    put_record(dest, offset, insert_value_);
+    put(dest, offset, rid_);
+    put_string(dest, offset, table_name_);
+}
+
+void InsertLogRecord::deserialize(const char *src) {
+    LogRecord::deserialize(src);
+    int offset = OFFSET_LOG_DATA;
+    get_record(src, offset, insert_value_);
+    rid_ = get<Rid>(src, offset);
+    get_string(src, offset, table_name_);
+}
+
+void DeleteLogRecord::serialize(char *dest) const {
+    LogRecord::serialize(dest);
+    int offset = OFFSET_LOG_DATA;
+    put_record(dest, offset, delete_value_);
+    put(dest, offset, rid_);
+    const uint8_t logical = logical_delete_ ? 1 : 0;
+    put(dest, offset, logical);
+    put_string(dest, offset, table_name_);
+}
+
+void DeleteLogRecord::deserialize(const char *src) {
+    LogRecord::deserialize(src);
+    int offset = OFFSET_LOG_DATA;
+    get_record(src, offset, delete_value_);
+    rid_ = get<Rid>(src, offset);
+    logical_delete_ = get<uint8_t>(src, offset) != 0;
+    get_string(src, offset, table_name_);
+}
+
+void UpdateLogRecord::serialize(char *dest) const {
+    LogRecord::serialize(dest);
+    int offset = OFFSET_LOG_DATA;
+    put_record(dest, offset, old_value_);
+    put_record(dest, offset, new_value_);
+    put(dest, offset, rid_);
+    const uint8_t revival = tombstone_revival_ ? 1 : 0;
+    put(dest, offset, revival);
+    put_string(dest, offset, table_name_);
+}
+
+void UpdateLogRecord::deserialize(const char *src) {
+    LogRecord::deserialize(src);
+    int offset = OFFSET_LOG_DATA;
+    get_record(src, offset, old_value_);
+    get_record(src, offset, new_value_);
+    rid_ = get<Rid>(src, offset);
+    tombstone_revival_ = get<uint8_t>(src, offset) != 0;
+    get_string(src, offset, table_name_);
+}
+
+void CheckpointLogRecord::serialize(char *dest) const {
+    LogRecord::serialize(dest);
+    int offset = OFFSET_LOG_DATA;
+    const uint32_t active_count = static_cast<uint32_t>(active_txns_.size());
+    put(dest, offset, active_count);
+    for (txn_id_t txn_id : active_txns_) put(dest, offset, txn_id);
+    const uint32_t tombstone_count = static_cast<uint32_t>(tombstones_.size());
+    put(dest, offset, tombstone_count);
+    for (const auto &entry : tombstones_) {
+        put_string(dest, offset, entry.table_name);
+        put(dest, offset, entry.rid);
+    }
+}
+
+void CheckpointLogRecord::deserialize(const char *src) {
+    LogRecord::deserialize(src);
+    int offset = OFFSET_LOG_DATA;
+    const uint32_t active_count = get<uint32_t>(src, offset);
+    active_txns_.clear();
+    active_txns_.reserve(active_count);
+    for (uint32_t i = 0; i < active_count; ++i) active_txns_.push_back(get<txn_id_t>(src, offset));
+    const uint32_t tombstone_count = get<uint32_t>(src, offset);
+    tombstones_.clear();
+    tombstones_.reserve(tombstone_count);
+    for (uint32_t i = 0; i < tombstone_count; ++i) {
+        CheckpointTombstone entry;
+        get_string(src, offset, entry.table_name);
+        entry.rid = get<Rid>(src, offset);
+        tombstones_.push_back(std::move(entry));
+    }
+}
+
+std::unique_ptr<LogRecord> deserialize_log_record(const char *data, size_t size) {
+    if (size < LOG_HEADER_SIZE) return nullptr;
+    LogType type{};
+    uint32_t total = 0;
+    std::memcpy(&type, data + OFFSET_LOG_TYPE, sizeof(type));
+    std::memcpy(&total, data + OFFSET_LOG_TOT_LEN, sizeof(total));
+    if (total < LOG_HEADER_SIZE || total > size) return nullptr;
+
+    std::unique_ptr<LogRecord> record;
+    switch (type) {
+        case LogType::UPDATE: record = std::make_unique<UpdateLogRecord>(); break;
+        case LogType::INSERT: record = std::make_unique<InsertLogRecord>(); break;
+        case LogType::DELETE: record = std::make_unique<DeleteLogRecord>(); break;
+        case LogType::begin: record = std::make_unique<BeginLogRecord>(); break;
+        case LogType::commit: record = std::make_unique<CommitLogRecord>(); break;
+        case LogType::ABORT: record = std::make_unique<AbortLogRecord>(); break;
+        case LogType::CHECKPOINT: record = std::make_unique<CheckpointLogRecord>(); break;
+        default: return nullptr;
+    }
+    try {
+        record->deserialize(data);
+    } catch (...) {
+        return nullptr;
+    }
+    return record;
+}
+
+void LogManager::initialize_size_unlocked() {
+    if (persisted_bytes_ >= 0) return;
+    const int size = disk_manager_->get_file_size(LOG_FILE_NAME);
+    persisted_bytes_ = std::max(size, 0);
+}
+
+lsn_t LogManager::add_log_to_buffer(LogRecord *log_record) {
+    if (log_record == nullptr) return INVALID_LSN;
+    std::lock_guard<std::mutex> guard(latch_);
+    initialize_size_unlocked();
+
+    log_record->lsn_ = global_lsn_.fetch_add(1);
+    const size_t size = log_record->log_tot_len_;
+    if (size < LOG_HEADER_SIZE) throw std::runtime_error("invalid log record size");
+
+    std::vector<char> serialized(size);
+    log_record->serialize(serialized.data());
+
+    if (size > LOG_BUFFER_SIZE) {
+        flush_log_to_disk_unlocked(false);
+        disk_manager_->write_log(serialized.data(), static_cast<int>(size));
+        persisted_bytes_ += static_cast<int64_t>(size);
+        persist_lsn_ = log_record->lsn_;
+        return log_record->lsn_;
+    }
+    if (log_buffer_.is_full(size)) flush_log_to_disk_unlocked(false);
+    std::memcpy(log_buffer_.buffer_ + log_buffer_.offset_, serialized.data(), size);
+    log_buffer_.offset_ += static_cast<int>(size);
+    buffer_last_lsn_ = log_record->lsn_;
     return log_record->lsn_;
 }
 
-/**
- * @description: 把日志缓冲区的内容刷到磁盘中，由于目前只设置了一个缓冲区，因此需要阻塞其他日志操作
- */
+void LogManager::flush_log_to_disk_unlocked(bool sync) {
+    initialize_size_unlocked();
+    if (log_buffer_.offset_ == 0) {
+        if (sync) disk_manager_->sync_log();
+        return;
+    }
+    disk_manager_->write_log(log_buffer_.buffer_, log_buffer_.offset_);
+    if (sync) disk_manager_->sync_log();
+    persisted_bytes_ += log_buffer_.offset_;
+    persist_lsn_ = buffer_last_lsn_;
+    log_buffer_.reset();
+    buffer_last_lsn_ = INVALID_LSN;
+}
+
 void LogManager::flush_log_to_disk() {
-    std::unique_lock<std::mutex> lock(latch_);
-    flush_log_to_disk_until_unlocked(lock, next_log_offset_ - 1);
+    std::lock_guard<std::mutex> guard(latch_);
+    flush_log_to_disk_unlocked(false);
 }
 
-void LogManager::flush_log_to_disk_until(lsn_t target_lsn) {
-    std::unique_lock<std::mutex> lock(latch_);
-    flush_log_to_disk_until_unlocked(lock, target_lsn);
+void LogManager::force_log_to_disk() {
+    std::lock_guard<std::mutex> guard(latch_);
+    flush_log_to_disk_unlocked(true);
 }
 
-void LogManager::flush_log_to_disk_until_group(lsn_t target_lsn) {
-    std::unique_lock<std::mutex> lock(latch_);
-    if (target_lsn == INVALID_LSN || target_lsn <= persist_lsn_) {
-        return;
-    }
-
-    while (target_lsn > persist_lsn_) {
-        if (flush_in_progress_ || group_leader_waiting_) {
-            flush_cv_.wait(lock, [&] {
-                return target_lsn <= persist_lsn_ || (!flush_in_progress_ && !group_leader_waiting_);
-            });
-            continue;
-        }
-
-        if (active_buffer_->offset_ == 0) {
-            return;
-        }
-
-        group_leader_waiting_ = true;
-        uint64_t observed_epoch = append_epoch_;
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(kGroupCommitMaxWaitUs);
-        while (target_lsn > persist_lsn_ && std::chrono::steady_clock::now() < deadline) {
-            if (group_flush_cv_.wait_until(lock, deadline, [&] {
-                    return append_epoch_ != observed_epoch || flush_in_progress_;
-                })) {
-                observed_epoch = append_epoch_;
-                if (flush_in_progress_) {
-                    break;
-                }
-            }
-        }
-        group_leader_waiting_ = false;
-        flush_cv_.notify_all();
-
-        if (target_lsn <= persist_lsn_) {
-            return;
-        }
-        if (flush_in_progress_) {
-            continue;
-        }
-        flush_active_buffer_unlocked(lock);
-    }
+int64_t LogManager::current_log_offset() {
+    std::lock_guard<std::mutex> guard(latch_);
+    initialize_size_unlocked();
+    return persisted_bytes_ + log_buffer_.offset_;
 }
 
-void LogManager::flush_log_to_disk_until_unlocked(std::unique_lock<std::mutex> &lock, lsn_t target_lsn) {
-    if (target_lsn == INVALID_LSN || target_lsn <= persist_lsn_) {
-        return;
-    }
-
-    while (target_lsn > persist_lsn_) {
-        if (flush_in_progress_) {
-            flush_cv_.wait(lock, [&] { return !flush_in_progress_ || target_lsn <= persist_lsn_; });
-            continue;
-        }
-
-        if (active_buffer_->offset_ > 0) {
-            flush_active_buffer_unlocked(lock);
-        } else {
-            return;
-        }
-    }
-}
-
-void LogManager::flush_active_buffer_unlocked(std::unique_lock<std::mutex> &lock) {
-    if (active_buffer_->offset_ == 0) {
-        return;
-    }
-    while (flush_in_progress_) {
-        flush_cv_.wait(lock, [&] { return !flush_in_progress_; });
-    }
-
-    std::swap(active_buffer_, flush_buffer_);
-    flush_start_offset_ = active_start_offset_;
-    flush_size_ = flush_buffer_->offset_;
-    active_start_offset_ = flush_start_offset_ + flush_size_;
-    flush_in_progress_ = true;
-
-    char *flush_data = flush_buffer_->buffer_;
-    int flush_size = flush_size_;
-    lsn_t flush_start = flush_start_offset_;
-    lock.unlock();
-    try {
-        disk_manager_->write_log(flush_data, static_cast<size_t>(flush_size), flush_start);
-        lock.lock();
-    } catch (...) {
-        lock.lock();
-        flush_in_progress_ = false;
-        flush_cv_.notify_all();
-        throw;
-    }
-
-    persist_lsn_ = flush_start + flush_size - 1;
-    flush_buffer_->reset();
-    flush_size_ = 0;
-    flush_in_progress_ = false;
-    flush_cv_.notify_all();
-}
-
-lsn_t LogManager::get_log_file_offset() {
-    std::lock_guard<std::mutex> lock(latch_);
-    return next_log_offset_;
-}
-
-lsn_t LogManager::get_persist_lsn() {
-    std::lock_guard<std::mutex> lock(latch_);
-    return persist_lsn_;
-}
-
-void LogManager::reset_log_file_offset(lsn_t log_file_offset) {
-    std::unique_lock<std::mutex> lock(latch_);
-    while (flush_in_progress_) {
-        flush_cv_.wait(lock);
-    }
-    active_buffer_->reset();
-    flush_buffer_->reset();
-    active_start_offset_ = log_file_offset;
-    next_log_offset_ = log_file_offset;
-    persist_lsn_ = log_file_offset > 0 ? log_file_offset - 1 : INVALID_LSN;
-    global_lsn_.store(0, std::memory_order_relaxed);
+void LogManager::initialize_from_disk(lsn_t next_lsn, int64_t valid_log_size) {
+    std::lock_guard<std::mutex> guard(latch_);
+    global_lsn_ = std::max<lsn_t>(next_lsn, 0);
+    persisted_bytes_ = std::max<int64_t>(valid_log_size, 0);
+    log_buffer_.reset();
+    buffer_last_lsn_ = INVALID_LSN;
 }

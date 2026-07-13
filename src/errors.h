@@ -82,6 +82,12 @@ class IndexEntryNotFoundError : public RMDBError {
     IndexEntryNotFoundError() : RMDBError("Index entry not found") {}
 };
 
+class UniqueConstraintError : public RMDBError {
+   public:
+    explicit UniqueConstraintError(const std::string &tab_name)
+        : RMDBError("Unique index constraint violated on table: " + tab_name) {}
+};
+
 // SM errors
 class DatabaseNotFoundError : public RMDBError {
    public:
