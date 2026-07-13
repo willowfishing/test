@@ -10,355 +10,22 @@ See the Mulan PSL v2 for more details. */
 
 #include "buffer_pool_manager.h"
 
-#include "recovery/log_manager.h"
-
-namespace {
-constexpr size_t kFetchCacheSize = 256;
-
-struct FetchCacheEntry {
-    const BufferPoolManager *owner = nullptr;
-    PageId page_id{0, INVALID_PAGE_ID};
-    frame_id_t frame_id = INVALID_FRAME_ID;
-    uint64_t generation = 0;
-};
-
-thread_local FetchCacheEntry fetch_cache[kFetchCacheSize];
-
-size_t fetch_cache_slot(const PageId &page_id) {
-    return std::hash<PageId>()(page_id) & (kFetchCacheSize - 1);
-}
-}  // namespace
-
-BufferAccessClass BufferPoolManager::access_class_from_strategy(BufferAccessStrategy *strategy) {
-    return strategy == nullptr ? BufferAccessClass::Default : strategy->cls;
-}
-
-bool BufferPoolManager::access_class_uses_ring(BufferAccessClass access_class) const {
-    return access_class == BufferAccessClass::BulkRead || access_class == BufferAccessClass::IndexBuild;
-}
-
-bool BufferPoolManager::access_class_is_cold(BufferAccessClass access_class) const {
-    return access_class == BufferAccessClass::BulkRead || access_class == BufferAccessClass::ColdWrite ||
-           access_class == BufferAccessClass::IndexBuild;
-}
-
-void BufferPoolManager::set_frame_access_class(frame_id_t frame_id, BufferAccessClass access_class) {
-    if (frame_id != INVALID_FRAME_ID && static_cast<size_t>(frame_id) < frame_access_class_.size()) {
-        frame_access_class_[frame_id] = static_cast<uint8_t>(access_class);
-    }
-}
-
-void BufferPoolManager::note_frame_access(frame_id_t frame_id, BufferAccessClass access_class) {
-    if (frame_id == INVALID_FRAME_ID || static_cast<size_t>(frame_id) >= frame_access_class_.size() ||
-        access_class == BufferAccessClass::BulkRead || access_class == BufferAccessClass::ColdWrite ||
-        access_class == BufferAccessClass::IndexBuild) {
-        return;
-    }
-    auto previous_class = static_cast<BufferAccessClass>(frame_access_class_[frame_id]);
-    if (access_class == BufferAccessClass::Hot || previous_class != BufferAccessClass::Hot) {
-        frame_access_class_[frame_id] = static_cast<uint8_t>(access_class);
-    }
-}
-
-bool BufferPoolManager::try_reuse_strategy_frame(PageId page_id, BufferAccessStrategy *strategy,
-                                                 frame_id_t *frame_id) {
-    if (strategy == nullptr || frame_id == nullptr || strategy->ring.empty() ||
-        !access_class_uses_ring(strategy->cls)) {
-        return false;
-    }
-
-    const size_t ring_size = strategy->ring.size();
-    size_t start = strategy->hand % ring_size;
-    for (size_t offset = 0; offset < ring_size; ++offset) {
-        size_t slot = (start + offset) % ring_size;
-        frame_id_t candidate = strategy->ring[slot];
-        if (candidate == INVALID_FRAME_ID || static_cast<size_t>(candidate) >= pool_size_) {
-            continue;
-        }
-
-        std::scoped_lock<std::mutex> frame_lock(frame_latches_[candidate]);
-        Page *page = &pages_[candidate];
-        if (page->is_replacing_ || page->pin_count_ != 0 || page->is_dirty_ ||
-            page->id_.page_no == INVALID_PAGE_ID) {
-            continue;
-        }
-        PageId old_page_id = page->id_;
-        if (old_page_id == page_id) {
-            continue;
-        }
-
-        std::unique_lock<std::mutex> shard_lock(page_table_latch_for(old_page_id), std::try_to_lock);
-        if (!shard_lock.owns_lock()) {
-            continue;
-        }
-        auto &old_table = page_table_for(old_page_id);
-        auto it = old_table.find(old_page_id);
-        if (it == old_table.end() || it->second != candidate || page->pin_count_ != 0 || page->is_dirty_ ||
-            page->is_replacing_) {
-            continue;
-        }
-
-        mark_frame_pinned_locked(candidate);
-        page->is_replacing_ = true;
-        page->generation_++;
-        old_table.erase(it);
-        clear_dense_frame(old_page_id, candidate);
-        *frame_id = candidate;
-        strategy->hand = (slot + 1) % ring_size;
-        return true;
-    }
-    return false;
-}
-
-void BufferPoolManager::attach_frame_to_strategy_ring(BufferAccessStrategy *strategy, frame_id_t frame_id) {
-    if (strategy == nullptr || strategy->ring.empty() || !access_class_uses_ring(strategy->cls) ||
-        frame_id == INVALID_FRAME_ID || static_cast<size_t>(frame_id) >= pool_size_) {
-        return;
-    }
-    size_t slot = strategy->hand % strategy->ring.size();
-    strategy->ring[slot] = frame_id;
-    strategy->hand = (slot + 1) % strategy->ring.size();
-}
-
-size_t BufferPoolManager::page_table_shard_for(const PageId &page_id) const {
-    return std::hash<PageId>()(page_id) % page_table_shard_count_;
-}
-
-std::unordered_map<PageId, frame_id_t, PageIdHash> &BufferPoolManager::page_table_for(const PageId &page_id) {
-    return page_table_shards_[page_table_shard_for(page_id)].table;
-}
-
-std::mutex &BufferPoolManager::page_table_latch_for(const PageId &page_id) {
-    return page_table_shards_[page_table_shard_for(page_id)].latch;
-}
-
-frame_id_t BufferPoolManager::frame_id_for_page(Page *page) const {
-    if (page == nullptr) {
-        return INVALID_FRAME_ID;
-    }
-    auto base = reinterpret_cast<std::uintptr_t>(pages_);
-    auto ptr = reinterpret_cast<std::uintptr_t>(page);
-    auto end = base + sizeof(Page) * pool_size_;
-    if (ptr < base || ptr >= end) {
-        return INVALID_FRAME_ID;
-    }
-    auto offset = ptr - base;
-    if (offset % sizeof(Page) != 0) {
-        return INVALID_FRAME_ID;
-    }
-    return static_cast<frame_id_t>(offset / sizeof(Page));
-}
-
-Page *BufferPoolManager::fetch_page_from_cache(PageId page_id, BufferAccessClass access_class) {
-    FetchCacheEntry &entry = fetch_cache[fetch_cache_slot(page_id)];
-    if (entry.owner != this || !(entry.page_id == page_id) || entry.frame_id == INVALID_FRAME_ID ||
-        static_cast<size_t>(entry.frame_id) >= pool_size_) {
-        return nullptr;
-    }
-
-    std::scoped_lock<std::mutex> frame_lock(frame_latches_[entry.frame_id]);
-    Page *page = &pages_[entry.frame_id];
-    if (page->is_replacing_ || !(page->id_ == page_id) || page->generation_ != entry.generation) {
-        entry = FetchCacheEntry{};
-        return nullptr;
-    }
-    bool was_unpinned = page->pin_count_ == 0;
-    page->pin_count_++;
-    if (was_unpinned) {
-        mark_frame_pinned_locked(entry.frame_id);
-    }
-    note_frame_access(entry.frame_id, access_class);
-    return page;
-}
-
-BufferPoolManager::DenseFrameChunk *BufferPoolManager::dense_chunk_for(PageId page_id, bool create) {
-    if (page_id.fd < 0 || page_id.fd >= DiskManager::MAX_FD || page_id.page_no < 0 ||
-        page_id.page_no >= kDenseFramePageLimit) {
-        return nullptr;
-    }
-    auto &dir = dense_frame_dirs_[page_id.fd];
-    const size_t chunk_idx = static_cast<size_t>(page_id.page_no) >> kDenseFrameChunkBits;
-    DenseFrameChunk *chunk = dir.chunks[chunk_idx].load(std::memory_order_acquire);
-    if (chunk != nullptr || !create) {
-        return chunk;
-    }
-    std::scoped_lock<std::mutex> lock(dir.latch);
-    chunk = dir.chunks[chunk_idx].load(std::memory_order_acquire);
-    if (chunk == nullptr) {
-        chunk = new DenseFrameChunk();
-        dir.chunks[chunk_idx].store(chunk, std::memory_order_release);
-    }
-    return chunk;
-}
-
-frame_id_t BufferPoolManager::lookup_dense_frame(PageId page_id) {
-    DenseFrameChunk *chunk = dense_chunk_for(page_id, false);
-    if (chunk == nullptr) {
-        return INVALID_FRAME_ID;
-    }
-    const size_t slot = static_cast<size_t>(page_id.page_no) & (kDenseFrameChunkSize - 1);
-    return chunk->frames[slot].load(std::memory_order_acquire);
-}
-
-void BufferPoolManager::publish_dense_frame(PageId page_id, frame_id_t frame_id) {
-    if (frame_id == INVALID_FRAME_ID || static_cast<size_t>(frame_id) >= pool_size_) {
-        return;
-    }
-    DenseFrameChunk *chunk = dense_chunk_for(page_id, true);
-    if (chunk == nullptr) {
-        return;
-    }
-    const size_t slot = static_cast<size_t>(page_id.page_no) & (kDenseFrameChunkSize - 1);
-    chunk->frames[slot].store(frame_id, std::memory_order_release);
-}
-
-void BufferPoolManager::clear_dense_frame(PageId page_id, frame_id_t expected_frame_id) {
-    DenseFrameChunk *chunk = dense_chunk_for(page_id, false);
-    if (chunk == nullptr) {
-        return;
-    }
-    const size_t slot = static_cast<size_t>(page_id.page_no) & (kDenseFrameChunkSize - 1);
-    if (expected_frame_id == INVALID_FRAME_ID) {
-        chunk->frames[slot].store(INVALID_FRAME_ID, std::memory_order_release);
-        return;
-    }
-    frame_id_t current = expected_frame_id;
-    chunk->frames[slot].compare_exchange_strong(current, INVALID_FRAME_ID, std::memory_order_acq_rel,
-                                                std::memory_order_acquire);
-}
-
-Page *BufferPoolManager::fetch_page_from_dense(PageId page_id, BufferAccessClass access_class) {
-    frame_id_t frame_id = lookup_dense_frame(page_id);
-    if (frame_id == INVALID_FRAME_ID || static_cast<size_t>(frame_id) >= pool_size_) {
-        return nullptr;
-    }
-
-    std::scoped_lock<std::mutex> frame_lock(frame_latches_[frame_id]);
-    Page *page = &pages_[frame_id];
-    if (page->is_replacing_ || !(page->id_ == page_id)) {
-        clear_dense_frame(page_id, frame_id);
-        return nullptr;
-    }
-    bool was_unpinned = page->pin_count_ == 0;
-    page->pin_count_++;
-    if (was_unpinned) {
-        mark_frame_pinned_locked(frame_id);
-    }
-    remember_fetch_cache(page_id, frame_id, page->generation_);
-    note_frame_access(frame_id, access_class);
-    return page;
-}
-
-void BufferPoolManager::remember_fetch_cache(PageId page_id, frame_id_t frame_id, uint64_t generation) {
-    if (frame_id == INVALID_FRAME_ID || static_cast<size_t>(frame_id) >= pool_size_) {
-        return;
-    }
-    fetch_cache[fetch_cache_slot(page_id)] = FetchCacheEntry{this, page_id, frame_id, generation};
-}
-
-void BufferPoolManager::initialize_frame_for_page(Page *page, PageId page_id, bool bump_generation) {
-    page->reset_memory();
-    page->id_ = page_id;
-    page->pin_count_ = 1;
-    page->is_dirty_ = false;
-    if (bump_generation) {
-        page->generation_++;
-    }
-    page->is_replacing_ = true;
-}
-
-void BufferPoolManager::mark_frame_pinned_locked(frame_id_t frame_id) {
-    if (frame_id == INVALID_FRAME_ID || static_cast<size_t>(frame_id) >= pool_size_) {
-        return;
-    }
-    FrameEvictState state = frame_evict_states_[frame_id];
-    if (state == FrameEvictState::kInReplacer) {
-        replacer_->pin(frame_id);
-    }
-    frame_evict_states_[frame_id] = FrameEvictState::kPinned;
-}
-
-void BufferPoolManager::mark_frame_evictable_locked(frame_id_t frame_id) {
-    if (frame_id == INVALID_FRAME_ID || static_cast<size_t>(frame_id) >= pool_size_) {
-        return;
-    }
-    if (frame_evict_states_[frame_id] == FrameEvictState::kPinned) {
-        frame_evict_states_[frame_id] = FrameEvictState::kPending;
-        if (!pending_evictable_queued_[frame_id]) {
-            pending_evictable_queued_[frame_id] = 1;
-            std::scoped_lock<std::mutex> pending_lock(pending_evictable_latch_);
-            pending_evictable_frames_.push_back(frame_id);
-        }
-    }
-}
-
-void BufferPoolManager::drain_pending_evictable() {
-    std::vector<frame_id_t> frames;
-    {
-        std::scoped_lock<std::mutex> pending_lock(pending_evictable_latch_);
-        if (pending_evictable_frames_.empty()) {
-            return;
-        }
-        frames.swap(pending_evictable_frames_);
-    }
-    for (frame_id_t frame_id : frames) {
-        if (frame_id == INVALID_FRAME_ID || static_cast<size_t>(frame_id) >= pool_size_) {
-            continue;
-        }
-        std::scoped_lock<std::mutex> frame_lock(frame_latches_[frame_id]);
-        pending_evictable_queued_[frame_id] = 0;
-        Page *page = &pages_[frame_id];
-        if (frame_evict_states_[frame_id] == FrameEvictState::kPending && !page->is_replacing_ &&
-            page->pin_count_ == 0 && page->id_.page_no != INVALID_PAGE_ID) {
-            auto access_class = static_cast<BufferAccessClass>(frame_access_class_[frame_id]);
-            if (access_class_is_cold(access_class)) {
-                replacer_->unpin_cold(frame_id);
-            } else {
-                replacer_->unpin(frame_id);
-            }
-            frame_evict_states_[frame_id] = FrameEvictState::kInReplacer;
-        }
-    }
-}
-
-void BufferPoolManager::ensure_wal_before_page_flush(Page *page) {
-    if (page == nullptr || !page->is_dirty_ || log_manager_ == nullptr) {
-        return;
-    }
-    log_manager_->flush_log_to_disk_until(page->get_page_lsn());
-}
-
 /**
  * @description: 从free_list或replacer中得到可淘汰帧页的 *frame_id
  * @return {bool} true: 可替换帧查找成功 , false: 可替换帧查找失败
  * @param {frame_id_t*} frame_id 帧页id指针,返回成功找到的可替换帧id
  */
-bool BufferPoolManager::find_victim_page(frame_id_t* frame_id) {
-    return find_victim_page(frame_id, nullptr);
-}
-
-bool BufferPoolManager::find_victim_page(frame_id_t* frame_id, VictimSource *source) {
+bool BufferPoolManager::find_victim_page(frame_id_t *frame_id)
+{
+    // Todo:
+    // 1 使用BufferPoolManager::free_list_判断缓冲池是否已满需要淘汰页面
+    if (!free_list_.empty())
     {
-        std::scoped_lock<std::mutex> lock(free_list_latch_);
-        if (!free_list_.empty()) {
-            *frame_id = free_list_.front();
-            free_list_.pop_front();
-            if (source != nullptr) {
-                *source = VictimSource::kFreeList;
-            }
-            return true;
-        }
+        *frame_id = free_list_.front(); // 从free_list_中获取一个可用的frame_id
+        free_list_.pop_front();         // 从free_list_中移除该frame_id
+        return true;                    // 成功找到一个可替换帧
     }
-    drain_pending_evictable();
-    if (replacer_->victim(frame_id)) {
-        std::scoped_lock<std::mutex> frame_lock(frame_latches_[*frame_id]);
-        frame_evict_states_[*frame_id] = FrameEvictState::kPinned;
-        if (source != nullptr) {
-            *source = VictimSource::kReplacer;
-        }
-        return true;
-    }
-    return false;
+    return replacer_->victim(frame_id); // 从replacer_中获取一个可替换的frame_id
 }
 
 /**
@@ -367,26 +34,36 @@ bool BufferPoolManager::find_victim_page(frame_id_t* frame_id, VictimSource *sou
  * @param {PageId} new_page_id 新的page_id
  * @param {frame_id_t} new_frame_id 新的帧frame_id
  */
-void BufferPoolManager::update_page(Page *page, PageId new_page_id, frame_id_t new_frame_id) {
-    if (page->id_.page_no != INVALID_PAGE_ID) {
-        if (page->is_dirty_) {
-            ensure_wal_before_page_flush(page);
-            disk_manager_->write_page(page->id_.fd, page->id_.page_no, page->data_, PAGE_SIZE);
-            if (perf_stats_ != nullptr) {
-                perf_stats_->RecordDirtyFlush();
-            }
-            page->is_dirty_ = false;
+void BufferPoolManager::update_page(Page *page, PageId new_page_id, frame_id_t new_frame_id)
+{
+    // Todo:
+    // 1 如果是脏页，写回磁盘，并且把dirty置为false
+
+    // 2 更新page table
+    // 3 重置page的data，更新page id
+
+    // 获取要替换的帧
+    Page &frame = pages_[new_frame_id];
+    // 如果是脏页有效，写回磁盘
+    PageId old_id = frame.get_page_id();
+    if (old_id.page_no != INVALID_PAGE_ID)
+    {
+        if (frame.is_dirty())
+        {
+            disk_manager_->write_page(old_id.fd, old_id.page_no, frame.get_data(), PAGE_SIZE);
+            frame.is_dirty_ = false;
         }
-        auto &old_table = page_table_for(page->id_);
-        old_table.erase(page->id_);
-        clear_dense_frame(page->id_, new_frame_id);
+        // 从页表中移除旧映射
+        page_table_.erase(old_id);
     }
-    page->reset_memory();
-    page->id_ = new_page_id;
-    page->pin_count_ = 0;
-    page->is_dirty_ = false;
-    page_table_for(new_page_id)[new_page_id] = new_frame_id;
-    publish_dense_frame(new_page_id, new_frame_id);
+    // 更新页表
+    frame.id_ = new_page_id;
+    frame.reset_memory();
+    frame.is_dirty_ = false;
+    frame.pin_count_ = 1;
+
+    // 在页表中建立新的映射
+    page_table_[new_page_id] = new_frame_id;
 }
 
 /**
@@ -396,158 +73,44 @@ void BufferPoolManager::update_page(Page *page, PageId new_page_id, frame_id_t n
  * @return {Page*} 若获得了需要的页则将其返回，否则返回nullptr
  * @param {PageId} page_id 需要获取的页的PageId
  */
-Page* BufferPoolManager::fetch_page(PageId page_id, BufferAccessStrategy *strategy) {
-    BufferAccessClass access_class = access_class_from_strategy(strategy);
-    if (Page *cached_page = fetch_page_from_cache(page_id, access_class)) {
-        if (perf_stats_ != nullptr) {
-            perf_stats_->RecordBufferPoolHit();
-        }
-        return cached_page;
-    }
-    if (Page *dense_page = fetch_page_from_dense(page_id, access_class)) {
-        if (perf_stats_ != nullptr) {
-            perf_stats_->RecordBufferPoolHit();
-        }
-        return dense_page;
-    }
-
+Page *BufferPoolManager::fetch_page(PageId page_id)
+{
+    std::scoped_lock lock{latch_};
+    // Todo:
+    //  1.     从page_table_中搜寻目标页
+    auto it = page_table_.find(page_id);
+    if (it != page_table_.end())
     {
-        std::scoped_lock<std::mutex> shard_lock(page_table_latch_for(page_id));
-        auto &table = page_table_for(page_id);
-        auto it = table.find(page_id);
-        if (it != table.end()) {
-            frame_id_t frame_id = it->second;
-            std::scoped_lock<std::mutex> frame_lock(frame_latches_[frame_id]);
-            Page *page = &pages_[frame_id];
-            bool was_unpinned = page->pin_count_ == 0;
-            page->pin_count_++;
-            if (was_unpinned) {
-                mark_frame_pinned_locked(frame_id);
-            }
-            remember_fetch_cache(page_id, frame_id, page->generation_);
-            note_frame_access(frame_id, access_class);
-            if (perf_stats_ != nullptr) {
-                perf_stats_->RecordBufferPoolHit();
-            }
-            return page;
-        }
+        frame_id_t frame_id = it->second; // 获取目标页所在的frame_id
+        Page &p = pages_[frame_id];       // 获取目标页所在的Page对象
+        ++p.pin_count_;                   // 固定目标页，pin_count自增
+        replacer_->pin(frame_id);         // 将该frame_id从replacer_中移除
+        return &p;                        // 返回目标页
     }
-
-    std::scoped_lock slow_lock{slow_path_latch_};
+    //  1.2    否则，尝试调用find_victim_page获得一个可用的frame，若失败则返回nullptr
+    frame_id_t fid;
+    if (!find_victim_page(&fid))
     {
-        std::scoped_lock<std::mutex> shard_lock(page_table_latch_for(page_id));
-        auto &table = page_table_for(page_id);
-        auto it = table.find(page_id);
-        if (it != table.end()) {
-            frame_id_t frame_id = it->second;
-            std::scoped_lock<std::mutex> frame_lock(frame_latches_[frame_id]);
-            Page *page = &pages_[frame_id];
-            bool was_unpinned = page->pin_count_ == 0;
-            page->pin_count_++;
-            if (was_unpinned) {
-                mark_frame_pinned_locked(frame_id);
-            }
-            remember_fetch_cache(page_id, frame_id, page->generation_);
-            note_frame_access(frame_id, access_class);
-            if (perf_stats_ != nullptr) {
-                perf_stats_->RecordBufferPoolHit();
-            }
-            return page;
-        }
+        return nullptr; // 没有可用的frame
     }
-
-    frame_id_t strategy_frame_id = INVALID_FRAME_ID;
-    if (try_reuse_strategy_frame(page_id, strategy, &strategy_frame_id)) {
-        Page *page = &pages_[strategy_frame_id];
-        {
-            std::scoped_lock<std::mutex> frame_lock(frame_latches_[strategy_frame_id]);
-            initialize_frame_for_page(page, page_id, false);
-            if (perf_stats_ != nullptr) {
-                perf_stats_->RecordBufferPoolMiss();
-                perf_stats_->RecordBufferPoolEviction();
-            }
-            disk_manager_->read_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
-            set_frame_access_class(strategy_frame_id, access_class);
-            std::scoped_lock<std::mutex> shard_lock(page_table_latch_for(page_id));
-            page_table_for(page_id)[page_id] = strategy_frame_id;
-            page->is_replacing_ = false;
-            publish_dense_frame(page_id, strategy_frame_id);
-            remember_fetch_cache(page_id, strategy_frame_id, page->generation_);
+    Page &victim = pages_[fid];           // 获取victim page
+    PageId old_id = victim.get_page_id(); // 获取victim page的page_id
+    if (old_id.page_no != INVALID_PAGE_ID)
+    { // 如果victim page有效
+        if (victim.is_dirty())
+        { // 如果victim page是脏页，则写回磁盘
+            disk_manager_->write_page(old_id.fd, old_id.page_no, victim.get_data(), PAGE_SIZE);
+            victim.is_dirty_ = false;
         }
-        return page;
+        page_table_.erase(old_id); // 从页表中移除victim page的映射
     }
-
-    frame_id_t frame_id;
-    VictimSource source;
-    while (find_victim_page(&frame_id, &source)) {
-        Page *page = &pages_[frame_id];
-        if (source == VictimSource::kFreeList) {
-            std::scoped_lock<std::mutex> frame_lock(frame_latches_[frame_id]);
-            initialize_frame_for_page(page, page_id, true);
-            if (perf_stats_ != nullptr) {
-                perf_stats_->RecordBufferPoolMiss();
-            }
-            disk_manager_->read_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
-            set_frame_access_class(frame_id, access_class);
-            std::scoped_lock<std::mutex> shard_lock(page_table_latch_for(page_id));
-            page_table_for(page_id)[page_id] = frame_id;
-            page->is_replacing_ = false;
-            publish_dense_frame(page_id, frame_id);
-            remember_fetch_cache(page_id, frame_id, page->generation_);
-            attach_frame_to_strategy_ring(strategy, frame_id);
-            return page;
-        }
-
-        PageId old_page_id = page->id_;
-        bool need_flush = false;
-        {
-            std::scoped_lock<std::mutex> shard_lock(page_table_latch_for(old_page_id));
-            std::scoped_lock<std::mutex> frame_lock(frame_latches_[frame_id]);
-            auto &old_table = page_table_for(old_page_id);
-            auto it = old_table.find(old_page_id);
-            if (it == old_table.end() || it->second != frame_id || page->pin_count_ != 0) {
-                if (page->pin_count_ == 0) {
-                    mark_frame_evictable_locked(frame_id);
-                }
-                continue;
-            }
-            page->is_replacing_ = true;
-            page->generation_++;
-            need_flush = page->is_dirty_;
-            old_table.erase(it);
-            clear_dense_frame(old_page_id, frame_id);
-        }
-
-        {
-            std::scoped_lock<std::mutex> frame_lock(frame_latches_[frame_id]);
-            if (need_flush) {
-                ensure_wal_before_page_flush(page);
-                disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, page->data_, PAGE_SIZE);
-                if (perf_stats_ != nullptr) {
-                    perf_stats_->RecordDirtyFlush();
-                }
-                page->is_dirty_ = false;
-            }
-            initialize_frame_for_page(page, page_id, false);
-            if (perf_stats_ != nullptr) {
-                perf_stats_->RecordBufferPoolMiss();
-                perf_stats_->RecordBufferPoolEviction();
-            }
-            disk_manager_->read_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
-            set_frame_access_class(frame_id, access_class);
-            std::scoped_lock<std::mutex> shard_lock(page_table_latch_for(page_id));
-            page_table_for(page_id)[page_id] = frame_id;
-            page->is_replacing_ = false;
-            publish_dense_frame(page_id, frame_id);
-            remember_fetch_cache(page_id, frame_id, page->generation_);
-            attach_frame_to_strategy_ring(strategy, frame_id);
-        }
-        return page;
-    }
-    if (perf_stats_ != nullptr) {
-        perf_stats_->RecordPinFailure();
-    }
-    return nullptr;
+    disk_manager_->read_page(page_id.fd, page_id.page_no, victim.get_data(), PAGE_SIZE);
+    victim.id_ = page_id;       // 更新victim page的page_id
+    victim.pin_count_ = 1;      // 固定victim page，pin_count置1
+    victim.is_dirty_ = false;   // 更新victim page的is_dirty
+    page_table_[page_id] = fid; // 在页表中建立目标页的映射
+    replacer_->pin(fid);        // 将该frame_id从replacer_中移除
+    return &victim;             // 返回目标页
 }
 
 /**
@@ -556,45 +119,46 @@ Page* BufferPoolManager::fetch_page(PageId page_id, BufferAccessStrategy *strate
  * @param {PageId} page_id 目标page的page_id
  * @param {bool} is_dirty 若目标page应该被标记为dirty则为true，否则为false
  */
-bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
-    std::scoped_lock<std::mutex> shard_lock(page_table_latch_for(page_id));
-    auto &table = page_table_for(page_id);
-    auto it = table.find(page_id);
-    if (it == table.end()) {
-        return false;
-    }
-    frame_id_t frame_id = it->second;
-    std::scoped_lock<std::mutex> frame_lock(frame_latches_[frame_id]);
-    Page *page = &pages_[frame_id];
-    if (page->pin_count_ <= 0) {
-        return false;
-    }
-    if (is_dirty) {
-        page->is_dirty_ = true;
-    }
-    page->pin_count_--;
-    if (page->pin_count_ == 0) {
-        mark_frame_evictable_locked(frame_id);
-    }
-    return true;
-}
+bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty)
+{
+    // Todo:
+    // 0. lock latch
+    // 1. 尝试在page_table_中搜寻page_id对应的页P
+    // 1.1 P在页表中不存在 return false
+    // 1.2 P在页表中存在，获取其pin_count_
+    // 2.1 若pin_count_已经等于0，则返回false
+    // 2.2 若pin_count_大于0，则pin_count_自减一
+    // 2.2.1 若自减后等于0，则调用replacer_的Unpin
+    // 3 根据参数is_dirty，更改P的is_dirty_
 
-bool BufferPoolManager::unpin_page_fast(Page *page, PageId expected_page_id, bool is_dirty) {
-    frame_id_t frame_id = frame_id_for_page(page);
-    if (frame_id == INVALID_FRAME_ID) {
+    std::scoped_lock lock{latch_};
+
+    auto it = page_table_.find(page_id);
+    if (it == page_table_.end())
+    {
         return false;
     }
-    std::scoped_lock<std::mutex> frame_lock(frame_latches_[frame_id]);
-    if (page->is_replacing_ || !(page->id_ == expected_page_id) || page->pin_count_ <= 0) {
+    frame_id_t fid = it->second;
+    Page &p = pages_[fid];
+
+    if (p.pin_count_ <= 0)
+    {
         return false;
     }
-    if (is_dirty) {
-        page->is_dirty_ = true;
+
+    // 递减 pin_count
+    --p.pin_count_;
+    if (is_dirty)
+    {
+        p.is_dirty_ = true;
     }
-    page->pin_count_--;
-    if (page->pin_count_ == 0) {
-        mark_frame_evictable_locked(frame_id);
+
+    // 若 pin_count 变为 0，则该帧可被替换器回收
+    if (p.pin_count_ == 0)
+    {
+        replacer_->unpin(fid);
     }
+
     return true;
 }
 
@@ -603,23 +167,27 @@ bool BufferPoolManager::unpin_page_fast(Page *page, PageId expected_page_id, boo
  * @return {bool} 成功则返回true，否则返回false(只有page_table_中没有目标页时)
  * @param {PageId} page_id 目标页的page_id，不能为INVALID_PAGE_ID
  */
-bool BufferPoolManager::flush_page(PageId page_id) {
-    std::scoped_lock<std::mutex> shard_lock(page_table_latch_for(page_id));
-    auto &table = page_table_for(page_id);
-    auto it = table.find(page_id);
-    if (it == table.end()) {
+bool BufferPoolManager::flush_page(PageId page_id)
+{
+    // Todo:
+    // 0. lock latch
+    // 1. 查找页表,尝试获取目标页P
+    // 1.1 目标页P没有被page_table_记录 ，返回false
+    // 2. 无论P是否为脏都将其写回磁盘。
+    // 3. 更新P的is_dirty_
+    std::scoped_lock lock{latch_};
+
+    auto it = page_table_.find(page_id);
+    if (it == page_table_.end())
+    {
         return false;
     }
-    frame_id_t frame_id = it->second;
-    std::scoped_lock<std::mutex> frame_lock(frame_latches_[frame_id]);
-    Page *page = &pages_[frame_id];
-    bool was_dirty = page->is_dirty_;
-    ensure_wal_before_page_flush(page);
-    disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
-    if (was_dirty && perf_stats_ != nullptr) {
-        perf_stats_->RecordDirtyFlush();
-    }
-    page->is_dirty_ = false;
+    frame_id_t fid = it->second;
+    Page &p = pages_[fid];
+
+    // 无论是否脏，都写回磁盘，之后清除脏标志
+    disk_manager_->write_page(page_id.fd, page_id.page_no, p.get_data(), PAGE_SIZE);
+    p.is_dirty_ = false;
     return true;
 }
 
@@ -628,66 +196,55 @@ bool BufferPoolManager::flush_page(PageId page_id) {
  * @return {Page*} 返回新创建的page，若创建失败则返回nullptr
  * @param {PageId*} page_id 当成功创建一个新的page时存储其page_id
  */
-Page* BufferPoolManager::new_page(PageId* page_id, BufferAccessStrategy *strategy) {
-    BufferAccessClass access_class = access_class_from_strategy(strategy);
-    std::scoped_lock slow_lock{slow_path_latch_};
-    frame_id_t frame_id;
-    VictimSource source;
-    while (find_victim_page(&frame_id, &source)) {
-        Page *page = &pages_[frame_id];
-        bool need_flush = false;
-        PageId old_page_id = page->id_;
+Page *BufferPoolManager::new_page(PageId *page_id)
+{
+    // 1.   获得一个可用的frame，若无法获得则返回nullptr
+    // 2.   在fd对应的文件分配一个新的page_id
+    // 3.   将frame的数据写回磁盘
+    // 4.   固定frame，更新pin_count_
+    // 5.   返回获得的page
+    std::scoped_lock lock{latch_};
 
-        if (source == VictimSource::kReplacer) {
-            std::scoped_lock<std::mutex> shard_lock(page_table_latch_for(old_page_id));
-            std::scoped_lock<std::mutex> frame_lock(frame_latches_[frame_id]);
-            auto &old_table = page_table_for(old_page_id);
-            auto it = old_table.find(old_page_id);
-            if (it == old_table.end() || it->second != frame_id || page->pin_count_ != 0) {
-                if (page->pin_count_ == 0) {
-                    mark_frame_evictable_locked(frame_id);
-                }
-                continue;
-            }
-            page->is_replacing_ = true;
-            page->generation_++;
-            need_flush = page->is_dirty_;
-            old_table.erase(it);
-            clear_dense_frame(old_page_id, frame_id);
-        } else {
-            std::scoped_lock<std::mutex> frame_lock(frame_latches_[frame_id]);
-            page->is_replacing_ = true;
-            page->generation_++;
-        }
+    // 参数必须包含目标 fd
+    if (page_id == nullptr || page_id->fd < 0)
+    {
+        return nullptr;
+    }
 
-        page_id->page_no = disk_manager_->allocate_page(page_id->fd);
+    frame_id_t fid;
+    if (!find_victim_page(&fid))
+    {
+        return nullptr; // 没有可用帧
+    }
+
+    Page &frame = pages_[fid];
+    PageId old_id = frame.get_page_id();
+
+    // 如果旧页有效且为脏，写回磁盘并移除页表映射
+    if (old_id.page_no != INVALID_PAGE_ID)
+    {
+        if (frame.is_dirty())
         {
-            std::scoped_lock<std::mutex> frame_lock(frame_latches_[frame_id]);
-            if (need_flush) {
-                ensure_wal_before_page_flush(page);
-                disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, page->data_, PAGE_SIZE);
-                if (perf_stats_ != nullptr) {
-                    perf_stats_->RecordDirtyFlush();
-                }
-                page->is_dirty_ = false;
-            }
-            initialize_frame_for_page(page, *page_id, false);
-            if (source == VictimSource::kReplacer && perf_stats_ != nullptr) {
-                perf_stats_->RecordBufferPoolEviction();
-            }
-            set_frame_access_class(frame_id, access_class);
-            std::scoped_lock<std::mutex> shard_lock(page_table_latch_for(*page_id));
-            page_table_for(*page_id)[*page_id] = frame_id;
-            page->is_replacing_ = false;
-            publish_dense_frame(*page_id, frame_id);
-            remember_fetch_cache(*page_id, frame_id, page->generation_);
+            disk_manager_->write_page(old_id.fd, old_id.page_no, frame.get_data(), PAGE_SIZE);
+            frame.is_dirty_ = false;
         }
-        return page;
+        page_table_.erase(old_id);
     }
-    if (perf_stats_ != nullptr) {
-        perf_stats_->RecordPinFailure();
-    }
-    return nullptr;
+
+    // 在磁盘文件中分配新的 page_no（fd 由调用者提供）
+    page_id->page_no = disk_manager_->allocate_page(page_id->fd);
+
+    // 重置帧为新页面
+    frame.id_ = *page_id;
+    frame.reset_memory();
+    frame.pin_count_ = 1;
+    frame.is_dirty_ = false;
+
+    // 更新页表并固定该帧
+    page_table_[*page_id] = fid;
+    replacer_->pin(fid);
+
+    return &frame;
 }
 
 /**
@@ -695,214 +252,69 @@ Page* BufferPoolManager::new_page(PageId* page_id, BufferAccessStrategy *strateg
  * @return {bool} 如果目标页不存在于buffer_pool或者成功被删除则返回true，若其存在于buffer_pool但无法删除则返回false
  * @param {PageId} page_id 目标页
  */
-bool BufferPoolManager::delete_page(PageId page_id) {
-    std::scoped_lock slow_lock{slow_path_latch_};
-    frame_id_t frame_id = INVALID_FRAME_ID;
-    Page *page = nullptr;
-    bool need_flush = false;
+bool BufferPoolManager::delete_page(PageId page_id)
+{
+    // 1.   在page_table_中查找目标页，若不存在返回true
+    // 2.   若目标页的pin_count不为0，则返回false
+    // 3.   将目标页数据写回磁盘，从页表中删除目标页，重置其元数据，将其加入free_list_，返回true
+    std::scoped_lock lock{latch_};
+
+    auto it = page_table_.find(page_id);
+    if (it == page_table_.end())
     {
-        std::scoped_lock<std::mutex> shard_lock(page_table_latch_for(page_id));
-        auto &table = page_table_for(page_id);
-        auto it = table.find(page_id);
-        if (it == table.end()) {
-            disk_manager_->deallocate_page(page_id.page_no);
-            return true;
-        }
-        frame_id = it->second;
-        std::scoped_lock<std::mutex> frame_lock(frame_latches_[frame_id]);
-        page = &pages_[frame_id];
-        if (page->pin_count_ != 0) {
-            return false;
-        }
-        mark_frame_pinned_locked(frame_id);
-        page->is_replacing_ = true;
-        page->generation_++;
-        need_flush = page->is_dirty_;
-        table.erase(it);
-        clear_dense_frame(page_id, frame_id);
+        // 不在缓冲池中，调用磁盘层释放（若支持）
+        disk_manager_->deallocate_page(page_id.page_no);
+        return true;
     }
+
+    frame_id_t fid = it->second;
+    Page &p = pages_[fid];
+
+    // 如果正在被使用，不能删除
+    if (p.pin_count_ > 0)
     {
-        std::scoped_lock<std::mutex> frame_lock(frame_latches_[frame_id]);
-        if (need_flush) {
-            ensure_wal_before_page_flush(page);
-            disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
-            if (perf_stats_ != nullptr) {
-                perf_stats_->RecordDirtyFlush();
-            }
-        }
-        page->reset_memory();
-        page->id_ = PageId{0, INVALID_PAGE_ID};
-        page->is_dirty_ = false;
-        page->pin_count_ = 0;
-        page->is_replacing_ = false;
+        return false;
     }
+
+    // 若脏，先写回磁盘
+    if (p.is_dirty())
     {
-        std::scoped_lock<std::mutex> free_lock(free_list_latch_);
-        free_list_.push_back(frame_id);
+        disk_manager_->write_page(page_id.fd, page_id.page_no, p.get_data(), PAGE_SIZE);
+        p.is_dirty_ = false;
     }
+
+    // 从页表移除并重置该帧，将其放回 free_list_
+    page_table_.erase(it);
+    p.id_.page_no = INVALID_PAGE_ID;
+    p.reset_memory();
+    p.pin_count_ = 0;
+    free_list_.push_back(fid);
+
+    // 可选择通知替换器（确保不在替换器候选中）
+    replacer_->pin(fid); // 将其从候选集中移除（如果在的话）
+    replacer_->pin(fid); // 安全无害（pin 对不存在项无动作）
+
+    // 在磁盘层释放该页（可选）
     disk_manager_->deallocate_page(page_id.page_no);
     return true;
 }
 
 /**
- * @description: 将buffer_pool中的脏页写回到磁盘
- * @param {int} fd 文件句柄，负数表示所有文件
- * @return 实际写回的脏页数量
+ * @description: 将buffer_pool中的所有页写回到磁盘
+ * @param {int} fd 文件句柄
  */
-size_t BufferPoolManager::flush_all_pages(int fd) {
-    std::vector<FlushCandidate> candidates;
-    lsn_t max_page_lsn = INVALID_LSN;
+void BufferPoolManager::flush_all_pages(int fd)
+{
+    std::scoped_lock lock{latch_};
 
-    for (size_t shard_idx = 0; shard_idx < page_table_shard_count_; ++shard_idx) {
-        std::scoped_lock<std::mutex> shard_lock(page_table_shards_[shard_idx].latch);
-        for (auto &entry : page_table_shards_[shard_idx].table) {
-            if (fd < 0 || entry.first.fd == fd) {
-                frame_id_t frame_id = entry.second;
-                std::scoped_lock<std::mutex> frame_lock(frame_latches_[frame_id]);
-                Page *page = &pages_[frame_id];
-                if (page->id_ == entry.first && page->is_dirty_) {
-                    lsn_t page_lsn = page->get_page_lsn();
-                    candidates.push_back(FlushCandidate{entry.first, frame_id, page_lsn});
-                    if (page_lsn > max_page_lsn) {
-                        max_page_lsn = page_lsn;
-                    }
-                }
-            }
-        }
+    for (auto &entry : page_table_)
+    {
+        const PageId &pid = entry.first;
+        frame_id_t fid = entry.second;
+        if (pid.fd != fd)
+            continue;
+        Page &p = pages_[fid];
+        disk_manager_->write_page(pid.fd, pid.page_no, p.get_data(), PAGE_SIZE);
+        p.is_dirty_ = false;
     }
-
-    if (log_manager_ != nullptr && max_page_lsn != INVALID_LSN) {
-        log_manager_->flush_log_to_disk_until(max_page_lsn);
-    }
-
-    size_t flushed_pages = 0;
-    for (const auto &candidate : candidates) {
-        std::scoped_lock<std::mutex> frame_lock(frame_latches_[candidate.frame_id]);
-        Page *page = &pages_[candidate.frame_id];
-        if (page->id_ == candidate.page_id && page->is_dirty_) {
-            disk_manager_->write_page(candidate.page_id.fd, candidate.page_id.page_no, page->data_, PAGE_SIZE);
-            if (perf_stats_ != nullptr) {
-                perf_stats_->RecordDirtyFlush();
-            }
-            page->is_dirty_ = false;
-            ++flushed_pages;
-        }
-    }
-    return flushed_pages;
-}
-
-size_t BufferPoolManager::flush_unpinned_pages_batch(size_t max_pages, size_t max_frames,
-                                                     size_t *next_frame, bool *pass_complete) {
-    if (next_frame == nullptr || pass_complete == nullptr || max_pages == 0 || max_frames == 0 ||
-        pool_size_ == 0) {
-        return 0;
-    }
-
-    *pass_complete = false;
-    size_t frame = *next_frame < pool_size_ ? *next_frame : 0;
-    size_t scanned = 0;
-    std::vector<FlushCandidate> candidates;
-    candidates.reserve(std::min(max_pages, max_frames));
-    lsn_t max_page_lsn = INVALID_LSN;
-    while (scanned < max_frames && candidates.size() < max_pages) {
-        {
-            std::scoped_lock<std::mutex> frame_lock(frame_latches_[frame]);
-            Page *page = &pages_[frame];
-            if (!page->is_replacing_ && page->pin_count_ == 0 && page->id_.page_no != INVALID_PAGE_ID &&
-                page->is_dirty_) {
-                lsn_t page_lsn = page->get_page_lsn();
-                candidates.push_back(FlushCandidate{page->id_, static_cast<frame_id_t>(frame), page_lsn});
-                if (page_lsn > max_page_lsn) {
-                    max_page_lsn = page_lsn;
-                }
-            }
-        }
-
-        ++scanned;
-        ++frame;
-        if (frame == pool_size_) {
-            frame = 0;
-            *pass_complete = true;
-            break;
-        }
-    }
-    *next_frame = frame;
-
-    if (log_manager_ != nullptr && max_page_lsn != INVALID_LSN) {
-        log_manager_->flush_log_to_disk_until(max_page_lsn);
-        disk_manager_->sync_log();
-    }
-
-    size_t flushed = 0;
-    for (const auto &candidate : candidates) {
-        std::scoped_lock<std::mutex> frame_lock(frame_latches_[candidate.frame_id]);
-        Page *page = &pages_[candidate.frame_id];
-        if (page->id_ == candidate.page_id && !page->is_replacing_ && page->pin_count_ == 0 &&
-            page->is_dirty_ && page->get_page_lsn() == candidate.page_lsn) {
-            disk_manager_->write_page(candidate.page_id.fd, candidate.page_id.page_no, page->data_, PAGE_SIZE);
-            if (perf_stats_ != nullptr) {
-                perf_stats_->RecordDirtyFlush();
-            }
-            page->is_dirty_ = false;
-            ++flushed;
-        }
-    }
-    return flushed;
-}
-
-bool BufferPoolManager::set_page_lsn(PageId page_id, lsn_t page_lsn) {
-    std::scoped_lock<std::mutex> shard_lock(page_table_latch_for(page_id));
-    auto &table = page_table_for(page_id);
-    auto it = table.find(page_id);
-    if (it == table.end()) {
-        return false;
-    }
-    std::scoped_lock<std::mutex> frame_lock(frame_latches_[it->second]);
-    Page *page = &pages_[it->second];
-    page->set_page_lsn(page_lsn);
-    return true;
-}
-
-bool BufferPoolManager::finalize_page_write(PageId page_id, lsn_t page_lsn, bool is_dirty) {
-    std::scoped_lock<std::mutex> shard_lock(page_table_latch_for(page_id));
-    auto &table = page_table_for(page_id);
-    auto it = table.find(page_id);
-    if (it == table.end()) {
-        return false;
-    }
-    frame_id_t frame_id = it->second;
-    std::scoped_lock<std::mutex> frame_lock(frame_latches_[frame_id]);
-    Page *page = &pages_[frame_id];
-    page->set_page_lsn(page_lsn);
-    if (page->pin_count_ <= 0) {
-        return false;
-    }
-    if (is_dirty) {
-        page->is_dirty_ = true;
-    }
-    page->pin_count_--;
-    if (page->pin_count_ == 0) {
-        mark_frame_evictable_locked(frame_id);
-    }
-    return true;
-}
-
-bool BufferPoolManager::finalize_page_write_fast(Page *page, PageId expected_page_id, lsn_t page_lsn, bool is_dirty) {
-    frame_id_t frame_id = frame_id_for_page(page);
-    if (frame_id == INVALID_FRAME_ID) {
-        return false;
-    }
-    std::scoped_lock<std::mutex> frame_lock(frame_latches_[frame_id]);
-    if (page->is_replacing_ || !(page->id_ == expected_page_id) || page->pin_count_ <= 0) {
-        return false;
-    }
-    page->set_page_lsn(page_lsn);
-    if (is_dirty) {
-        page->is_dirty_ = true;
-    }
-    page->pin_count_--;
-    if (page->pin_count_ == 0) {
-        mark_frame_evictable_locked(frame_id);
-    }
-    return true;
 }

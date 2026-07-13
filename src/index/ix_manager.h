@@ -12,7 +12,6 @@ See the Mulan PSL v2 for more details. */
 
 #include <memory>
 #include <string>
-#include <vector>
 
 #include "system/sm_meta.h"
 #include "ix_defs.h"
@@ -45,13 +44,6 @@ class IxManager {
         return index_name;
     }
 
-    std::string get_index_name(const std::string &filename, const IndexMeta &index) {
-        if (!index.index_name.empty()) {
-            return index.index_name;
-        }
-        return get_index_name(filename, index.cols);
-    }
-
     bool exists(const std::string &filename, const std::vector<ColMeta>& index_cols) {
         auto ix_name = get_index_name(filename, index_cols);
         return disk_manager_->is_file(ix_name);
@@ -62,25 +54,8 @@ class IxManager {
         return disk_manager_->is_file(ix_name);
     }
 
-    bool exists(const std::string &filename, const IndexMeta &index) {
-        auto ix_name = get_index_name(filename, index);
-        return disk_manager_->is_file(ix_name);
-    }
-
     void create_index(const std::string &filename, const std::vector<ColMeta>& index_cols) {
-        IndexMeta index;
-        index.tab_name = filename;
-        index.index_name = get_index_name(filename, index_cols);
-        index.col_num = static_cast<int>(index_cols.size());
-        index.cols = index_cols;
-        index.col_tot_len = index.logical_col_tot_len();
-        index.unique = true;
-        index.hidden = false;
-        create_index(filename, index);
-    }
-
-    void create_index(const std::string &filename, const IndexMeta &index) {
-        std::string ix_name = get_index_name(filename, index);
+        std::string ix_name = get_index_name(filename, index_cols);
         // Create index file
         disk_manager_->create_file(ix_name);
         // Open index file
@@ -90,28 +65,14 @@ class IxManager {
         // Theoretically we have: |page_hdr| + (|attr| + |rid|) * n <= PAGE_SIZE
         // but we reserve one slot for convenient inserting and deleting, i.e.
         // |page_hdr| + (|attr| + |rid|) * (n + 1) <= PAGE_SIZE
-        std::vector<ColType> physical_col_types;
-        std::vector<int> physical_col_lens;
-        physical_col_types.reserve(index.cols.size() + (index.unique ? 0 : 2));
-        physical_col_lens.reserve(index.cols.size() + (index.unique ? 0 : 2));
         int col_tot_len = 0;
-        for(auto& col: index.cols) {
-            physical_col_types.push_back(col.type);
-            physical_col_lens.push_back(col.len);
+        int col_num = index_cols.size();
+        for(auto& col: index_cols) {
             col_tot_len += col.len;
         }
-        if (!index.unique) {
-            physical_col_types.push_back(TYPE_INT);
-            physical_col_lens.push_back(sizeof(int));
-            physical_col_types.push_back(TYPE_INT);
-            physical_col_lens.push_back(sizeof(int));
-            col_tot_len += sizeof(Rid);
-        }
-        int max_col_len = index.unique ? IX_MAX_COL_LEN : IX_MAX_COL_LEN + static_cast<int>(sizeof(Rid));
-        if (col_tot_len > max_col_len || col_tot_len != index.col_tot_len) {
+        if (col_tot_len > IX_MAX_COL_LEN) {
             throw InvalidColLengthError(col_tot_len);
         }
-        int col_num = static_cast<int>(physical_col_lens.size());
         // 根据 |page_hdr| + (|attr| + |rid|) * (n + 1) <= PAGE_SIZE 求得n的最大值btree_order
         // 即 n <= btree_order，那么btree_order就是每个结点最多可插入的键值对数量（实际还多留了一个空位，但其不可插入）
         int btree_order = static_cast<int>((PAGE_SIZE - sizeof(IxPageHdr)) / (col_tot_len + sizeof(Rid)) - 1);
@@ -122,8 +83,8 @@ class IxManager {
                                 col_num, col_tot_len, btree_order, (btree_order + 1) * col_tot_len,
                                 IX_INIT_ROOT_PAGE, IX_INIT_ROOT_PAGE);
         for(int i = 0; i < col_num; ++i) {
-            fhdr->col_types_.push_back(physical_col_types[i]);
-            fhdr->col_lens_.push_back(physical_col_lens[i]);
+            fhdr->col_types_.push_back(index_cols[i].type);
+            fhdr->col_lens_.push_back(index_cols[i].len);
         }
         fhdr->update_tot_len();
         
@@ -182,11 +143,6 @@ class IxManager {
         disk_manager_->destroy_file(ix_name);
     }
 
-    void destroy_index(const std::string &filename, const IndexMeta &index) {
-        std::string ix_name = get_index_name(filename, index);
-        disk_manager_->destroy_file(ix_name);
-    }
-
     // 注意这里打开文件，创建并返回了index file handle的指针
     std::unique_ptr<IxIndexHandle> open_index(const std::string &filename, const std::vector<ColMeta>& index_cols) {
         std::string ix_name = get_index_name(filename, index_cols);
@@ -200,15 +156,12 @@ class IxManager {
         return std::make_unique<IxIndexHandle>(disk_manager_, buffer_pool_manager_, fd);
     }
 
-    std::unique_ptr<IxIndexHandle> open_index(const std::string &filename, const IndexMeta &index) {
-        std::string ix_name = get_index_name(filename, index);
-        int fd = disk_manager_->open_file(ix_name);
-        return std::make_unique<IxIndexHandle>(disk_manager_, buffer_pool_manager_, fd);
-    }
-
-    void close_index(IxIndexHandle *ih) {
-        ih->flush();
-        disk_manager_->sync_file(ih->fd_);
+    void close_index(const IxIndexHandle *ih) {
+        char* data = new char[ih->file_hdr_->tot_len_];
+        ih->file_hdr_->serialize(data);
+        disk_manager_->write_page(ih->fd_, IX_FILE_HDR_PAGE, data, ih->file_hdr_->tot_len_);
+        // 缓冲区的所有页刷到磁盘，注意这句话必须写在close_file前面
+        buffer_pool_manager_->flush_all_pages(ih->fd_);
         disk_manager_->close_file(ih->fd_);
     }
 };

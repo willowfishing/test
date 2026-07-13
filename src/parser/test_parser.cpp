@@ -10,9 +10,6 @@ See the Mulan PSL v2 for more details. */
 #undef NDEBUG
 
 #include <cassert>
-#include <iostream>
-#include <string>
-#include <vector>
 
 #include "parser.h"
 
@@ -29,10 +26,13 @@ int main() {
         "insert into tb values (1, 3.14, 'pi');",
         "delete from tb where a = 1;",
         "update tb set a = 1, b = 2.2, c = 'xyz' where x = 2 and y < 1.1 and z > 'abc';",
+        "update tab set col_score=col_score+5 where col_id<3;",
         "select * from tb;",
         "select * from tb where x <> 2 and y >= 3. and z <= '123' and b < tb.a;",
         "select x.a, y.b from x, y where x.a = y.b and c = d;",
         "select x.a, y.b from x join y where x.a = y.b and c = d;",
+        "set transaction isolation level snapshot isolation;",
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;",
         "exit;",
         "help;",
         "",

@@ -13,72 +13,43 @@ See the Mulan PSL v2 for more details. */
 #include <cassert>
 #include <cstring>
 #include <memory>
-#include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "parser/parser.h"
 #include "system/sm.h"
 #include "common/common.h"
 
-enum class StmtKind {
-    Unknown,
-    Select,
-    Insert,
-    Update,
-    Delete,
-    Load,
-    Union,
-    Explain,
-    Help,
-    ShowTables,
-    ShowIndex,
-    DescTable,
-    TxnBegin,
-    TxnCommit,
-    TxnAbort,
-    TxnRollback,
-    SetTransactionIsolation,
-    SetKnob,
-    CreateCheckpoint,
-    CreateTable,
-    DropTable,
-    CreateIndex,
-    DropIndex,
-};
-
 class Query{
     public:
-    StmtKind kind = StmtKind::Unknown;
     std::shared_ptr<ast::TreeNode> parse;
-    std::string target_table;
     // TODO jointree
     // where条件
     std::vector<Condition> conds;
     // 投影列
     std::vector<TabCol> cols;
+    std::vector<SelectItem> select_items;
+    std::vector<TabCol> group_by_cols;
+    std::vector<HavingCondition> having_conds;
+    std::vector<TabCol> order_by_cols;
+    std::vector<bool> order_by_desc;
+    int limit{-1};
+    bool has_agg{false};
+    bool has_group_by{false};
     // 表名
     std::vector<std::string> tables;
+    std::vector<std::string> real_tables;
+    std::vector<std::string> display_tables;
+    std::unordered_map<std::string, std::string> display_to_real;
+    std::unordered_map<std::string, std::string> real_to_display;
+    bool is_explain_analyze{false};
+    bool select_all{false};
+    bool preserve_join_order{false};
     // update 的set 值
     std::vector<SetClause> set_clauses;
     //insert 的values值
     std::vector<Value> values;
-    // load 的文件名
-    std::string load_file;
-    std::vector<std::shared_ptr<ast::SelectItem>> select_items;
-    std::vector<TabCol> group_cols;
-    std::vector<std::shared_ptr<ast::HavingExpr>> having_conds;
-    std::vector<std::pair<TabCol, bool>> order_cols;
-    bool has_aggregate = false;
-    bool has_group = false;
-    bool has_limit = false;
-    int limit = -1;
-    bool is_semi_join = false;
-    std::vector<Condition> semi_conds;
-    std::vector<std::shared_ptr<ast::TableRef>> table_refs;
-    std::map<std::string, std::string> alias_to_table;
-    std::vector<std::shared_ptr<Query>> union_queries;
-    std::vector<ColMeta> union_cols;
 
     Query(){}
 
@@ -96,10 +67,15 @@ public:
 
 private:
     TabCol check_column(const std::vector<ColMeta> &all_cols, TabCol target);
-    void get_all_cols(const std::vector<std::string> &tab_names, std::vector<ColMeta> &all_cols);
+    void get_all_cols(const std::vector<std::string> &tab_names, std::vector<ColMeta> &all_cols,
+                      const std::unordered_map<std::string, std::string> *display_to_real = nullptr);
     void get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds, std::vector<Condition> &conds);
     void check_clause(const std::vector<std::string> &tab_names, std::vector<Condition> &conds,
-                      const std::map<std::string, std::string> *alias_to_table = nullptr);
+                      const std::unordered_map<std::string, std::string> *display_to_real = nullptr);
     Value convert_sv_value(const std::shared_ptr<ast::Value> &sv_val);
     CompOp convert_sv_comp_op(ast::SvCompOp op);
+    AggExpr convert_sv_agg_expr(const std::shared_ptr<ast::Expr> &expr, const std::vector<ColMeta> &all_cols);
+    void get_having_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
+                           const std::vector<ColMeta> &all_cols, std::vector<HavingCondition> &conds);
 };
+

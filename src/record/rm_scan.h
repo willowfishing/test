@@ -10,52 +10,21 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
-#include <cstdint>
-#include <utility>
+#include "rm_defs.h"
 
-#include "rm_file_handle.h"
+class RmFileHandle;
 
-class RmScan : public RecScan {
-    const RmFileHandle *file_handle_;
+class RmScan : public RecScan
+{
+    RmFileHandle *file_handle_;
     Rid rid_;
-    Page *current_page_ = nullptr;
-    int current_page_no_ = RM_NO_PAGE;
-    RmPageHdr *current_page_hdr_ = nullptr;
-    const char *current_bitmap_ = nullptr;
-    const char *current_slots_ = nullptr;
-    const char *current_slot_ = nullptr;
-    uint64_t current_bitmap_word_ = 0;
-    int current_bitmap_word_base_slot_ = 0;
-    BufferAccessStrategy access_strategy_;
-    bool use_access_strategy_ = false;
-
-    void release_current_page();
-    void reset_current_bitmap_word();
-    bool pin_next_non_empty_page(int page_no);
-    bool next_slot_in_current_page(int after_slot_no, int *slot_no);
 
 public:
-    RmScan(const RmFileHandle *file_handle, BufferAccessClass access_class = BufferAccessClass::Default,
-           size_t ring_size = 0);
-
-    ~RmScan() override;
+    RmScan(const RmFileHandle *file_handle); // 增加const
 
     void next() override;
 
     bool is_end() const override;
 
     Rid rid() const override;
-
-    template <typename Fn>
-    bool with_current_slot(Fn &&fn) const {
-        if (is_end() || current_page_ == nullptr || current_slot_ == nullptr || rid_.page_no != current_page_no_) {
-            return false;
-        }
-        std::shared_lock<std::shared_mutex> guard(file_handle_->file_latch_);
-        if (rid_.slot_no < 0 || rid_.slot_no >= file_handle_->file_hdr_.num_records_per_page ||
-            !Bitmap::is_set(current_bitmap_, rid_.slot_no)) {
-            return false;
-        }
-        return static_cast<bool>(std::forward<Fn>(fn)(current_slot_));
-    }
 };

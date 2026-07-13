@@ -9,6 +9,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+#include <cstring>
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
@@ -23,34 +24,37 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
     std::vector<ColMeta> cols_;                 // join后获得的记录的字段
 
     std::vector<Condition> fed_conds_;          // join条件
-    std::vector<CompiledCondition> compiled_conds_;
-    bool compiled_conds_valid_ = false;
     bool isend;
-    bool has_current_ = false;
-    mutable RmRecord current_record_;
-    TupleView current_view_;
-    std::vector<const char *> current_cells_;
+    std::unique_ptr<RmRecord> left_rec_;
+    std::unique_ptr<RmRecord> current_rec_;
 
-    bool set_current_from_children() {
-        auto left_view = left_->CurrentTupleView();
-        auto right_view = right_->CurrentTupleView();
-        if (left_view == nullptr || right_view == nullptr) {
-            return false;
+    std::unique_ptr<RmRecord> join_records(const RmRecord *left_rec, const RmRecord *right_rec) {
+        auto rec = std::make_unique<RmRecord>(len_);
+        memcpy(rec->data, left_rec->data, left_->tupleLen());
+        memcpy(rec->data + left_->tupleLen(), right_rec->data, right_->tupleLen());
+        return rec;
+    }
+
+    void advance_to_next_match() {
+        current_rec_.reset();
+        while (!left_->is_end()) {
+            while (!right_->is_end()) {
+                auto right_rec = right_->Next();
+                auto joined = join_records(left_rec_.get(), right_rec.get());
+                right_->nextTuple();
+                if (eval_conds(cols_, joined.get(), fed_conds_)) {
+                    current_rec_ = std::move(joined);
+                    return;
+                }
+            }
+            left_->nextTuple();
+            if (left_->is_end()) {
+                break;
+            }
+            left_rec_ = left_->Next();
+            right_->beginTuple();
         }
-        const auto &left_cols = left_->cols();
-        const auto &right_cols = right_->cols();
-        current_cells_.resize(left_cols.size() + right_cols.size());
-        size_t out_idx = 0;
-        for (size_t i = 0; i < left_cols.size(); ++i) {
-            current_cells_[out_idx++] = left_view->cell_at(left_cols[i], i);
-        }
-        for (size_t i = 0; i < right_cols.size(); ++i) {
-            current_cells_[out_idx++] = right_view->cell_at(right_cols[i], i);
-        }
-        current_view_.record = nullptr;
-        current_view_.cells = &current_cells_;
-        return compiled_conds_valid_ ? eval_compiled_conds_view(current_view_, compiled_conds_)
-                                     : eval_conds_view(cols_, current_view_, fed_conds_);
+        isend = true;
     }
 
    public:
@@ -67,74 +71,43 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
 
         cols_.insert(cols_.end(), right_cols.begin(), right_cols.end());
         isend = false;
-        current_record_.Resize(static_cast<int>(len_));
         fed_conds_ = std::move(conds);
-        compiled_conds_valid_ = compile_conds(cols_, fed_conds_, &compiled_conds_);
 
     }
 
+    size_t tupleLen() const override { return len_; }
+
+    const std::vector<ColMeta> &cols() const override { return cols_; }
+
+    std::string getType() override { return "NestedLoopJoinExecutor"; }
+
+    bool is_end() const override { return isend; }
+
     void beginTuple() override {
-        isend = false;
-        has_current_ = false;
         left_->beginTuple();
-        right_->beginTuple();
-        while (!left_->is_end()) {
-            while (!right_->is_end()) {
-                if (set_current_from_children()) {
-                    has_current_ = true;
-                    return;
-                }
-                right_->nextTuple();
-            }
-            left_->nextTuple();
-            right_->beginTuple();
+        isend = false;
+        if (left_->is_end()) {
+            isend = true;
+            return;
         }
-        isend = true;
+        left_rec_ = left_->Next();
+        right_->beginTuple();
+        advance_to_next_match();
     }
 
     void nextTuple() override {
         if (isend) {
             return;
         }
-        has_current_ = false;
-        right_->nextTuple();
-        while (!left_->is_end()) {
-            while (!right_->is_end()) {
-                if (set_current_from_children()) {
-                    has_current_ = true;
-                    return;
-                }
-                right_->nextTuple();
-            }
-            left_->nextTuple();
-            right_->beginTuple();
-        }
-        isend = true;
+        advance_to_next_match();
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        if (!has_current_) {
+        if (current_rec_ == nullptr) {
             return nullptr;
         }
-        auto rec = std::make_unique<RmRecord>(static_cast<int>(len_));
-        materialize_tuple_view(current_view_, cols_, rec.get(), len_);
-        return rec;
+        return std::make_unique<RmRecord>(*current_rec_);
     }
 
-    const TupleView *CurrentTupleView() const override { return has_current_ ? &current_view_ : nullptr; }
-
-    const RmRecord *CurrentTuple() const override {
-        if (!has_current_) {
-            return nullptr;
-        }
-        materialize_tuple_view(current_view_, cols_, &current_record_, len_);
-        return &current_record_;
-    }
-
-    bool is_end() const override { return isend; }
-    size_t tupleLen() const override { return len_; }
-    const std::vector<ColMeta> &cols() const override { return cols_; }
-    std::string getType() override { return "NestedLoopJoinExecutor"; }
-    ColMeta get_col_offset(const TabCol &target) override { return *get_col(cols_, target); }
     Rid &rid() override { return _abstract_rid; }
 };

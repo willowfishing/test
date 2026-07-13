@@ -32,6 +32,9 @@ class Optimizer {
         {}
     
     std::shared_ptr<Plan> plan_query(std::shared_ptr<Query> query, Context *context) {
+        if (query->is_explain_analyze) {
+            return std::make_shared<ExplainAnalyzePlan>(query);
+        }
         if (auto x = std::dynamic_pointer_cast<ast::Help>(query->parse)) {
             // help;
             return std::make_shared<OtherPlan>(T_Help, std::string());
@@ -39,7 +42,6 @@ class Optimizer {
             // show tables;
             return std::make_shared<OtherPlan>(T_ShowTable, std::string());
         } else if (auto x = std::dynamic_pointer_cast<ast::ShowIndex>(query->parse)) {
-            // show index from table;
             return std::make_shared<OtherPlan>(T_ShowIndex, x->tab_name);
         } else if (auto x = std::dynamic_pointer_cast<ast::DescTable>(query->parse)) {
             // desc table;
@@ -56,14 +58,13 @@ class Optimizer {
         } else if (auto x = std::dynamic_pointer_cast<ast::TxnRollback>(query->parse)) {
             // rollback;
             return std::make_shared<OtherPlan>(T_Transaction_rollback, std::string());
-        } else if (auto x = std::dynamic_pointer_cast<ast::SetTransactionIsolation>(query->parse)) {
-            return std::make_shared<SetTransactionIsolationPlan>(
-                x->serializable ? IsolationLevel::SERIALIZABLE : IsolationLevel::SNAPSHOT_ISOLATION);
         } else if (auto x = std::dynamic_pointer_cast<ast::SetStmt>(query->parse)) {
             // Set Knob Plan
             return std::make_shared<SetKnobPlan>(x->set_knob_type_, x->bool_val_);
-        } else if (auto x = std::dynamic_pointer_cast<ast::CreateCheckpoint>(query->parse)) {
-            return std::make_shared<OtherPlan>(T_Checkpoint, std::string());
+        } else if (auto x = std::dynamic_pointer_cast<ast::SetIsolationStmt>(query->parse)) {
+            return std::make_shared<OtherPlan>(T_SetIsolation,
+                                               x->isolation_level_ == IsolationLevel::SERIALIZABLE ? "SERIALIZABLE"
+                                                                                                   : "SNAPSHOT");
         } else {
             return planner_->do_planner(query, context);
         }
