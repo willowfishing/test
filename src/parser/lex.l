@@ -83,7 +83,6 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "CHAR" { return CHAR; }
 "FLOAT" { return FLOAT; }
 "INDEX" { return INDEX; }
-"STATIC_CHECKPOINT" { return STATIC_CHECKPOINT; }
 "AND" { return AND; }
 "JOIN" {return JOIN;}
 "SEMI" { return SEMI; }

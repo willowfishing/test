@@ -57,7 +57,7 @@ public:
     
     ~TransactionManager() = default;
 
-    Transaction* begin(Transaction* txn, LogManager* log_manager, IsolationLevel isolation_level = IsolationLevel::SERIALIZABLE);
+    Transaction* begin(Transaction* txn, LogManager* log_manager);
 
     void commit(Transaction* txn, LogManager* log_manager);
 
@@ -123,21 +123,6 @@ public:
 
     /** @brief 获取系统中的最低读时间戳。 */
     timestamp_t GetWatermark();
-
-    /** @brief 检查两个事务之间的写写冲突 */
-    bool HasWriteConflict(Transaction* txn, Rid rid, const std::string& tab_name);
-
-    /** @brief 检查在当前事务添加 rw-依赖后是否形成 SSI 危险结构 */
-    bool DetectSSIDanger(Transaction* current_txn);
-    /** @brief Detect SSI danger assuming latch_ is already held */
-    bool DetectSSIDangerUnlocked(Transaction* current_txn);
-
-    /** @brief 检查写操作是否形成 SSI rw-依赖（reader ->rw current_writer） */
-    void CheckSSIRWDependency(Transaction* current_txn, const std::string& tab_name, const Rid& rid);
-
-    /** @brief 检查 SELECT 对不可见写入形成 rw-依赖（current_reader ->rw writer） */
-    void CheckSSIInvisibleWrite(Transaction* reader_txn, const std::string& tab_name, const Rid& rid,
-                                const RmRecord& record);
 
     /** @brief 垃圾回收。仅在所有事务都未访问时调用。 */
     void GarbageCollection();

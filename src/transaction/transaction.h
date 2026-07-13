@@ -25,22 +25,34 @@ See the Mulan PSL v2 for more details. */
 #include "transaction/txn_defs.h"
 #include "record/rm_defs.h"
 
+/** 表示此tuple的前一个版本的链接 */
 struct UndoLink {
+  /* 之前的版本可以在其中的事务中找到 */
   txn_id_t prev_txn_{INVALID_TXN_ID};
+  /* 在 `prev_txn_` 中前一个版本的日志索引 */
   int prev_log_idx_{0};
+
   friend auto operator==(const UndoLink &a, const UndoLink &b) {
     return a.prev_txn_ == b.prev_txn_ && a.prev_log_idx_ == b.prev_log_idx_;
   }
+
   friend auto operator!=(const UndoLink &a, const UndoLink &b) { return !(a == b); }
+
+  /* Checks if the undo link points to something. */
   bool IsValid() { return prev_txn_ != INVALID_TXN_ID; }
 };
 
 struct UndoLog {
+  /* 此日志是否为删除标记 */
   bool is_deleted_;
+  /* 此撤销日志修改的字段 */
   std::vector<bool> modified_fields_;
+  /* 修改后的字段 */
   std::vector<Value> tuple_;
-  RmRecord* tuple_test_ = nullptr;
+  RmRecord* tuple_test_;
+  /* 此撤销日志的时间戳 */
   timestamp_t ts_{INVALID_TS};
+  /* 撤销日志的前一个版本 */
   UndoLink prev_version_{};
 };
 
@@ -62,120 +74,123 @@ class Transaction {
     ~Transaction() = default;
 
     inline txn_id_t get_transaction_id() { return txn_id_; }
+
     inline std::thread::id get_thread_id() { return thread_id_; }
+
     inline void set_txn_mode(bool txn_mode) { txn_mode_ = txn_mode; }
     inline bool get_txn_mode() { return txn_mode_; }
+
     inline void set_start_ts(timestamp_t start_ts) { start_ts_ = start_ts; }
     inline timestamp_t get_start_ts() { return start_ts_; }
-    inline IsolationLevel get_isolation_level() { return isolation_level_; }
+
     inline void set_isolation_level(IsolationLevel level) { isolation_level_ = level; }
+    inline IsolationLevel get_isolation_level() { return isolation_level_; }
+
     inline TransactionState get_state() { return state_; }
     inline void set_state(TransactionState state) { state_ = state; }
+
     inline lsn_t get_prev_lsn() { return prev_lsn_; }
     inline void set_prev_lsn(lsn_t prev_lsn) { prev_lsn_ = prev_lsn; }
-    inline std::shared_ptr<std::deque<WriteRecord *>> get_write_set() { return write_set_; }
+
+    inline std::shared_ptr<std::deque<WriteRecord *>> get_write_set() { return write_set_; }  
     inline void append_write_record(WriteRecord* write_record) { write_set_->push_back(write_record); }
+
     inline std::shared_ptr<std::deque<Page*>> get_index_deleted_page_set() { return index_deleted_page_set_; }
     inline void append_index_deleted_page(Page* page) { index_deleted_page_set_->push_back(page); }
+
     inline std::shared_ptr<std::deque<Page*>> get_index_latch_page_set() { return index_latch_page_set_; }
     inline void append_index_latch_page_set(Page* page) { index_latch_page_set_->push_back(page); }
-    inline std::shared_ptr<std::unordered_set<LockDataId>> get_lock_set() { return lock_set_; }
-    inline void clear_snapshot() { snapshots_.clear(); }
 
-    // ===== SSI methods =====
-    inline void add_read_record(const std::string &tab_name, const Rid &rid) {
-        read_set_[tab_name].insert(rid);
-    }
-    inline void add_predicate_read(const std::string &tab_name, const std::vector<Condition> &conds) {
-        predicate_reads_.emplace_back(tab_name, conds);
-    }
-    inline const auto &get_read_set() const { return read_set_; }
-    inline const auto &get_predicate_reads() const { return predicate_reads_; }
-    inline void add_rw_dependency_out(txn_id_t writer_txn) { rw_out_.push_back(writer_txn); }
-    inline void add_rw_dependency_in(txn_id_t reader_txn) { rw_in_.push_back(reader_txn); }
-    inline const auto &get_rw_out() const { return rw_out_; }
-    inline const auto &get_rw_in() const { return rw_in_; }
-    inline void clear_ssi_state() {
-        read_set_.clear();
-        predicate_reads_.clear();
-        rw_out_.clear();
-        rw_in_.clear();
-    }
+    inline std::shared_ptr<std::unordered_set<LockDataId>> get_lock_set() { return lock_set_; }
+
+    inline void clear_snapshot() { snapshots_.clear(); }
 
     inline void set_snapshot_records(const std::string &tab_name, SnapshotRecords records) {
         snapshots_[tab_name] = std::move(records);
     }
+
     inline bool has_snapshot(const std::string &tab_name) const {
         return snapshots_.find(tab_name) != snapshots_.end();
     }
+
     inline const SnapshotRecords *get_snapshot_records(const std::string &tab_name) const {
         auto iter = snapshots_.find(tab_name);
-        if (iter == snapshots_.end()) return nullptr;
+        if (iter == snapshots_.end()) {
+            return nullptr;
+        }
         return &iter->second;
     }
+
     inline void remove_snapshot_record(const std::string &tab_name, const Rid &rid) {
         auto iter = snapshots_.find(tab_name);
-        if (iter == snapshots_.end()) return;
+        if (iter == snapshots_.end()) {
+            return;
+        }
         auto &records = iter->second;
         records.erase(std::remove_if(records.begin(), records.end(), [&](const auto &entry) {
             return entry.first == rid;
         }), records.end());
     }
+
     inline void upsert_snapshot_record(const std::string &tab_name, const Rid &rid, const RmRecord &record) {
         auto iter = snapshots_.find(tab_name);
-        if (iter == snapshots_.end()) return;
+        if (iter == snapshots_.end()) {
+            return;
+        }
         remove_snapshot_record(tab_name, rid);
         snapshots_[tab_name].emplace_back(rid, record);
     }
 
-    // TIMESTAMP accessors
     inline timestamp_t get_read_ts() const { return read_ts_; }
-    inline void set_read_ts(timestamp_t ts) { read_ts_.store(ts); }
-    inline timestamp_t get_commit_ts() const { return commit_ts_.load(); }
-    inline void set_commit_ts(timestamp_t ts) { commit_ts_.store(ts); }
+    inline timestamp_t get_commit_ts() const { return commit_ts_; }
 
-    // UNDO LOG methods
+    /** 修改现有的撤销日志 */
     inline auto ModifyUndoLog(int log_idx, UndoLog new_log) {
         std::scoped_lock<std::mutex> lck(latch_);
         undo_logs_[log_idx] = std::move(new_log);
-    }
+      }
+
+    /** @return 此事务中撤销日志的索引 */
     inline auto AppendUndoLog(UndoLog log) -> UndoLink {
         std::scoped_lock<std::mutex> lck(latch_);
         undo_logs_.emplace_back(std::move(log));
         return {txn_id_, static_cast<int>(undo_logs_.size() - 1)};
-    }
+      }
     inline auto GetUndoLog(size_t log_id) -> UndoLog {
         std::scoped_lock<std::mutex> lck(latch_);
         return undo_logs_[log_id];
-    }
+      }
+
+    /** @return 撤销日志的数量 */
     inline auto GetUndoLogNum() -> size_t {
         std::scoped_lock<std::mutex> lck(latch_);
         return undo_logs_.size();
-    }
+      }
+
 
    private:
-    bool txn_mode_;
-    TransactionState state_;
-    IsolationLevel isolation_level_;
-    std::thread::id thread_id_;
-    lsn_t prev_lsn_;
-    txn_id_t txn_id_;
-    timestamp_t start_ts_;
+    bool txn_mode_;                   // 用于标识当前事务为显式事务还是单条SQL语句的隐式事务
+    TransactionState state_;          // 事务状态
+    IsolationLevel isolation_level_;  // 事务的隔离级别，默认隔离级别为可串行化
+    std::thread::id thread_id_;       // 当前事务对应的线程id
+    lsn_t prev_lsn_;                  // 当前事务执行的最后一条操作对应的lsn，用于系统故障恢复
+    txn_id_t txn_id_;                 // 事务的ID，唯一标识符
+    timestamp_t start_ts_;            // 事务的开始时间戳
 
-    std::shared_ptr<std::deque<WriteRecord *>> write_set_;
-    std::shared_ptr<std::unordered_set<LockDataId>> lock_set_;
-    std::shared_ptr<std::deque<Page*>> index_latch_page_set_;
-    std::shared_ptr<std::deque<Page*>> index_deleted_page_set_;
+    std::shared_ptr<std::deque<WriteRecord *>> write_set_;  // 事务包含的所有写操作
+    std::shared_ptr<std::unordered_set<LockDataId>> lock_set_;  // 事务申请的所有锁
+    std::shared_ptr<std::deque<Page*>> index_latch_page_set_;          // 维护事务执行过程中加锁的索引页面
+    std::shared_ptr<std::deque<Page*>> index_deleted_page_set_;    // 维护事务执行过程中删除的索引页面
 
-    std::atomic<timestamp_t> read_ts_{0};
-    std::atomic<timestamp_t> commit_ts_{INVALID_TS};
-    std::unordered_map<std::string, SnapshotRecords> snapshots_;
-    std::vector<UndoLog> undo_logs_;
-    std::mutex latch_;
-
-    // SSI tracking
-    std::unordered_map<std::string, std::unordered_set<Rid>> read_set_;
-    std::vector<std::pair<std::string, std::vector<Condition>>> predicate_reads_;
-    std::vector<txn_id_t> rw_out_;
-    std::vector<txn_id_t> rw_in_;
+  std::atomic<timestamp_t> read_ts_{0};
+  /** 提交时间戳 */
+  std::atomic<timestamp_t> commit_ts_{INVALID_TS};
+  std::unordered_map<std::string, SnapshotRecords> snapshots_;
+  /**
+  * @brief 存储撤销日志。
+  * 其他撤销日志/表堆将存储 (txn_id, index) 对，因此只能向此vector中追加内容或就地更新内容，而不能删除任何内容。
+  */
+  std::vector<UndoLog> undo_logs_;
+  /** 用于访问事务级撤销日志的锁。 */
+  std::mutex latch_;
 };

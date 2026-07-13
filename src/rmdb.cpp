@@ -45,8 +45,8 @@ auto lock_manager = std::make_unique<LockManager>();
 auto txn_manager = std::make_unique<TransactionManager>(lock_manager.get(), sm_manager.get());
 auto planner = std::make_unique<Planner>(sm_manager.get());
 auto optimizer = std::make_unique<Optimizer>(sm_manager.get(), planner.get());
-auto log_manager = std::make_unique<LogManager>(disk_manager.get());
 auto ql_manager = std::make_unique<QlManager>(sm_manager.get(), txn_manager.get(), nullptr);
+auto log_manager = std::make_unique<LogManager>(disk_manager.get());
 auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_pool_manager.get(), sm_manager.get());
 auto portal = std::make_unique<Portal>(sm_manager.get());
 auto analyze = std::make_unique<Analyze>(sm_manager.get());
@@ -62,11 +62,11 @@ void sigint_handler(int signo) {
 }
 
 // 判断当前正在执行的是显式事务还是单条SQL语句的事务，并更新事务ID
-void SetTransaction(txn_id_t *txn_id, Context *context, IsolationLevel session_isolation) {
+void SetTransaction(txn_id_t *txn_id, Context *context) {
     context->txn_ = txn_manager->get_transaction(*txn_id);
     if(context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
         context->txn_->get_state() == TransactionState::ABORTED) {
-        context->txn_ = txn_manager->begin(nullptr, context->log_mgr_, session_isolation);
+        context->txn_ = txn_manager->begin(nullptr, context->log_mgr_);
         *txn_id = context->txn_->get_transaction_id();
         context->txn_->set_txn_mode(false);
     }
@@ -88,9 +88,6 @@ void *client_handler(void *sock_fd) {
 
     std::string output = "establish client connection, sockfd: " + std::to_string(fd) + "\n";
     std::cout << output;
-
-    // Session-level isolation level, defaults to SERIALIZABLE
-    IsolationLevel session_isolation_level = IsolationLevel::SERIALIZABLE;
 
     while (true) {
         std::cout << "Waiting for request..." << std::endl;
@@ -125,9 +122,7 @@ void *client_handler(void *sock_fd) {
 
         // 开启事务，初始化系统所需的上下文信息（包括事务对象指针、锁管理器指针、日志管理器指针、存放结果的buffer、记录结果长度的变量）
         Context *context = new Context(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
-        context->txn_mgr_ = txn_manager.get();
-        context->set_isolation_level(session_isolation_level);
-        SetTransaction(&txn_id, context, session_isolation_level);
+        SetTransaction(&txn_id, context);
 
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;
@@ -148,12 +143,7 @@ void *client_handler(void *sock_fd) {
                     std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context);
                     portal->run(portalStmt, ql_manager.get(), &txn_id, context);
                     portal->drop();
-                    // Sync session isolation level from context (may have been changed by SET TRANSACTION)
-                    session_isolation_level = context->get_isolation_level();
                 } catch (TransactionAbortException &e) {
-                    // Sync session isolation level back from context
-                    session_isolation_level = context->get_isolation_level();
-
                     // 事务需要回滚，需要把abort信息返回给客户端并写入output.txt文件中
                     std::string str = "abort\n";
                     memcpy(data_send, str.c_str(), str.length());
@@ -169,9 +159,6 @@ void *client_handler(void *sock_fd) {
                     outfile << str;
                     outfile.close();
                 } catch (RMDBError &e) {
-                    // Sync session isolation level back from context
-                    session_isolation_level = context->get_isolation_level();
-
                     // 遇到异常，需要打印failure到output.txt文件中，并发异常信息返回给客户端
                     std::cerr << e.what() << std::endl;
 
@@ -300,8 +287,6 @@ int main(int argc, char **argv) {
     }
 
     signal(SIGINT, sigint_handler);
-    // Wire log_manager to ql_manager for checkpoint support
-    ql_manager->set_log_manager(log_manager.get());
     try {
         std::cout << "\n"
                      "  _____  __  __ _____  ____  \n"
