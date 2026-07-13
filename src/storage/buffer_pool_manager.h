@@ -12,26 +12,105 @@ See the Mulan PSL v2 for more details. */
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <array>
 #include <cassert>
+#include <atomic>
+#include <cstdint>
 #include <list>
+#include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
 #include "disk_manager.h"
 #include "errors.h"
 #include "page.h"
+#include "common/perf_stats.h"
 #include "replacer/lru_replacer.h"
 #include "replacer/replacer.h"
+
+class LogManager;
+
+enum class BufferAccessClass : uint8_t {
+    Default = 0,
+    BulkRead,
+    ColdWrite,
+    IndexBuild,
+    Hot
+};
+
+struct BufferAccessStrategy {
+    explicit BufferAccessStrategy(BufferAccessClass access_class = BufferAccessClass::Default,
+                                  size_t ring_size = 0)
+        : cls(access_class), ring(ring_size, INVALID_FRAME_ID) {}
+
+    BufferAccessClass cls{BufferAccessClass::Default};
+    std::vector<frame_id_t> ring;
+    size_t hand{0};
+};
 
 class BufferPoolManager {
    private:
     size_t pool_size_;      // buffer_pool中可容纳页面的个数，即帧的个数
     Page *pages_;           // buffer_pool中的Page对象数组，在构造空间中申请内存空间，在析构函数中释放，大小为BUFFER_POOL_SIZE
-    std::unordered_map<PageId, frame_id_t, PageIdHash> page_table_; // 帧号和页面号的映射哈希表，用于根据页面的PageId定位该页面的帧编号
+    struct alignas(64) PageTableShard {
+        std::mutex latch;
+        std::unordered_map<PageId, frame_id_t, PageIdHash> table;
+    };
+    std::unique_ptr<PageTableShard[]> page_table_shards_;
+    size_t page_table_shard_count_{1};
     std::list<frame_id_t> free_list_;   // 空闲帧编号的链表
     DiskManager *disk_manager_;
+    LogManager *log_manager_{nullptr};
+    RuntimePerfStats *perf_stats_{nullptr};
     Replacer *replacer_;    // buffer_pool的置换策略，当前赛题中为LRU置换策略
-    std::mutex latch_;      // 用于共享数据结构的并发控制
+    std::mutex free_list_latch_;
+    std::mutex slow_path_latch_;
+    std::unique_ptr<std::mutex[]> frame_latches_;
+    enum class FrameEvictState : uint8_t { kPinned, kPending, kInReplacer };
+    std::vector<FrameEvictState> frame_evict_states_;
+    std::vector<uint8_t> pending_evictable_queued_;
+    std::vector<frame_id_t> pending_evictable_frames_;
+    std::mutex pending_evictable_latch_;
+    std::vector<uint8_t> frame_access_class_;
+
+    static constexpr page_id_t kDenseFramePageLimit = 1 << 20;
+    static constexpr size_t kDenseFrameChunkBits = 12;
+    static constexpr size_t kDenseFrameChunkSize = 1 << kDenseFrameChunkBits;
+    static constexpr size_t kDenseFrameChunkCount =
+        static_cast<size_t>(kDenseFramePageLimit) / kDenseFrameChunkSize;
+
+    struct DenseFrameChunk {
+        std::array<std::atomic<frame_id_t>, kDenseFrameChunkSize> frames;
+
+        DenseFrameChunk() {
+            for (auto &frame : frames) {
+                frame.store(INVALID_FRAME_ID, std::memory_order_relaxed);
+            }
+        }
+    };
+
+    struct DenseFdDirectory {
+        std::mutex latch;
+        std::array<std::atomic<DenseFrameChunk *>, kDenseFrameChunkCount> chunks;
+
+        DenseFdDirectory() {
+            for (auto &chunk : chunks) {
+                chunk.store(nullptr, std::memory_order_relaxed);
+            }
+        }
+
+        DenseFdDirectory(const DenseFdDirectory &) = delete;
+        DenseFdDirectory &operator=(const DenseFdDirectory &) = delete;
+
+        ~DenseFdDirectory() {
+            for (auto &chunk : chunks) {
+                delete chunk.load(std::memory_order_relaxed);
+            }
+        }
+    };
+
+    std::unique_ptr<DenseFdDirectory[]> dense_frame_dirs_;
 
    public:
     BufferPoolManager(size_t pool_size, DiskManager *disk_manager)
@@ -46,6 +125,13 @@ class BufferPoolManager {
         else {
             replacer_ = new LRUReplacer(pool_size_);
         }
+        page_table_shard_count_ = pool_size_ < 64 ? 1 : 64;
+        page_table_shards_ = std::make_unique<PageTableShard[]>(page_table_shard_count_);
+        dense_frame_dirs_ = std::make_unique<DenseFdDirectory[]>(DiskManager::MAX_FD);
+        frame_latches_ = std::make_unique<std::mutex[]>(pool_size_);
+        frame_evict_states_.assign(pool_size_, FrameEvictState::kPinned);
+        pending_evictable_queued_.assign(pool_size_, 0);
+        frame_access_class_.assign(pool_size_, static_cast<uint8_t>(BufferAccessClass::Default));
         // 初始化时，所有的page都在free_list_中
         for (size_t i = 0; i < pool_size_; ++i) {
             free_list_.emplace_back(static_cast<frame_id_t>(i));  // static_cast转换数据类型
@@ -63,21 +149,92 @@ class BufferPoolManager {
      */
     static void mark_dirty(Page* page) { page->is_dirty_ = true; }
 
-   public: 
-    Page* fetch_page(PageId page_id);
+    void set_log_manager(LogManager *log_manager) { log_manager_ = log_manager; }
+
+    void set_perf_stats(RuntimePerfStats *perf_stats) { perf_stats_ = perf_stats; }
+
+   public:
+    Page* fetch_page(PageId page_id, BufferAccessStrategy *strategy = nullptr);
 
     bool unpin_page(PageId page_id, bool is_dirty);
 
+    bool unpin_page_fast(Page *page, PageId expected_page_id, bool is_dirty);
+
     bool flush_page(PageId page_id);
 
-    Page* new_page(PageId* page_id);
+    Page* new_page(PageId* page_id, BufferAccessStrategy *strategy = nullptr);
 
     bool delete_page(PageId page_id);
 
-    void flush_all_pages(int fd);
+    size_t flush_all_pages(int fd = -1);
+
+    size_t flush_unpinned_pages_batch(size_t max_pages, size_t max_frames, size_t *next_frame,
+                                      bool *pass_complete);
+
+    bool set_page_lsn(PageId page_id, lsn_t page_lsn);
+
+    bool finalize_page_write(PageId page_id, lsn_t page_lsn, bool is_dirty = true);
+
+    bool finalize_page_write_fast(Page *page, PageId expected_page_id, lsn_t page_lsn, bool is_dirty = true);
 
    private:
+    enum class VictimSource { kFreeList, kReplacer };
+
+    struct FlushCandidate {
+        PageId page_id;
+        frame_id_t frame_id;
+        lsn_t page_lsn;
+    };
+
+    size_t page_table_shard_for(const PageId &page_id) const;
+
+    std::unordered_map<PageId, frame_id_t, PageIdHash> &page_table_for(const PageId &page_id);
+
+    std::mutex &page_table_latch_for(const PageId &page_id);
+
     bool find_victim_page(frame_id_t* frame_id);
 
+    bool find_victim_page(frame_id_t* frame_id, VictimSource *source);
+
+    frame_id_t frame_id_for_page(Page *page) const;
+
+    Page *fetch_page_from_cache(PageId page_id, BufferAccessClass access_class);
+
+    Page *fetch_page_from_dense(PageId page_id, BufferAccessClass access_class);
+
+    void remember_fetch_cache(PageId page_id, frame_id_t frame_id, uint64_t generation);
+
+    DenseFrameChunk *dense_chunk_for(PageId page_id, bool create);
+
+    frame_id_t lookup_dense_frame(PageId page_id);
+
+    void publish_dense_frame(PageId page_id, frame_id_t frame_id);
+
+    void clear_dense_frame(PageId page_id, frame_id_t expected_frame_id);
+
+    void initialize_frame_for_page(Page *page, PageId page_id, bool bump_generation);
+
+    void mark_frame_pinned_locked(frame_id_t frame_id);
+
+    void mark_frame_evictable_locked(frame_id_t frame_id);
+
+    void drain_pending_evictable();
+
     void update_page(Page* page, PageId new_page_id, frame_id_t new_frame_id);
+
+    void ensure_wal_before_page_flush(Page *page);
+
+    static BufferAccessClass access_class_from_strategy(BufferAccessStrategy *strategy);
+
+    void set_frame_access_class(frame_id_t frame_id, BufferAccessClass access_class);
+
+    void note_frame_access(frame_id_t frame_id, BufferAccessClass access_class);
+
+    bool access_class_uses_ring(BufferAccessClass access_class) const;
+
+    bool access_class_is_cold(BufferAccessClass access_class) const;
+
+    bool try_reuse_strategy_frame(PageId page_id, BufferAccessStrategy *strategy, frame_id_t *frame_id);
+
+    void attach_frame_to_strategy_ring(BufferAccessStrategy *strategy, frame_id_t frame_id);
 };

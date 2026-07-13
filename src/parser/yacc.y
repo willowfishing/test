@@ -22,7 +22,7 @@ using namespace ast;
 
 // keywords
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
-WHERE UPDATE SET TRANSACTION ISOLATION LEVEL SNAPSHOT SERIALIZABLE SELECT INT CHAR FLOAT INDEX AND JOIN SEMI ON GROUP HAVING LIMIT AS EXPLAIN ANALYZE UNION EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
+WHERE UPDATE SET TRANSACTION ISOLATION LEVEL SNAPSHOT SERIALIZABLE SELECT INT CHAR FLOAT DATETIME INDEX AND JOIN SEMI ON GROUP HAVING LIMIT AS EXPLAIN ANALYZE UNION EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE STATIC_CHECKPOINT LOAD
 %token MAX MIN COUNT SUM AVG
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
@@ -166,12 +166,20 @@ ddl:
     {
         $$ = std::make_shared<DropIndex>($3, $5);
     }
+    |   CREATE STATIC_CHECKPOINT
+    {
+        $$ = std::make_shared<CreateCheckpoint>();
+    }
     ;
 
 dml:
         INSERT INTO tbName VALUES '(' valueList ')'
     {
         $$ = std::make_shared<InsertStmt>($3, $6);
+    }
+    |   LOAD VALUE_STRING INTO tbName
+    {
+        $$ = std::make_shared<LoadStmt>($2, $4);
     }
     |   DELETE FROM tbName optWhereClause
     {
@@ -271,6 +279,10 @@ type:
     {
         $$ = std::make_shared<TypeLen>(SV_TYPE_FLOAT, sizeof(float));
     }
+    |   DATETIME
+    {
+        $$ = std::make_shared<TypeLen>(SV_TYPE_STRING, 19);
+    }
     ;
 
 valueList:
@@ -289,9 +301,25 @@ value:
     {
         $$ = std::make_shared<IntLit>($1);
     }
+    |   '+' VALUE_INT
+    {
+        $$ = std::make_shared<IntLit>($2);
+    }
+    |   '-' VALUE_INT
+    {
+        $$ = std::make_shared<IntLit>(-$2);
+    }
     |   VALUE_FLOAT
     {
         $$ = std::make_shared<FloatLit>($1);
+    }
+    |   '+' VALUE_FLOAT
+    {
+        $$ = std::make_shared<FloatLit>($2);
+    }
+    |   '-' VALUE_FLOAT
+    {
+        $$ = std::make_shared<FloatLit>(-$2);
     }
     |   VALUE_STRING
     {
@@ -404,6 +432,26 @@ setClause:
         colName '=' value
     {
         $$ = std::make_shared<SetClause>($1, $3);
+    }
+    |   colName '=' colName
+    {
+        $$ = std::make_shared<SetClause>($1, $3);
+    }
+    |   colName '=' colName '+' value
+    {
+        $$ = std::make_shared<SetClause>($1, $3, $5, SET_OP_ADD);
+    }
+    |   colName '=' colName '-' value
+    {
+        $$ = std::make_shared<SetClause>($1, $3, $5, SET_OP_SUB);
+    }
+    |   colName '=' colName '*' value
+    {
+        $$ = std::make_shared<SetClause>($1, $3, $5, SET_OP_MUL);
+    }
+    |   colName '=' colName '/' value
+    {
+        $$ = std::make_shared<SetClause>($1, $3, $5, SET_OP_DIV);
     }
     ;
 

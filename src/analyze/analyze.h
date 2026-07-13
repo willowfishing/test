@@ -21,9 +21,37 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm.h"
 #include "common/common.h"
 
+enum class StmtKind {
+    Unknown,
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Load,
+    Union,
+    Explain,
+    Help,
+    ShowTables,
+    ShowIndex,
+    DescTable,
+    TxnBegin,
+    TxnCommit,
+    TxnAbort,
+    TxnRollback,
+    SetTransactionIsolation,
+    SetKnob,
+    CreateCheckpoint,
+    CreateTable,
+    DropTable,
+    CreateIndex,
+    DropIndex,
+};
+
 class Query{
     public:
+    StmtKind kind = StmtKind::Unknown;
     std::shared_ptr<ast::TreeNode> parse;
+    std::string target_table;
     // TODO jointree
     // where条件
     std::vector<Condition> conds;
@@ -35,6 +63,8 @@ class Query{
     std::vector<SetClause> set_clauses;
     //insert 的values值
     std::vector<Value> values;
+    // load 的文件名
+    std::string load_file;
     std::vector<std::shared_ptr<ast::SelectItem>> select_items;
     std::vector<TabCol> group_cols;
     std::vector<std::shared_ptr<ast::HavingExpr>> having_conds;

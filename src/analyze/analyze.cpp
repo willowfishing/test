@@ -38,6 +38,57 @@ std::string select_item_name(const std::shared_ptr<ast::SelectItem> &item) {
 bool same_col(const TabCol &lhs, const TabCol &rhs) {
     return lhs.tab_name == rhs.tab_name && lhs.col_name == rhs.col_name;
 }
+
+StmtKind infer_stmt_kind(const std::shared_ptr<ast::TreeNode> &parse) {
+    if (std::dynamic_pointer_cast<ast::SelectStmt>(parse)) return StmtKind::Select;
+    if (std::dynamic_pointer_cast<ast::InsertStmt>(parse)) return StmtKind::Insert;
+    if (std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) return StmtKind::Update;
+    if (std::dynamic_pointer_cast<ast::DeleteStmt>(parse)) return StmtKind::Delete;
+    if (std::dynamic_pointer_cast<ast::LoadStmt>(parse)) return StmtKind::Load;
+    if (std::dynamic_pointer_cast<ast::UnionStmt>(parse)) return StmtKind::Union;
+    if (std::dynamic_pointer_cast<ast::ExplainStmt>(parse)) return StmtKind::Explain;
+    if (std::dynamic_pointer_cast<ast::Help>(parse)) return StmtKind::Help;
+    if (std::dynamic_pointer_cast<ast::ShowTables>(parse)) return StmtKind::ShowTables;
+    if (std::dynamic_pointer_cast<ast::ShowIndex>(parse)) return StmtKind::ShowIndex;
+    if (std::dynamic_pointer_cast<ast::DescTable>(parse)) return StmtKind::DescTable;
+    if (std::dynamic_pointer_cast<ast::TxnBegin>(parse)) return StmtKind::TxnBegin;
+    if (std::dynamic_pointer_cast<ast::TxnCommit>(parse)) return StmtKind::TxnCommit;
+    if (std::dynamic_pointer_cast<ast::TxnAbort>(parse)) return StmtKind::TxnAbort;
+    if (std::dynamic_pointer_cast<ast::TxnRollback>(parse)) return StmtKind::TxnRollback;
+    if (std::dynamic_pointer_cast<ast::SetTransactionIsolation>(parse)) return StmtKind::SetTransactionIsolation;
+    if (std::dynamic_pointer_cast<ast::SetStmt>(parse)) return StmtKind::SetKnob;
+    if (std::dynamic_pointer_cast<ast::CreateCheckpoint>(parse)) return StmtKind::CreateCheckpoint;
+    if (std::dynamic_pointer_cast<ast::CreateTable>(parse)) return StmtKind::CreateTable;
+    if (std::dynamic_pointer_cast<ast::DropTable>(parse)) return StmtKind::DropTable;
+    if (std::dynamic_pointer_cast<ast::CreateIndex>(parse)) return StmtKind::CreateIndex;
+    if (std::dynamic_pointer_cast<ast::DropIndex>(parse)) return StmtKind::DropIndex;
+    return StmtKind::Unknown;
+}
+
+void fill_stmt_metadata(Query *query, const std::shared_ptr<ast::TreeNode> &parse) {
+    query->kind = infer_stmt_kind(parse);
+    if (auto x = std::dynamic_pointer_cast<ast::InsertStmt>(parse)) {
+        query->target_table = x->tab_name;
+    } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
+        query->target_table = x->tab_name;
+    } else if (auto x = std::dynamic_pointer_cast<ast::DeleteStmt>(parse)) {
+        query->target_table = x->tab_name;
+    } else if (auto x = std::dynamic_pointer_cast<ast::LoadStmt>(parse)) {
+        query->target_table = x->tab_name;
+    } else if (auto x = std::dynamic_pointer_cast<ast::ShowIndex>(parse)) {
+        query->target_table = x->tab_name;
+    } else if (auto x = std::dynamic_pointer_cast<ast::DescTable>(parse)) {
+        query->target_table = x->tab_name;
+    } else if (auto x = std::dynamic_pointer_cast<ast::CreateTable>(parse)) {
+        query->target_table = x->tab_name;
+    } else if (auto x = std::dynamic_pointer_cast<ast::DropTable>(parse)) {
+        query->target_table = x->tab_name;
+    } else if (auto x = std::dynamic_pointer_cast<ast::CreateIndex>(parse)) {
+        query->target_table = x->tab_name;
+    } else if (auto x = std::dynamic_pointer_cast<ast::DropIndex>(parse)) {
+        query->target_table = x->tab_name;
+    }
+}
 }
 
 /**
@@ -48,6 +99,7 @@ bool same_col(const TabCol &lhs, const TabCol &rhs) {
 std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
 {
     std::shared_ptr<Query> query = std::make_shared<Query>();
+    fill_stmt_metadata(query.get(), parse);
     if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(parse))
     {
         if (x->table_refs.size() == 1 && !x->table_refs[0]->union_selects.empty()) {
@@ -273,19 +325,75 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             throw TableNotFoundError(x->tab_name);
         }
         auto &tab = sm_manager_->db_.get_table(x->tab_name);
+        auto normalize_value_to_type = [](Value rhs, ColType target_type, int target_len) {
+            if (target_type == TYPE_FLOAT && rhs.type == TYPE_INT) {
+                rhs.set_float(static_cast<float>(rhs.int_val));
+                rhs.init_raw(target_len);
+                return rhs;
+            }
+            if (target_type != rhs.type) {
+                throw IncompatibleTypeError(coltype2str(target_type), coltype2str(rhs.type));
+            }
+            rhs.init_raw(target_len);
+            return rhs;
+        };
         for (auto &sv_set_clause : x->set_clauses) {
             auto lhs_col = check_column(tab.cols, {.tab_name = x->tab_name, .col_name = sv_set_clause->col_name});
             auto col_meta = tab.get_col(lhs_col.col_name);
-            Value rhs = convert_sv_value(sv_set_clause->val);
-            if (col_meta->type == TYPE_FLOAT && rhs.type == TYPE_INT) {
-                rhs.set_float(static_cast<float>(rhs.int_val));
-                rhs.init_raw(col_meta->len);
-            } else if (col_meta->type != rhs.type) {
-                throw IncompatibleTypeError(coltype2str(col_meta->type), coltype2str(rhs.type));
-            } else {
-                rhs.init_raw(col_meta->len);
+            SetClause clause;
+            clause.lhs = lhs_col;
+
+            if (!sv_set_clause->rhs_is_col) {
+                clause.op = SetOp::ASSIGN;
+                clause.rhs = normalize_value_to_type(convert_sv_value(sv_set_clause->val), col_meta->type, col_meta->len);
+                clause.rhs_has_val = true;
+                query->set_clauses.push_back(std::move(clause));
+                continue;
             }
-            query->set_clauses.push_back({.lhs = lhs_col, .rhs = rhs});
+
+            auto rhs_col = check_column(tab.cols, {.tab_name = x->tab_name, .col_name = sv_set_clause->rhs_col_name});
+            auto rhs_meta = tab.get_col(rhs_col.col_name);
+            clause.rhs_is_col = true;
+            clause.rhs_col = rhs_col;
+
+            if (sv_set_clause->op == ast::SET_OP_ASSIGN) {
+                clause.op = SetOp::ASSIGN;
+                if (!(col_meta->type == TYPE_FLOAT && rhs_meta->type == TYPE_INT) &&
+                    col_meta->type != rhs_meta->type) {
+                    throw IncompatibleTypeError(coltype2str(col_meta->type), coltype2str(rhs_meta->type));
+                }
+                query->set_clauses.push_back(std::move(clause));
+                continue;
+            }
+
+            if (sv_set_clause->op != ast::SET_OP_ADD &&
+                sv_set_clause->op != ast::SET_OP_SUB &&
+                sv_set_clause->op != ast::SET_OP_MUL &&
+                sv_set_clause->op != ast::SET_OP_DIV) {
+                throw InternalError("Unsupported update set operation");
+            }
+            if (col_meta->type != TYPE_INT && col_meta->type != TYPE_FLOAT) {
+                throw IncompatibleTypeError("numeric column", coltype2str(col_meta->type));
+            }
+            if (rhs_meta->type != TYPE_INT && rhs_meta->type != TYPE_FLOAT) {
+                throw IncompatibleTypeError("numeric column", coltype2str(rhs_meta->type));
+            }
+            if (col_meta->type == TYPE_INT && rhs_meta->type != TYPE_INT) {
+                throw IncompatibleTypeError(coltype2str(col_meta->type), coltype2str(rhs_meta->type));
+            }
+
+            if (sv_set_clause->op == ast::SET_OP_ADD) {
+                clause.op = SetOp::ADD;
+            } else if (sv_set_clause->op == ast::SET_OP_SUB) {
+                clause.op = SetOp::SUB;
+            } else if (sv_set_clause->op == ast::SET_OP_MUL) {
+                clause.op = SetOp::MUL;
+            } else {
+                clause.op = SetOp::DIV;
+            }
+            clause.rhs = normalize_value_to_type(convert_sv_value(sv_set_clause->val), col_meta->type, col_meta->len);
+            clause.rhs_has_val = true;
+            query->set_clauses.push_back(std::move(clause));
         }
         get_clause(x->conds, query->conds);
         check_clause({x->tab_name}, query->conds);
@@ -297,6 +405,11 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         //处理where条件
         get_clause(x->conds, query->conds);
         check_clause({x->tab_name}, query->conds);        
+    } else if (auto x = std::dynamic_pointer_cast<ast::LoadStmt>(parse)) {
+        if (!sm_manager_->db_.is_table(x->tab_name)) {
+            throw TableNotFoundError(x->tab_name);
+        }
+        query->load_file = x->file_name;
     } else if (auto x = std::dynamic_pointer_cast<ast::InsertStmt>(parse)) {
         if (!sm_manager_->db_.is_table(x->tab_name)) {
             throw TableNotFoundError(x->tab_name);

@@ -15,6 +15,8 @@ See the Mulan PSL v2 for more details. */
 #include <memory>
 #include <string>
 #include <vector>
+#include "common/index_runtime.h"
+#include "common/runtime_feedback.h"
 #include "parser/ast.h"
 
 #include "parser/parser.h"
@@ -31,6 +33,7 @@ typedef enum PlanTag{
     T_DropIndex,
     T_SetKnob,
     T_Insert,
+    T_Load,
     T_Update,
     T_Delete,
     T_select,
@@ -43,21 +46,43 @@ typedef enum PlanTag{
     T_IndexScan,
     T_NestLoop,
     T_IndexNestLoop,
+    T_HashJoin,
     T_SortMerge,    // sort merge join
     T_Sort,
     T_Projection,
     T_Aggregate,
+    T_MinMaxIndexAggregate,
+    T_CountIndexAggregate,
     T_Limit,
     T_SemiJoin,
     T_Union,
-    T_Explain
+    T_Explain,
+    T_Checkpoint
 } PlanTag;
+
+struct PlanRuntimeCache {
+    const TabMeta *tab = nullptr;
+    RmFileHandle *fh = nullptr;
+    std::vector<ColMeta> full_cols;
+    size_t full_len = 0;
+    bool has_table = false;
+
+    IndexMeta index_meta;
+    IxIndexHandle *ih = nullptr;
+    bool has_index = false;
+
+    std::vector<rmdb::IndexBinding> index_bindings;
+    bool has_index_bindings = false;
+};
 
 // 查询执行计划
 class Plan
 {
 public:
     PlanTag tag;
+    std::shared_ptr<const PlanRuntimeCache> runtime_cache_;
+    uint32_t template_node_id_ = rmdb::kInvalidRuntimeNodeId;
+    std::shared_ptr<rmdb::RuntimeNodeFeedback> runtime_feedback_;
     virtual ~Plan() = default;
 };
 
@@ -90,6 +115,7 @@ class ScanPlan : public Plan
         size_t len_;                               
         std::vector<Condition> fed_conds_;
         std::vector<std::string> index_col_names_;
+        std::vector<TabCol> required_cols_;
     
 };
 
@@ -176,6 +202,7 @@ class SortPlan : public Plan
         TabCol sel_col_;
         bool is_desc_;
         std::vector<std::pair<TabCol, bool>> order_cols_;
+        int limit_ = -1;
         
 };
 
@@ -214,6 +241,66 @@ class AggregatePlan : public Plan
         std::vector<std::shared_ptr<ast::SelectItem>> select_items_;
         std::vector<TabCol> group_cols_;
         std::vector<std::shared_ptr<ast::HavingExpr>> having_conds_;
+        std::vector<TabCol> output_cols_;
+};
+
+class MinMaxIndexAggregatePlan : public Plan
+{
+    public:
+        MinMaxIndexAggregatePlan(std::string tab_name,
+                                 std::string visible_name,
+                                 std::vector<Condition> conds,
+                                 std::vector<std::string> index_col_names,
+                                 TabCol agg_col,
+                                 ast::AggType agg_type,
+                                 std::vector<TabCol> output_cols)
+        {
+            Plan::tag = T_MinMaxIndexAggregate;
+            tab_name_ = std::move(tab_name);
+            visible_name_ = visible_name.empty() ? tab_name_ : std::move(visible_name);
+            conds_ = std::move(conds);
+            index_col_names_ = std::move(index_col_names);
+            agg_col_ = std::move(agg_col);
+            agg_type_ = agg_type;
+            output_cols_ = std::move(output_cols);
+        }
+        ~MinMaxIndexAggregatePlan(){}
+        std::string tab_name_;
+        std::string visible_name_;
+        std::vector<Condition> conds_;
+        std::vector<std::string> index_col_names_;
+        TabCol agg_col_;
+        ast::AggType agg_type_;
+        std::vector<TabCol> output_cols_;
+};
+
+class CountIndexAggregatePlan : public Plan
+{
+    public:
+        CountIndexAggregatePlan(std::string tab_name,
+                                std::string visible_name,
+                                std::vector<Condition> conds,
+                                std::vector<std::string> index_col_names,
+                                bool count_star,
+                                TabCol count_col,
+                                std::vector<TabCol> output_cols)
+        {
+            Plan::tag = T_CountIndexAggregate;
+            tab_name_ = std::move(tab_name);
+            visible_name_ = visible_name.empty() ? tab_name_ : std::move(visible_name);
+            conds_ = std::move(conds);
+            index_col_names_ = std::move(index_col_names);
+            count_star_ = count_star;
+            count_col_ = std::move(count_col);
+            output_cols_ = std::move(output_cols);
+        }
+        ~CountIndexAggregatePlan(){}
+        std::string tab_name_;
+        std::string visible_name_;
+        std::vector<Condition> conds_;
+        std::vector<std::string> index_col_names_;
+        bool count_star_ = false;
+        TabCol count_col_;
         std::vector<TabCol> output_cols_;
 };
 
@@ -260,12 +347,20 @@ class DMLPlan : public Plan
             conds_ = std::move(conds);
             set_clauses_ = std::move(set_clauses);
         }
+        DMLPlan(PlanTag tag, std::string tab_name, std::string file_name)
+        {
+            Plan::tag = tag;
+            tab_name_ = std::move(tab_name);
+            file_name_ = std::move(file_name);
+        }
         ~DMLPlan(){}
         std::shared_ptr<Plan> subplan_;
         std::string tab_name_;
+        std::string file_name_;
         std::vector<Value> values_;
         std::vector<Condition> conds_;
         std::vector<SetClause> set_clauses_;
+        std::vector<TabCol> output_cols_;
 };
 
 // ddl语句, 包括create/drop table; create/drop index;
@@ -296,6 +391,18 @@ class OtherPlan : public Plan
         }
         ~OtherPlan(){}
         std::string tab_name_;
+};
+
+class SetTransactionIsolationPlan : public Plan
+{
+    public:
+        explicit SetTransactionIsolationPlan(IsolationLevel isolation_level)
+        {
+            Plan::tag = T_SetTransactionIsolation;
+            isolation_level_ = isolation_level;
+        }
+        ~SetTransactionIsolationPlan(){}
+        IsolationLevel isolation_level_;
 };
 
 // Set Knob Plan

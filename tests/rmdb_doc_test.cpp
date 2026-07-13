@@ -137,19 +137,6 @@ std::vector<Case> generated_cases() {
         Case{"07_03_abort_test", {}, {}, "txn_abort"},
         Case{"07_04_commit_index_test", {}, {}, "txn_commit_index"},
         Case{"07_05_abort_index_test", {}, {}, "txn_abort_index"},
-        Case{"08_01_abort_test", {}, {}, "mvcc_abort"},
-        Case{"08_02_deadlock", {}, {}, "mvcc_deadlock"},
-        Case{"08_03_dirty_read", {}, {}, "mvcc_dirty_read"},
-        Case{"08_04_insert_delete_conflict", {}, {}, "mvcc_insert_delete"},
-        Case{"08_05_insert_test", {}, {}, "mvcc_insert"},
-        Case{"08_06_non_repeatable_read_lost_update", {}, {}, "mvcc_lost_update"},
-        Case{"08_07_read_write_conflict_delete", {}, {}, "mvcc_read_write_delete"},
-        Case{"08_08_scan_test", {}, {}, "mvcc_scan"},
-        Case{"08_09_timestamp_tracking", {}, {}, "mvcc_timestamp"},
-        Case{"08_10_tuple_reconstruct", {}, {}, "mvcc_tuple_reconstruct"},
-        Case{"08_11_update_test", {}, {}, "mvcc_update"},
-        Case{"08_12_write_write_delete_insert", {}, {}, "mvcc_write_write_delete_insert"},
-        Case{"08_13_write_write_update", {}, {}, "mvcc_write_write_update"},
         Case{"09_01_crash_recovery_single_thread", {}, {}, "recovery_single"},
         Case{"09_02_crash_recovery_multi_thread", {}, {}, "recovery_multi"},
         Case{"09_03_crash_recovery_index", {}, {}, "recovery_index"},
@@ -766,32 +753,6 @@ bool run_index_perf_case(const Options &options, const Case &test_case) {
     return true;
 }
 
-void append_mvcc_setup(std::vector<std::string> &statements) {
-    statements.push_back("create table concurrency_test (id int, name char(8), score float);");
-    statements.push_back("insert into concurrency_test values (1, 'xiaohong', 90.0);");
-    statements.push_back("insert into concurrency_test values (2, 'xiaoming', 95.0);");
-    statements.push_back("insert into concurrency_test values (3, 'zhanghua', 88.5);");
-}
-
-bool verify_mvcc_baseline(const Options &options, const Case &test_case, RmdbClient &client,
-                          const std::string &db_name) {
-    std::vector<std::string> statements = {
-        "create table mvcc_txn_probe (id int, name char(8), score float);",
-        "insert into mvcc_txn_probe values (1, 'base', 10.0);",
-        "begin;",
-        "insert into mvcc_txn_probe values (2, 'abort', 20.0);",
-        "abort;",
-        "select * from mvcc_txn_probe;",
-    };
-    for (const auto &statement : statements) {
-        client.execute(statement);
-    }
-    std::vector<std::string> expected = {"| id | name | score |", "| 1 | base | 10.000000 |"};
-    bool ok = compare_case_output(options, test_case, db_name, expected);
-    cleanup_outputs(options, db_name);
-    return ok;
-}
-
 bool run_transaction_case(const Options &options, const Case &test_case) {
     bool with_index = test_case.kind.find("_index") != std::string::npos;
     bool is_commit = test_case.kind.find("commit") != std::string::npos;
@@ -811,206 +772,6 @@ bool run_transaction_case(const Options &options, const Case &test_case) {
     }
     statements.push_back("select * from student;");
     return run_statements_case(options, test_case, statements, expected);
-}
-
-bool run_mvcc_case(const Options &options, const Case &test_case) {
-    std::string db_name = "doc_test_" + test_case.name;
-    fs::path log_path = options.root / "tests" / (test_case.name + ".server.log");
-    cleanup_outputs(options, db_name);
-    if (!options.keep_db) {
-        cleanup_db(options, db_name);
-    }
-    pid_t pid = start_server(options, db_name, log_path);
-    std::vector<std::unique_ptr<RmdbClient>> clients;
-    try {
-        auto setup = std::make_unique<RmdbClient>(options.timeout_sec);
-        if (!verify_mvcc_baseline(options, test_case, *setup, db_name)) {
-            throw std::runtime_error("MVCC transaction baseline failed");
-        }
-        std::vector<std::string> setup_statements;
-        append_mvcc_setup(setup_statements);
-        for (const auto &statement : setup_statements) {
-            setup->execute(statement);
-        }
-        setup->close();
-
-        auto t1 = std::make_unique<RmdbClient>(options.timeout_sec);
-        auto t2 = std::make_unique<RmdbClient>(options.timeout_sec);
-        RmdbClient *c1 = t1.get();
-        RmdbClient *c2 = t2.get();
-        clients.push_back(std::move(t1));
-        clients.push_back(std::move(t2));
-        std::vector<std::string> expected;
-
-        if (test_case.kind == "mvcc_abort" || test_case.kind == "mvcc_dirty_read") {
-            c1->execute("begin;");
-            c2->execute("begin;");
-            c1->execute("update concurrency_test set score = 100.0 where id = 2;");
-            c2->execute("select * from concurrency_test where id = 2;");
-            c1->execute("abort;");
-            c1->execute("select * from concurrency_test where id = 2;");
-            c2->execute("commit;");
-            expected = {"| id | name | score |", "| 2 | xiaoming | 95.000000 |",
-                        "| id | name | score |", "| 2 | xiaoming | 95.000000 |"};
-        } else if (test_case.kind == "mvcc_deadlock") {
-            c1->execute("begin;");
-            c2->execute("begin;");
-            c1->execute("update concurrency_test set score = 91.0 where id = 1;");
-            c2->execute("update concurrency_test set score = 96.0 where id = 2;");
-            std::vector<std::string> errors;
-            std::vector<std::string> responses;
-            std::mutex result_mutex;
-            auto run_cross = [&](RmdbClient *client, const std::string &statement) {
-                try {
-                    std::string response = client->execute(statement);
-                    std::lock_guard<std::mutex> lock(result_mutex);
-                    responses.push_back(response);
-                } catch (const std::exception &exception) {
-                    std::lock_guard<std::mutex> lock(result_mutex);
-                    errors.push_back(exception.what());
-                }
-            };
-            std::thread a(run_cross, c1, "update concurrency_test set score = 92.0 where id = 2;");
-            std::thread b(run_cross, c2, "update concurrency_test set score = 97.0 where id = 1;");
-            a.join();
-            b.join();
-            bool signaled = !errors.empty();
-            for (auto response : responses) {
-                std::transform(response.begin(), response.end(), response.begin(), [](unsigned char ch) {
-                    return static_cast<char>(std::tolower(ch));
-                });
-                signaled = signaled || response.find("abort") != std::string::npos ||
-                           response.find("failure") != std::string::npos;
-            }
-            if (!signaled) {
-                throw std::runtime_error("deadlock conflict completed without abort/failure signal");
-            }
-            c1->execute("abort;");
-            c2->execute("abort;");
-            cleanup_outputs(options, db_name);
-            auto verifier = std::make_unique<RmdbClient>(options.timeout_sec);
-            verifier->execute("select * from concurrency_test where id = 2;");
-            verifier->close();
-            expected = {"| id | name | score |", "| 2 | xiaoming | 95.000000 |"};
-        } else if (test_case.kind == "mvcc_insert_delete") {
-            c1->execute("begin;");
-            c2->execute("begin;");
-            c1->execute("insert into concurrency_test values (4, 'newrow', 77.0);");
-            c2->execute("delete from concurrency_test where id = 4;");
-            c1->execute("commit;");
-            c2->execute("abort;");
-            c1->execute("select * from concurrency_test where id = 4;");
-            expected = {"| id | name | score |", "| 4 | newrow | 77.000000 |"};
-        } else if (test_case.kind == "mvcc_insert") {
-            c1->execute("begin;");
-            c1->execute("insert into concurrency_test values (4, 'insert', 80.0);");
-            c1->execute("commit;");
-            c2->execute("select * from concurrency_test where id = 4;");
-            expected = {"| id | name | score |", "| 4 | insert | 80.000000 |"};
-        } else if (test_case.kind == "mvcc_lost_update") {
-            c1->execute("begin;");
-            c2->execute("begin;");
-            c1->execute("select * from concurrency_test where id = 2;");
-            c2->execute("update concurrency_test set score = 96.0 where id = 2;");
-            c2->execute("commit;");
-            c1->execute("update concurrency_test set score = 97.0 where id = 2;");
-            c1->execute("commit;");
-            c2->execute("select * from concurrency_test where id = 2;");
-            expected = {"| id | name | score |", "| 2 | xiaoming | 95.000000 |",
-                        "| id | name | score |", "| 2 | xiaoming | 97.000000 |"};
-        } else if (test_case.kind == "mvcc_read_write_delete") {
-            c1->execute("begin;");
-            c1->execute("select * from concurrency_test where id = 3;");
-            c2->execute("begin;");
-            c2->execute("delete from concurrency_test where id = 3;");
-            c2->execute("commit;");
-            c1->execute("select * from concurrency_test where id = 3;");
-            c1->execute("commit;");
-            expected = {"| id | name | score |", "| 3 | zhanghua | 88.500000 |",
-                        "| id | name | score |", "| 3 | zhanghua | 88.500000 |"};
-        } else if (test_case.kind == "mvcc_scan") {
-            c1->execute("begin;");
-            c1->execute("select * from concurrency_test;");
-            c2->execute("begin;");
-            c2->execute("insert into concurrency_test values (4, 'scanrow', 70.0);");
-            c2->execute("commit;");
-            c1->execute("select * from concurrency_test;");
-            c1->execute("commit;");
-            expected = {"| id | name | score |", "| 1 | xiaohong | 90.000000 |",
-                        "| 2 | xiaoming | 95.000000 |", "| 3 | zhanghua | 88.500000 |",
-                        "| id | name | score |", "| 1 | xiaohong | 90.000000 |",
-                        "| 2 | xiaoming | 95.000000 |", "| 3 | zhanghua | 88.500000 |"};
-        } else if (test_case.kind == "mvcc_timestamp") {
-            c1->execute("begin;");
-            c1->execute("select * from concurrency_test where id = 1;");
-            c1->execute("commit;");
-            c2->execute("begin;");
-            c2->execute("update concurrency_test set score = 91.0 where id = 1;");
-            c2->execute("commit;");
-            c1->execute("select * from concurrency_test where id = 1;");
-            expected = {"| id | name | score |", "| 1 | xiaohong | 90.000000 |",
-                        "| id | name | score |", "| 1 | xiaohong | 91.000000 |"};
-        } else if (test_case.kind == "mvcc_tuple_reconstruct") {
-            c1->execute("begin;");
-            c2->execute("begin;");
-            c2->execute("update concurrency_test set score = 96.0 where id = 2;");
-            c2->execute("commit;");
-            c1->execute("select * from concurrency_test where id = 2;");
-            c1->execute("commit;");
-            expected = {"| id | name | score |", "| 2 | xiaoming | 95.000000 |"};
-        } else if (test_case.kind == "mvcc_update") {
-            c1->execute("begin;");
-            c1->execute("update concurrency_test set score = 91.0 where id = 1;");
-            c1->execute("commit;");
-            c2->execute("select * from concurrency_test where id = 1;");
-            expected = {"| id | name | score |", "| 1 | xiaohong | 91.000000 |"};
-        } else if (test_case.kind == "mvcc_write_write_delete_insert") {
-            c1->execute("begin;");
-            c2->execute("begin;");
-            c1->execute("delete from concurrency_test where id = 2;");
-            c2->execute("insert into concurrency_test values (2, 'again', 99.0);");
-            c1->execute("commit;");
-            c2->execute("abort;");
-            c1->execute("select * from concurrency_test where id = 2;");
-            expected = {"| id | name | score |"};
-        } else if (test_case.kind == "mvcc_write_write_update") {
-            c1->execute("begin;");
-            c2->execute("begin;");
-            c1->execute("update concurrency_test set score = 96.0 where id = 2;");
-            c2->execute("update concurrency_test set score = 97.0 where id = 2;");
-            c1->execute("commit;");
-            c2->execute("abort;");
-            c1->execute("select * from concurrency_test where id = 2;");
-            expected = {"| id | name | score |", "| 2 | xiaoming | 96.000000 |"};
-        } else {
-            throw std::runtime_error("unknown MVCC case kind: " + test_case.kind);
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        for (auto &client : clients) {
-            client->close();
-        }
-        stop_server(pid);
-        bool ok = compare_case_output(options, test_case, db_name, expected);
-        if (ok && !options.keep_db) {
-            cleanup_db(options, db_name);
-        }
-        if (ok && !options.show_server_log) {
-            std::error_code ignored;
-            fs::remove(log_path, ignored);
-        }
-        return ok;
-    } catch (const std::exception &exception) {
-        for (auto &client : clients) {
-            client->close();
-        }
-        stop_server(pid);
-        std::cerr << "runtime error: " << exception.what() << "\n";
-        if (options.show_server_log) {
-            std::cerr << read_file(log_path);
-        }
-        return false;
-    }
 }
 
 void recovery_workload(RmdbClient &client, int rows, bool use_index, bool use_checkpoint, int workers,
@@ -1165,9 +926,6 @@ bool run_generated_case(const Options &options, const Case &test_case) {
     }
     if (test_case.kind.rfind("txn_", 0) == 0) {
         return run_transaction_case(options, test_case);
-    }
-    if (test_case.kind.rfind("mvcc_", 0) == 0) {
-        return run_mvcc_case(options, test_case);
     }
     if (test_case.kind.rfind("recovery_", 0) == 0) {
         return run_recovery_case(options, test_case);

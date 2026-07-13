@@ -52,6 +52,8 @@ class SmManager {
 
     IxManager* get_ix_manager() { return ix_manager_; }  
 
+    int hidden_index_count() const;
+
     bool is_dir(const std::string& db_name);
 
     void create_db(const std::string& db_name);
@@ -75,6 +77,9 @@ class SmManager {
     void drop_table(const std::string& tab_name, Context* context);
 
     void create_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context);
+
+    bool create_internal_non_unique_index(const std::string& tab_name, const std::vector<std::string>& col_names,
+                                          Context* context);
 
     void drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context);
     

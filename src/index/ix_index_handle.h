@@ -12,11 +12,27 @@ See the Mulan PSL v2 for more details. */
 
 #include "ix_defs.h"
 #include "transaction/transaction.h"
-#include <map>
+#include <condition_variable>
+#include <mutex>
+#include <memory>
+#include <shared_mutex>
+#include <utility>
+
+class IxScan;
+class IxIndexHandle;
 
 enum class Operation { FIND = 0, INSERT, DELETE };  // 三种操作：查找、插入、删除
 
+enum class LatchMode { None = 0, Shared, Exclusive };
+
 static const bool binary_search = false;
+
+enum class IxInsertResult { kInserted, kDuplicate };
+
+struct IxInsertOutcome {
+    IxInsertResult result;
+    page_id_t page_no;
+};
 
 inline int ix_compare(const char *a, const char *b, ColType type, int col_len) {
     switch (type) {
@@ -68,34 +84,64 @@ class IxNodeHandle {
         rids = reinterpret_cast<Rid *>(keys + file_hdr->keys_size_);
     }
 
-    int get_size() { return page_hdr->num_key; }
+    int get_size() const { return page_hdr->num_key; }
 
     void set_size(int size) { page_hdr->num_key = size; }
 
-    int get_max_size() { return file_hdr->btree_order_ + 1; }
+    int get_physical_key_capacity() const { return file_hdr->btree_order_ + 1; }
 
-    int get_min_size() { return get_max_size() / 2; }
+    int get_max_size() const { return file_hdr->btree_order_; }
 
-    int key_at(int i) { return *(int *)get_key(i); }
+    int get_min_size() const { return get_max_size() / 2; }
+
+    int key_at(int i) const { return *(int *)get_key(i); }
 
     /* 得到第i个孩子结点的page_no */
-    page_id_t value_at(int i) { return get_rid(i)->page_no; }
+    page_id_t value_at(int i) const { return get_rid(i)->page_no; }
 
-    page_id_t get_page_no() { return page->get_page_id().page_no; }
+    page_id_t get_page_no() const { return page->get_page_id().page_no; }
 
-    PageId get_page_id() { return page->get_page_id(); }
+    PageId get_page_id() const { return page->get_page_id(); }
 
-    page_id_t get_next_leaf() { return page_hdr->next_leaf; }
+    page_id_t get_next_leaf() const { return page_hdr->next_leaf; }
 
-    page_id_t get_prev_leaf() { return page_hdr->prev_leaf; }
+    page_id_t right_link() const { return page_hdr->next_leaf; }
 
-    page_id_t get_parent_page_no() { return page_hdr->parent; }
+    page_id_t get_prev_leaf() const { return page_hdr->prev_leaf; }
 
-    bool is_leaf_page() { return page_hdr->is_leaf; }
+    page_id_t get_parent_page_no() const { return page_hdr->parent; }
 
-    bool is_root_page() { return get_parent_page_no() == INVALID_PAGE_ID; }
+    bool is_leaf_page() const { return page_hdr->is_leaf; }
+
+    bool is_root_page() const { return get_parent_page_no() == INVALID_PAGE_ID; }
+
+    bool is_tombstone() const {
+        return page_hdr->next_free_page_no == IX_PAGE_TOMBSTONE ||
+               page_hdr->next_free_page_no == IX_PAGE_DRAINING;
+    }
+
+    bool is_draining() const { return page_hdr->next_free_page_no == IX_PAGE_DRAINING; }
+
+    bool is_free_page() const { return page_hdr->parent == IX_PAGE_FREE; }
+
+    void mark_tombstone() { page_hdr->next_free_page_no = IX_PAGE_TOMBSTONE; }
+
+    void mark_draining() { page_hdr->next_free_page_no = IX_PAGE_DRAINING; }
+
+    void clear_tombstone() { page_hdr->next_free_page_no = IX_NO_PAGE; }
+
+    void mark_free_page(page_id_t next_free_page_no) {
+        page_hdr->next_free_page_no = next_free_page_no;
+        page_hdr->parent = IX_PAGE_FREE;
+        page_hdr->num_key = 0;
+        page_hdr->is_leaf = true;
+        page_hdr->prev_leaf = IX_NO_PAGE;
+        page_hdr->next_leaf = IX_NO_PAGE;
+    }
 
     void set_next_leaf(page_id_t page_no) { page_hdr->next_leaf = page_no; }
+
+    void set_right_link(page_id_t page_no) { page_hdr->next_leaf = page_no; }
 
     void set_prev_leaf(page_id_t page_no) { page_hdr->prev_leaf = page_no; }
 
@@ -103,9 +149,16 @@ class IxNodeHandle {
 
     char *get_key(int key_idx) const { return keys + key_idx * file_hdr->col_tot_len_; }
 
+    char *high_key() const {
+        assert(get_max_size() < get_physical_key_capacity());
+        return get_key(get_max_size());
+    }
+
     Rid *get_rid(int rid_idx) const { return &rids[rid_idx]; }
 
     void set_key(int key_idx, const char *key) { memcpy(keys + key_idx * file_hdr->col_tot_len_, key, file_hdr->col_tot_len_); }
+
+    void set_high_key(const char *key) { memcpy(high_key(), key, file_hdr->col_tot_len_); }
 
     void set_rid(int rid_idx, const Rid &rid) { rids[rid_idx] = rid; }
 
@@ -113,9 +166,26 @@ class IxNodeHandle {
 
     int upper_bound(const char *target) const;
 
+    bool has_high_key() const;
+
+    bool key_belongs_here(const char *key) const;
+
+    void assert_valid() const;
+
+    int find_child_by_first_key(const char *child_first_key) const;
+
+    int find_child_index(page_id_t child_page_no) const {
+        for (int rid_idx = 0; rid_idx < page_hdr->num_key; rid_idx++) {
+            if (get_rid(rid_idx)->page_no == child_page_no) {
+                return rid_idx;
+            }
+        }
+        return -1;
+    }
+
     void insert_pairs(int pos, const char *key, const Rid *rid, int n);
 
-    page_id_t internal_lookup(const char *key);
+    page_id_t internal_lookup(const char *key) const;
 
     bool leaf_lookup(const char *key, Rid **value);
 
@@ -129,118 +199,294 @@ class IxNodeHandle {
     int remove(const char *key);
 
     /**
-     * @brief used in internal node to remove the last key in root node, and return the last child
-     *
-     * @return the last child
-     */
-    page_id_t remove_and_return_only_child() {
-        assert(get_size() == 1);
-        page_id_t child_page_no = value_at(0);
-        erase_pair(0);
-        assert(get_size() == 0);
-        return child_page_no;
-    }
-
-    /**
      * @brief 由parent调用，寻找child，返回child在parent中的rid_idx∈[0,page_hdr->num_key)
      * @param child
      * @return int
      */
-    int find_child(IxNodeHandle *child) {
-        int rid_idx;
-        for (rid_idx = 0; rid_idx < page_hdr->num_key; rid_idx++) {
-            if (get_rid(rid_idx)->page_no == child->get_page_no()) {
-                break;
-            }
-        }
-        assert(rid_idx < page_hdr->num_key);
+    int find_child(const IxNodeHandle *child) const {
+        assert(child != nullptr);
+        int rid_idx = find_child_index(child->get_page_no());
+        assert(rid_idx >= 0);
         return rid_idx;
     }
+};
+
+class IxNodeHandleGuard {
+   public:
+    IxNodeHandleGuard() = default;
+
+    IxNodeHandleGuard(BufferPoolManager *buffer_pool_manager, const IxFileHdr *file_hdr, Page *page,
+                      LatchMode latch_mode = LatchMode::None)
+        : buffer_pool_manager_(buffer_pool_manager), page_(page), node_(file_hdr, page) {
+        latch(latch_mode);
+    }
+
+    ~IxNodeHandleGuard() { reset(); }
+
+    IxNodeHandleGuard(const IxNodeHandleGuard &) = delete;
+    IxNodeHandleGuard &operator=(const IxNodeHandleGuard &) = delete;
+
+    IxNodeHandleGuard(IxNodeHandleGuard &&other) noexcept { move_from(std::move(other)); }
+
+    IxNodeHandleGuard &operator=(IxNodeHandleGuard &&other) noexcept {
+        if (this != &other) {
+            reset();
+            move_from(std::move(other));
+        }
+        return *this;
+    }
+
+    explicit operator bool() const { return page_ != nullptr; }
+
+    IxNodeHandle *operator->() {
+        assert(page_ != nullptr);
+        return &node_;
+    }
+
+    const IxNodeHandle *operator->() const {
+        assert(page_ != nullptr);
+        return &node_;
+    }
+
+    IxNodeHandle &get() {
+        assert(page_ != nullptr);
+        return node_;
+    }
+
+    const IxNodeHandle &get() const {
+        assert(page_ != nullptr);
+        return node_;
+    }
+
+    void mark_dirty() {
+        assert(page_ != nullptr);
+        dirty_ = true;
+    }
+
+    void unlock() {
+        if (page_ == nullptr || latch_mode_ == LatchMode::None) {
+            return;
+        }
+        if (latch_mode_ == LatchMode::Shared) {
+            page_->r_unlatch();
+        } else {
+            page_->w_unlatch();
+        }
+        latch_mode_ = LatchMode::None;
+    }
+
+    LatchMode latch_mode() const { return latch_mode_; }
+
+    PageId page_id() const {
+        assert(page_ != nullptr);
+        return page_->get_page_id();
+    }
+
+    void reset() {
+        if (page_ == nullptr) {
+            return;
+        }
+        if (latch_mode_ != LatchMode::None) {
+            node_.assert_valid();
+        }
+        unlock();
+        PageId page_id = page_->get_page_id();
+        bool ok = buffer_pool_manager_->unpin_page_fast(page_, page_id, dirty_);
+        if (!ok) {
+            ok = buffer_pool_manager_->unpin_page(page_id, dirty_);
+        }
+        assert(ok);
+        clear();
+    }
+
+   private:
+    void latch(LatchMode latch_mode) {
+        assert(page_ != nullptr || latch_mode == LatchMode::None);
+        if (latch_mode == LatchMode::Shared) {
+            page_->r_latch();
+        } else if (latch_mode == LatchMode::Exclusive) {
+            page_->w_latch();
+        }
+        latch_mode_ = latch_mode;
+    }
+
+    void move_from(IxNodeHandleGuard &&other) {
+        buffer_pool_manager_ = other.buffer_pool_manager_;
+        page_ = other.page_;
+        node_ = other.node_;
+        dirty_ = other.dirty_;
+        latch_mode_ = other.latch_mode_;
+        other.clear();
+    }
+
+    void clear() {
+        buffer_pool_manager_ = nullptr;
+        page_ = nullptr;
+        node_ = IxNodeHandle();
+        dirty_ = false;
+        latch_mode_ = LatchMode::None;
+    }
+
+    BufferPoolManager *buffer_pool_manager_ = nullptr;
+    Page *page_ = nullptr;
+    IxNodeHandle node_;
+    bool dirty_ = false;
+    LatchMode latch_mode_ = LatchMode::None;
+};
+
+class IxReadGuard {
+   public:
+    IxReadGuard() = default;
+    explicit IxReadGuard(const IxIndexHandle *index);
+    ~IxReadGuard();
+
+    IxReadGuard(const IxReadGuard &) = delete;
+    IxReadGuard &operator=(const IxReadGuard &) = delete;
+
+    IxReadGuard(IxReadGuard &&other) noexcept { move_from(std::move(other)); }
+    IxReadGuard &operator=(IxReadGuard &&other) noexcept {
+        if (this != &other) {
+            reset();
+            move_from(std::move(other));
+        }
+        return *this;
+    }
+
+    explicit operator bool() const { return index_ != nullptr; }
+    void reset();
+
+   private:
+    void move_from(IxReadGuard &&other) {
+        index_ = other.index_;
+        other.index_ = nullptr;
+    }
+
+    const IxIndexHandle *index_{nullptr};
 };
 
 /* B+树 */
 class IxIndexHandle {
     friend class IxScan;
     friend class IxManager;
+    friend class IxReadGuard;
 
    private:
     DiskManager *disk_manager_;
     BufferPoolManager *buffer_pool_manager_;
     int fd_;                                    // 存储B+树的文件
     IxFileHdr* file_hdr_;                       // 存了root_page，但其初始化为2（第0页存FILE_HDR_PAGE，第1页存LEAF_HEADER_PAGE）
-    std::mutex root_latch_;
-    std::map<std::string, Rid> entries_;
+    mutable std::shared_mutex tree_latch_;
+    mutable std::mutex page_reclaim_latch_;
+    mutable std::mutex reclamation_latch_;
+    mutable std::condition_variable reclamation_cv_;
+    mutable int active_readers_{0};
 
    public:
     IxIndexHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, int fd);
 
-    void flush() {
+    ~IxIndexHandle() { delete file_hdr_; }
+
+    void flush_header() {
         char *data = new char[file_hdr_->tot_len_];
         file_hdr_->serialize(data);
         disk_manager_->write_page(fd_, IX_FILE_HDR_PAGE, data, file_hdr_->tot_len_);
         delete[] data;
+    }
+
+    void flush() {
+        flush_header();
         buffer_pool_manager_->flush_all_pages(fd_);
     }
 
     // for search
     bool get_value(const char *key, std::vector<Rid> *result, Transaction *transaction);
 
-    void get_all_rids(std::vector<Rid> *result) const {
-        for (const auto &entry : entries_) {
-            result->push_back(entry.second);
-        }
-    }
+    void get_all_rids(std::vector<Rid> *result) const;
 
-    std::pair<IxNodeHandle *, bool> find_leaf_page(const char *key, Operation operation, Transaction *transaction,
-                                                 bool find_first = false);
+    void get_prefix_values(const char *prefix_key, int prefix_len, std::vector<Rid> *result) const;
 
     // for insert
-    page_id_t insert_entry(const char *key, const Rid &value, Transaction *transaction);
+    IxInsertOutcome insert_entry(const char *key, const Rid &value, Transaction *transaction);
 
-    IxNodeHandle *split(IxNodeHandle *node);
+    // Bulk-load: build entire B+ tree from index entries.
+    void bulk_load(std::vector<std::pair<std::string, Rid>> &entries, bool enforce_unique = true);
 
-    void insert_into_parent(IxNodeHandle *old_node, const char *key, IxNodeHandle *new_node, Transaction *transaction);
+    IxNodeHandleGuard split(IxNodeHandleGuard &node);
+
+    void insert_into_parent(IxNodeHandleGuard &old_node, const char *key, IxNodeHandleGuard &new_node,
+                            Transaction *transaction, std::vector<page_id_t> *ancestors = nullptr);
 
     // for delete
     bool delete_entry(const char *key, Transaction *transaction);
 
-    bool coalesce_or_redistribute(IxNodeHandle *node, Transaction *transaction = nullptr,
-                                bool *root_is_latched = nullptr);
-    bool adjust_root(IxNodeHandle *old_root_node);
+    Iid lower_bound(const char *key) const;
 
-    void redistribute(IxNodeHandle *neighbor_node, IxNodeHandle *node, IxNodeHandle *parent, int index);
-
-    bool coalesce(IxNodeHandle **neighbor_node, IxNodeHandle **node, IxNodeHandle **parent, int index,
-                  Transaction *transaction, bool *root_is_latched);
-
-    Iid lower_bound(const char *key);
-
-    Iid upper_bound(const char *key);
+    Iid upper_bound(const char *key) const;
 
     Iid leaf_end() const;
 
     Iid leaf_begin() const;
 
+    std::unique_ptr<IxScan> create_scan(const Iid &lower, const Iid &upper) const;
+
+    IxReadGuard make_read_guard() const;
+
    private:
+    Iid lower_bound_internal(const char *key) const;
+
+    Iid upper_bound_internal(const char *key) const;
+
+    Iid leaf_end_internal() const;
+
+    Iid leaf_begin_internal() const;
+
     // 辅助函数
-    void update_root_page_no(page_id_t root) { file_hdr_->root_page_ = root; }
+    page_id_t root_page_no() const;
 
-    bool is_empty() const { return file_hdr_->root_page_ == IX_NO_PAGE; }
+    void update_root_page_no(page_id_t root);
 
-    // for get/create node
-    IxNodeHandle *fetch_node(int page_no) const;
+    void update_leaf_bounds(page_id_t first_leaf, page_id_t last_leaf);
 
-    IxNodeHandle *create_node();
+    void update_last_leaf_page_no(page_id_t last_leaf);
 
-    // for maintain data structure
-    void maintain_parent(IxNodeHandle *node);
+    bool is_empty() const { return root_page_no() == IX_NO_PAGE; }
 
-    void erase_leaf(IxNodeHandle *leaf);
+    void enter_read() const;
 
-    void release_node_handle(IxNodeHandle &node);
+    void leave_read() const;
 
-    void maintain_child(IxNodeHandle *node, int child_idx);
+    void wait_for_readers_to_drain() const;
+
+    IxNodeHandleGuard fetch_node_guard(int page_no, LatchMode latch_mode = LatchMode::None,
+                                       BufferAccessStrategy *strategy = nullptr) const;
+
+    IxNodeHandleGuard create_node_guard(LatchMode latch_mode = LatchMode::None,
+                                        BufferAccessStrategy *strategy = nullptr);
+
+    IxNodeHandleGuard pop_free_node_guard(LatchMode latch_mode);
+
+    void push_free_node(IxNodeHandleGuard &node);
+
+    IxNodeHandleGuard fetch_parent_for_child(page_id_t parent_page_no, page_id_t child_page_no) const;
+
+    IxNodeHandleGuard find_leaf_page_for_write(const char *key, std::vector<page_id_t> *ancestors) const;
+
+    bool try_reclaim_empty_leaf(page_id_t leaf_page_no, std::vector<page_id_t> *ancestors);
+
+    bool unlink_leaf_from_parent(IxNodeHandleGuard &leaf, std::vector<page_id_t> *ancestors);
+
+    bool unlink_leaf_from_leaf_chain(IxNodeHandleGuard &leaf);
+
+    page_id_t safe_next_leaf(const IxNodeHandle &node) const;
+
+    IxNodeHandleGuard fetch_next_live_leaf(page_id_t page_no, LatchMode latch_mode) const;
+
+    std::pair<IxNodeHandleGuard, bool> find_leaf_page_guard(const char *key, Operation operation, Transaction *transaction,
+                                                            bool find_first = false,
+                                                            std::vector<page_id_t> *ancestors = nullptr) const;
 
     // for index test
     Rid get_rid(const Iid &iid) const;
+
+    void collect_all_rids(std::vector<Rid> *result) const;
 };

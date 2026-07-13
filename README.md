@@ -1,5 +1,5 @@
 <div align="center">
-<img src="RMDB.jpg"  width=25%  /> 
+<img src="docs/assets/RMDB.jpg"  width=25%  /> 
 </div>
 
 
@@ -22,15 +22,38 @@ RMDB由中国人民大学数据库教学团队开发，同时得到教育部-华
 - bison
 - readline
 
-欲查看有关依赖运行库和编译工具的更多信息，以及如何运行的说明，请查阅[RMDB使用文档](RMDB使用文档.pdf)
+欲查看有关依赖运行库、编译工具、项目结构和运行方式的更多说明，请查阅 [RMDB项目结构](docs/RMDB项目结构.md)。
 
-欲了解如何在非Linux系统PC上部署实验环境的指导，请查阅[RMDB环境配置文档](RMDB环境配置文档.pdf)
+## 项目结构
+
+- `src/rmdb.cpp`：服务端入口，负责数据库打开/创建、恢复、TCP 连接处理和 SQL 分发。
+- `rmdb_client/main.cpp`：通过 TCP/Unix socket 与服务端交互的客户端。
+- `src/parser/`：SQL 词法、语法解析和 AST 定义。
+- `src/analyze/`：表、列、类型、谓词、分组、连接和聚合的语义检查。
+- `src/optimizer/`：逻辑计划和优化，包括索引选择、谓词/投影下推、连接顺序、排序和 `explain`。
+- `src/execution/`：插入、删除、更新、顺序扫描、索引扫描、连接、投影和排序等执行器。
+- `src/system/`：元数据和 DDL 管理，包括表/索引创建删除、`show tables`、`desc` 和元数据持久化。
+- `src/storage/`：磁盘管理器、页抽象和缓冲池。
+- `src/replacer/`：缓冲池替换策略，主要为 LRU。
+- `src/record/`：记录文件、记录页和记录扫描。
+- `src/index/`：B+ 树索引和索引扫描。
+- `src/transaction/`：事务、锁、时间戳、MVCC、写集合和回滚。
+- `src/recovery/`：日志、redo/undo、崩溃恢复和检查点。
+- `src/unit_test.cpp`：低层模块的 GoogleTest 单元测试。
+- `tests/`：本地回归测试，包括 SQL 用例、期望输出和 Python/C++ 运行器。
+- `docs/`：项目、竞赛和测试文档，题目文档位于 `docs/task/`。
+- `deps/`：第三方依赖和子模块，包括 `deps/TPCC-Tester`。
+
+本地回归测试位于 `tests/`，TPC-C 性能测试流程和测试负载代码位于 `deps/TPCC-Tester/`。
 
 ### 项目说明文档
 
-- [RMDB环境配置文档](RMDB环境配置文档.pdf)
-- [RMDB使用文档](RMDB使用文档.pdf)
-- [RMDB项目结构](RMDB项目结构.pdf)
+- [RMDB项目结构](docs/RMDB项目结构.md)
+- [初赛说明文档 2026](docs/初赛说明文档2026.md)
+- [决赛性能测试 2026](docs/决赛性能测试2026.md)
+- [题目文档](docs/task/)
+- [本地测试说明](tests/README.md)
+- [TPC-C 性能测试流程](deps/TPCC-Tester/perf_workflow/README.md)
 
 ## 推荐参考资料
 

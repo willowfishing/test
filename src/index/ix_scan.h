@@ -22,11 +22,14 @@ class IxScan : public RecScan {
     const IxIndexHandle *ih_;
     Iid iid_;  // 初始为lower（用于遍历的指针）
     Iid end_;  // 初始为upper
-    BufferPoolManager *bpm_;
+    IxReadGuard read_guard_;
+    IxNodeHandleGuard current_guard_;
 
    public:
-    IxScan(const IxIndexHandle *ih, const Iid &lower, const Iid &upper, BufferPoolManager *bpm)
-        : ih_(ih), iid_(lower), end_(upper), bpm_(bpm) {}
+    IxScan(const IxIndexHandle *ih, const Iid &lower, const Iid &upper, IxNodeHandleGuard current_guard)
+        : ih_(ih), iid_(lower), end_(upper), read_guard_(ih), current_guard_(std::move(current_guard)) {
+        assert(!current_guard_ || current_guard_.latch_mode() == LatchMode::Shared);
+    }
 
     void next() override;
 
@@ -35,4 +38,18 @@ class IxScan : public RecScan {
     Rid rid() const override;
 
     const Iid &iid() const { return iid_; }
+
+    const char *key() const;
+
+    int current_leaf_slot() const { return iid_.slot_no; }
+
+    int current_leaf_scan_end_slot() const;
+
+    int current_leaf_scan_remaining() const { return current_leaf_scan_end_slot() - iid_.slot_no; }
+
+    const Rid *current_leaf_rid_at(int slot_no) const;
+
+    const char *current_leaf_key_at(int slot_no) const;
+
+    void advance_current_leaf(int slots);
 };

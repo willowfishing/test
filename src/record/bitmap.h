@@ -10,7 +10,9 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <algorithm>
 #include <cinttypes>
+#include <cstdint>
 #include <cstring>
 
 static constexpr int BITMAP_WIDTH = 8;
@@ -39,16 +41,69 @@ class Bitmap {
      * @return 找到了就返回偏移位置，没找到就返回max_n
      */
     static int next_bit(bool bit, const char *bm, int max_n, int curr) {
-        for (int i = curr + 1; i < max_n; i++) {
-            if (is_set(bm, i) == bit) {
-                return i;
+        int pos = std::max(0, curr + 1);
+        if (pos >= max_n) {
+            return max_n;
+        }
+
+        const auto *bytes = reinterpret_cast<const unsigned char *>(bm);
+
+        if ((pos % BITMAP_WIDTH) != 0) {
+            int byte_idx = get_bucket(pos);
+            int end_bit = std::min(BITMAP_WIDTH, max_n - byte_idx * BITMAP_WIDTH);
+            int found = next_bit_in_byte(bit, bytes[byte_idx], pos % BITMAP_WIDTH, end_bit);
+            if (found < end_bit) {
+                return byte_idx * BITMAP_WIDTH + found;
+            }
+            pos = (byte_idx + 1) * BITMAP_WIDTH;
+        }
+
+        while (pos + 64 <= max_n) {
+            uint64_t raw = 0;
+            std::memcpy(&raw, bytes + get_bucket(pos), sizeof(raw));
+            uint64_t candidates = reverse_bits_in_bytes(bit ? raw : ~raw);
+            if (candidates != 0) {
+                return pos + static_cast<int>(__builtin_ctzll(candidates));
+            }
+            pos += 64;
+        }
+
+        if (pos < max_n) {
+            uint64_t raw = 0;
+            int remaining_bits = max_n - pos;
+            int remaining_bytes = (remaining_bits + BITMAP_WIDTH - 1) / BITMAP_WIDTH;
+            std::memcpy(&raw, bytes + get_bucket(pos), remaining_bytes);
+            uint64_t candidates = reverse_bits_in_bytes(bit ? raw : ~raw);
+            uint64_t valid_mask = remaining_bits == 64 ? ~uint64_t{0} : ((uint64_t{1} << remaining_bits) - 1);
+            candidates &= valid_mask;
+            if (candidates != 0) {
+                return pos + static_cast<int>(__builtin_ctzll(candidates));
             }
         }
+
         return max_n;
     }
 
     // 找第一个为0 or 1的位
     static int first_bit(bool bit, const char *bm, int max_n) { return next_bit(bit, bm, max_n, -1); }
+
+    // Return logical bits for slots [word_base, word_base + 64). word_base must be 64-bit aligned.
+    // Bit 0 in the return value corresponds to slot word_base.
+    static uint64_t aligned_word_bits(bool bit, const char *bm, int max_n, int word_base) {
+        if (word_base < 0 || word_base >= max_n) {
+            return 0;
+        }
+        const auto *bytes = reinterpret_cast<const unsigned char *>(bm);
+        uint64_t raw = 0;
+        int remaining_bits = std::min(64, max_n - word_base);
+        int remaining_bytes = (remaining_bits + BITMAP_WIDTH - 1) / BITMAP_WIDTH;
+        std::memcpy(&raw, bytes + get_bucket(word_base), remaining_bytes);
+        uint64_t candidates = reverse_bits_in_bytes(bit ? raw : ~raw);
+        if (remaining_bits < 64) {
+            candidates &= (uint64_t{1} << remaining_bits) - 1;
+        }
+        return candidates;
+    }
 
     // for example:
     // rid_.slot_no = Bitmap::next_bit(true, page_handle.bitmap, file_handle_->file_hdr_.num_records_per_page,
@@ -58,4 +113,20 @@ class Bitmap {
     static int get_bucket(int pos) { return pos / BITMAP_WIDTH; }
 
     static char get_bit(int pos) { return BITMAP_HIGHEST_BIT >> static_cast<char>(pos % BITMAP_WIDTH); }
+
+    static uint64_t reverse_bits_in_bytes(uint64_t x) {
+        x = ((x & 0xF0F0F0F0F0F0F0F0ULL) >> 4) | ((x & 0x0F0F0F0F0F0F0F0FULL) << 4);
+        x = ((x & 0xCCCCCCCCCCCCCCCCULL) >> 2) | ((x & 0x3333333333333333ULL) << 2);
+        x = ((x & 0xAAAAAAAAAAAAAAAAULL) >> 1) | ((x & 0x5555555555555555ULL) << 1);
+        return x;
+    }
+
+    static int next_bit_in_byte(bool bit, unsigned char byte, int start_bit, int end_bit) {
+        for (int i = start_bit; i < end_bit; ++i) {
+            if (((byte & static_cast<unsigned char>(BITMAP_HIGHEST_BIT >> i)) != 0) == bit) {
+                return i;
+            }
+        }
+        return end_bit;
+    }
 };

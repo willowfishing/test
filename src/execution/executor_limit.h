@@ -32,4 +32,6 @@ class LimitExecutor : public AbstractExecutor {
     ColMeta get_col_offset(const TabCol &target) override { return prev_->get_col_offset(target); }
     Rid &rid() override { return _abstract_rid; }
     std::unique_ptr<RmRecord> Next() override { return prev_->Next(); }
+    const TupleView *CurrentTupleView() const override { return prev_->CurrentTupleView(); }
+    const RmRecord *CurrentTuple() const override { return prev_->CurrentTuple(); }
 };

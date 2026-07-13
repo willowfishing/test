@@ -104,6 +104,10 @@ private:
             // print_val(x->col_name, offset);
             for(auto col_name: x->col_names)
                 print_val(col_name, offset);
+        } else if (auto x = std::dynamic_pointer_cast<LoadStmt>(node)) {
+            std::cout << "LOAD\n";
+            print_val(x->file_name, offset);
+            print_val(x->tab_name, offset);
         } else if (auto x = std::dynamic_pointer_cast<ColDef>(node)) {
             std::cout << "COL_DEF\n";
             print_val(x->col_name, offset);
@@ -128,7 +132,16 @@ private:
         } else if (auto x = std::dynamic_pointer_cast<SetClause>(node)) {
             std::cout << "SET_CLAUSE\n";
             print_val(x->col_name, offset);
-            print_node(x->val, offset);
+            print_val(x->rhs_is_col ? x->rhs_col_name : std::string("<value>"), offset);
+            std::string op_name = "ASSIGN";
+            if (x->op == SET_OP_ADD) op_name = "ADD";
+            else if (x->op == SET_OP_SUB) op_name = "SUB";
+            else if (x->op == SET_OP_MUL) op_name = "MUL";
+            else if (x->op == SET_OP_DIV) op_name = "DIV";
+            print_val(op_name, offset);
+            if (x->val != nullptr) {
+                print_node(x->val, offset);
+            }
         } else if (auto x = std::dynamic_pointer_cast<BinaryExpr>(node)) {
             std::cout << "BINARY_EXPR\n";
             print_node(x->lhs, offset);

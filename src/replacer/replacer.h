@@ -39,6 +39,12 @@ class Replacer {
      */
     virtual void unpin(frame_id_t frame_id) = 0;
 
+    /**
+     * Unpins a frame into the cold end of the replacement policy when supported.
+     * The default keeps existing replacers behavior.
+     */
+    virtual void unpin_cold(frame_id_t frame_id) { unpin(frame_id); }
+
     /** @return the number of elements in the replacer that can be victimized */
     virtual size_t Size() = 0;
 };

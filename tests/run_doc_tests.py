@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import os
 import re
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -53,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--server", type=Path, help="Path to rmdb server binary.")
     parser.add_argument("--timeout", type=float, default=20.0, help="Per-case timeout in seconds.")
     parser.add_argument("--connect-timeout", type=float, default=5.0)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="TCP port used by the test server.")
     parser.add_argument("--keep-db", action="store_true", help="Keep generated test databases.")
     parser.add_argument("--list", action="store_true", help="List discovered cases and exit.")
     parser.add_argument("--quiet", action="store_true", help="Only print details for failing cases.")
@@ -83,24 +86,25 @@ def discover_cases(filters: list[str]) -> list[TestCase]:
         TestCase("08_02_transaction_abort", None, None, "txn_abort"),
         TestCase("08_03_transaction_commit_index", None, None, "txn_commit_index"),
         TestCase("08_04_transaction_abort_index", None, None, "txn_abort_index"),
-        TestCase("09_00_isolation_syntax", None, None, "isolation_syntax"),
-        TestCase("09_01_si_write_write_conflict", None, None, "isolation_si_write_conflict"),
-        TestCase("09_02_si_repeatable_read", None, None, "isolation_si_repeatable_read"),
-        TestCase("09_03_ser_write_write_conflict", None, None, "isolation_ser_write_conflict"),
-        TestCase("09_04_ser_repeatable_read", None, None, "isolation_ser_repeatable_read"),
-        TestCase("09_05_si_insert_visibility", None, None, "isolation_si_insert_visibility"),
-        TestCase("09_06_si_dirty_read_self_write", None, None, "isolation_si_dirty_read_self_write"),
-        TestCase("09_07_si_read_write_delete_conflict", None, None, "isolation_si_read_write_delete_conflict"),
-        TestCase("09_08_si_write_skew_allowed", None, None, "isolation_si_write_skew_allowed"),
-        TestCase("09_09_ser_write_skew_abort", None, None, "isolation_ser_write_skew_abort"),
-        TestCase("09_10_ser_phantom_empty_predicate_abort", None, None, "isolation_ser_phantom_empty_predicate_abort"),
-        TestCase("09_11_ser_select_dangerous_abort", None, None, "isolation_ser_select_dangerous_abort"),
+        TestCase("08_18_rc_delete_abort_visibility", None, None, "txn_rc_delete_abort_visibility"),
+        TestCase("08_19_abort_multitable_insert", None, None, "txn_abort_multitable_insert"),
+        TestCase("08_20_explicit_error_aborts_multitable", None, None, "txn_error_aborts_multitable"),
+        TestCase("08_21_connection_resilience", None, None, "connection_resilience"),
+        TestCase("08_22_rc_update_visibility", None, None, "txn_rc_update_visibility"),
         TestCase("10_01_crash_recovery_single_thread", None, None, "recovery_single"),
         TestCase("10_02_crash_recovery_multi_thread", None, None, "recovery_multi"),
         TestCase("10_03_crash_recovery_index", None, None, "recovery_index"),
         TestCase("10_04_crash_recovery_large_data", None, None, "recovery_large"),
         TestCase("10_05_crash_recovery_without_checkpoint", None, None, "recovery_without_checkpoint"),
         TestCase("10_06_crash_recovery_with_checkpoint", None, None, "recovery_with_checkpoint"),
+        TestCase("10_07_recovery_undo_uncommitted", None, None, "recovery_script_undo_uncommitted"),
+        TestCase("10_08_recovery_redo_committed", None, None, "recovery_script_redo_committed"),
+        TestCase("10_09_recovery_index_consistency", None, None, "recovery_script_index_consistency"),
+        TestCase("10_10_recovery_checkpoint_boundary", None, None, "recovery_script_checkpoint_boundary"),
+        TestCase("10_11_recovery_restart_new_writes", None, None, "recovery_script_restart_new_writes"),
+        TestCase("10_12_recovery_multitable_atomic", None, None, "recovery_script_multitable_atomic"),
+        TestCase("10_13_recovery_log_validation", None, None, "recovery_log_validation"),
+        TestCase("10_14_recovery_streaming_log", None, None, "recovery_streaming_log"),
     ]
     for case in generated:
         if filters and not any(token in case.name for token in filters):
@@ -335,11 +339,22 @@ def cleanup_db(build_dir: Path, db_name: str) -> None:
             shutil.rmtree(path)
 
 
-def start_server(server: Path, build_dir: Path, db_name: str, server_log: Path) -> subprocess.Popen[str]:
+def start_server(
+    server: Path,
+    build_dir: Path,
+    db_name: str,
+    server_log: Path,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.Popen[str]:
     log_file = server_log.open("w", encoding="utf-8")
+    env = os.environ.copy()
+    env["RMDB_PORT"] = str(DEFAULT_PORT)
+    if extra_env is not None:
+        env.update(extra_env)
     return subprocess.Popen(
         [str(server), db_name],
         cwd=build_dir,
+        env=env,
         stdout=log_file,
         stderr=subprocess.STDOUT,
         text=True,
@@ -357,8 +372,235 @@ def terminate_server(proc: subprocess.Popen[str]) -> None:
         proc.wait(timeout=3)
 
 
+def recv_protocol_frames(sock: socket.socket, count: int) -> list[bytes]:
+    pending = b""
+    frames: list[bytes] = []
+    while len(frames) < count:
+        chunk = sock.recv(1024 * 1024)
+        if not chunk:
+            raise RuntimeError("server closed connection before completing a response frame")
+        pending += chunk
+        while b"\0" in pending and len(frames) < count:
+            frame, pending = pending.split(b"\0", 1)
+            frames.append(frame)
+    return frames
+
+
+def response_has_int_row(response: bytes, expected_id: int, expected_value: int) -> bool:
+    text = response.decode("utf-8", errors="replace")
+    for line in text.splitlines():
+        if not is_table_line(line.strip()):
+            continue
+        cells = split_table_cells(line.strip())
+        if cells == [str(expected_id), str(expected_value)]:
+            return True
+    return False
+
+
+def read_process_thread_count(pid: int) -> int | None:
+    status_path = Path(f"/proc/{pid}/status")
+    if not status_path.exists():
+        return None
+    for line in status_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("Threads:"):
+            return int(line.split()[1])
+    return None
+
+
+def read_process_rss_kb(pid: int) -> int | None:
+    status_path = Path(f"/proc/{pid}/status")
+    if not status_path.exists():
+        return None
+    for line in status_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("VmRSS:"):
+            return int(line.split()[1])
+    return None
+
+
+def run_connection_resilience_case(
+    case: TestCase,
+    server: Path,
+    build_dir: Path,
+    timeout: float,
+    connect_timeout: float,
+    keep_db: bool,
+    show_server_log: bool,
+) -> TestResult:
+    db_name = f"doc_test_{case.name}"
+    cleanup_outputs(build_dir, db_name)
+    if not keep_db:
+        cleanup_db(build_dir, db_name)
+    server_log = TEST_ROOT / f"{case.name}.server.log"
+    restart_log = TEST_ROOT / f"{case.name}.restart.server.log"
+    proc: subprocess.Popen[str] | None = None
+    clients: list[RmdbClient] = []
+
+    def new_client() -> RmdbClient:
+        client = RmdbClient(DEFAULT_PORT, timeout)
+        clients.append(client)
+        return client
+
+    def close_client(client: RmdbClient) -> None:
+        client.close()
+        if client in clients:
+            clients.remove(client)
+
+    def assert_current_value(expected: int) -> None:
+        client = new_client()
+        response = client.execute("select * from connection_guard;")
+        close_client(client)
+        if not response_has_int_row(response, 1, expected):
+            raise RuntimeError(f"expected connection_guard value {expected}, got {response!r}")
+
+    try:
+        proc = start_server(
+            server,
+            build_dir,
+            db_name,
+            server_log,
+            {
+                "RMDB_TXN_IDLE_TIMEOUT_SECONDS": "1",
+                "RMDB_CONNECTION_IDLE_TIMEOUT_SECONDS": "5",
+            },
+        )
+        wait_for_server(DEFAULT_PORT, max(connect_timeout, 20.0))
+
+        setup = new_client()
+        setup.execute("create table connection_guard (id int, val int);")
+        setup.execute("insert into connection_guard values (1, 10);")
+        close_client(setup)
+
+        # A command may span many TCP reads, and multiple NUL-delimited commands may share one read.
+        framed = socket.create_connection(("127.0.0.1", DEFAULT_PORT), timeout=timeout)
+        framed.settimeout(timeout)
+        for byte in b"select * from connection_guard;\0":
+            framed.send(bytes([byte]))
+        fragmented = recv_protocol_frames(framed, 1)[0]
+        if not response_has_int_row(fragmented, 1, 10):
+            raise RuntimeError(f"fragmented command returned {fragmented!r}")
+        framed.sendall(b"select * from connection_guard;\0select * from connection_guard;\0")
+        coalesced = recv_protocol_frames(framed, 2)
+        if not all(response_has_int_row(response, 1, 10) for response in coalesced):
+            raise RuntimeError(f"coalesced commands returned {coalesced!r}")
+        framed.close()
+
+        # The pinned TPCC-Tester omits request NULs. Its SQL still has a lexical terminator,
+        # except for this setup command, so compatibility must not depend on recv boundaries.
+        legacy = socket.create_connection(("127.0.0.1", DEFAULT_PORT), timeout=timeout)
+        legacy.settimeout(timeout)
+        legacy.sendall(b"set output_file off")
+        recv_protocol_frames(legacy, 1)
+        for byte in b"select * from connection_guard;":
+            legacy.send(bytes([byte]))
+        legacy_response = recv_protocol_frames(legacy, 1)[0]
+        if not response_has_int_row(legacy_response, 1, 10):
+            raise RuntimeError(f"legacy TPCC command returned {legacy_response!r}")
+        legacy.close()
+
+        oversized = socket.create_connection(("127.0.0.1", DEFAULT_PORT), timeout=timeout)
+        oversized.settimeout(timeout)
+        oversized.sendall(b"x" * 9000)
+        if recv_protocol_frames(oversized, 1)[0] != b"failure\n":
+            raise RuntimeError("oversized command was not rejected")
+        oversized.close()
+
+        # EOF and RST must abort explicit transactions and release their locks.
+        disconnected = new_client()
+        disconnected.execute("begin;")
+        disconnected.execute("update connection_guard set val = 99 where id = 1;")
+        close_client(disconnected)
+        time.sleep(0.1)
+        assert_current_value(10)
+
+        rst_txn = new_client()
+        rst_txn.execute("begin;")
+        rst_txn.execute("update connection_guard set val = 88 where id = 1;")
+        rst_txn.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        close_client(rst_txn)
+        time.sleep(0.1)
+        assert_current_value(10)
+
+        # A reset before response delivery must not terminate the whole server via SIGPIPE.
+        rst_writer = socket.create_connection(("127.0.0.1", DEFAULT_PORT), timeout=timeout)
+        rst_writer.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        rst_writer.sendall(b"select * from connection_guard;\0")
+        rst_writer.close()
+        time.sleep(0.1)
+        if proc.poll() is not None:
+            raise RuntimeError(f"server exited after client RST: {proc.returncode}")
+
+        idle = new_client()
+        idle.execute("begin;")
+        idle.execute("update connection_guard set val = 77 where id = 1;")
+        idle.sock.settimeout(0.5)
+        time.sleep(1.2)
+        try:
+            idle_result = idle.sock.recv(1)
+        except ConnectionResetError:
+            idle_result = b""
+        except socket.timeout as exc:
+            raise RuntimeError("explicit transaction idle timeout did not close the connection") from exc
+        if idle_result != b"":
+            raise RuntimeError(f"unexpected data after explicit transaction idle timeout: {idle_result!r}")
+        close_client(idle)
+        assert_current_value(10)
+
+        committed = new_client()
+        committed.execute("begin;")
+        committed.execute("update connection_guard set val = 20 where id = 1;")
+        committed.execute("commit;")
+        close_client(committed)
+        assert_current_value(20)
+
+        for _ in range(100):
+            churn = socket.create_connection(("127.0.0.1", DEFAULT_PORT), timeout=timeout)
+            churn.close()
+        thread_count = None
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            thread_count = read_process_thread_count(proc.pid)
+            if thread_count is None or thread_count <= 2:
+                break
+            time.sleep(0.05)
+        if thread_count is not None and thread_count > 2:
+            raise RuntimeError(f"detached client handlers were not reclaimed: threads={thread_count}")
+
+        active_at_shutdown = new_client()
+        active_at_shutdown.execute("begin;")
+        active_at_shutdown.execute("update connection_guard set val = 66 where id = 1;")
+        proc.send_signal(signal.SIGINT)
+        proc.wait(timeout=max(20.0, connect_timeout))
+        close_client(active_at_shutdown)
+        if proc.returncode != 0:
+            raise RuntimeError(f"server failed graceful shutdown: {proc.returncode}")
+
+        proc = start_server(server, build_dir, db_name, restart_log)
+        wait_for_server(DEFAULT_PORT, max(connect_timeout, 20.0))
+        assert_current_value(20)
+    except Exception as exc:
+        detail = f"runtime error: {exc}"
+        for log_path in [server_log, restart_log]:
+            if show_server_log and log_path.exists():
+                detail += f"\n\n--- {log_path.name} tail ---\n"
+                detail += log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+        return TestResult(case, False, detail)
+    finally:
+        for client in clients:
+            client.close()
+        if proc is not None:
+            terminate_server(proc)
+
+    if not show_server_log:
+        for log_path in [server_log, restart_log]:
+            if log_path.exists():
+                log_path.unlink()
+    if not keep_db:
+        cleanup_db(build_dir, db_name)
+    return TestResult(case, True, "passed")
+
+
 def preserve_table_order_for_case(case_name: str) -> bool:
-    return case_name in {
+    return case_name.startswith("08_") or case_name.startswith("09_") or case_name in {
         "05_02_group_by_having",
         "05_04_order_limit",
         "05_05_group_multi_hidden",
@@ -843,7 +1085,7 @@ def run_transaction_case(
     )
 
 
-def run_isolation_case(
+def run_abort_atomicity_case(
     case: TestCase,
     server: Path,
     build_dir: Path,
@@ -856,519 +1098,142 @@ def run_isolation_case(
     cleanup_outputs(build_dir, db_name)
     if not keep_db:
         cleanup_db(build_dir, db_name)
+
     server_log = TEST_ROOT / f"{case.name}.server.log"
     proc = start_server(server, build_dir, db_name, server_log)
-    clients: list[RmdbClient] = []
+    client1: RmdbClient | None = None
+    client2: RmdbClient | None = None
     try:
         wait_for_server(DEFAULT_PORT, connect_timeout)
-        setup = RmdbClient(DEFAULT_PORT, timeout)
-        clients.append(setup)
-
-        level = "SNAPSHOT ISOLATION" if "_si_" in case.kind else "SERIALIZABLE"
-        if case.kind == "isolation_syntax":
-            setup.execute("create table iso_syntax (id int, val int);")
-            setup.execute("set transaction isolation level snapshot isolation;")
-            setup.execute("begin;")
-            setup.execute("insert into iso_syntax values (1, 10);")
-            setup.execute("commit;")
-            setup.execute("set transaction isolation level serializable;")
-            setup.execute("begin;")
-            setup.execute("select * from iso_syntax;")
-            setup.execute("commit;")
-            expected = ["| id | val |", "| 1 | 10 |"]
-        elif case.kind.endswith("write_conflict"):
-            setup.execute("create table account (id int, balance int);")
-            setup.execute("insert into account values (1, 100);")
-            setup.close()
-            clients.clear()
-
-            t1 = RmdbClient(DEFAULT_PORT, timeout)
-            t2 = RmdbClient(DEFAULT_PORT, timeout)
-            verifier = RmdbClient(DEFAULT_PORT, timeout)
-            clients.extend([t1, t2, verifier])
-            t1.execute(f"set transaction isolation level {level};")
-            t2.execute(f"set transaction isolation level {level};")
-            t1.execute("begin;")
-            t1.execute("update account set balance = 120 where id = 1;")
-            t2.execute("begin;")
-            t2.execute("update account set balance = 90 where id = 1;")
-            t1.execute("commit;")
-            t2.execute("commit;")
-            verifier.execute("select * from account where id = 1;")
-            expected = ["abort", "| id | balance |", "| 1 | 120 |"]
-        elif case.kind.endswith("repeatable_read"):
-            setup.execute("create table counter_test (id int, val int);")
-            setup.execute("insert into counter_test values (1, 100);")
-            setup.close()
-            clients.clear()
-
-            t1 = RmdbClient(DEFAULT_PORT, timeout)
-            t2 = RmdbClient(DEFAULT_PORT, timeout)
-            clients.extend([t1, t2])
-            t1.execute(f"set transaction isolation level {level};")
-            t1.execute("begin;")
-            t1.execute("select * from counter_test where id = 1;")
-            t2.execute(f"set transaction isolation level {level};")
-            t2.execute("begin;")
-            t2.execute("update counter_test set val = 200 where id = 1;")
-            t2.execute("commit;")
-            t1.execute("select * from counter_test where id = 1;")
-            t1.execute("commit;")
+        client1 = RmdbClient(DEFAULT_PORT, timeout)
+        client2 = RmdbClient(DEFAULT_PORT, timeout)
+        if case.kind == "txn_rc_delete_abort_visibility":
+            for stmt in [
+                "create table new_orders (no_o_id int, no_d_id int, no_w_id int);",
+                "create index new_orders(no_w_id,no_d_id,no_o_id);",
+                "insert into new_orders values (3001, 1, 1);",
+                "insert into new_orders values (3002, 1, 1);",
+                "insert into new_orders values (3003, 1, 1);",
+            ]:
+                client1.execute(stmt)
+            client1.execute("begin;")
+            client1.execute("delete from new_orders where no_o_id = 3001 and no_d_id = 1 and no_w_id = 1;")
+            client2.execute("select min(no_o_id) from new_orders where no_d_id = 1 and no_w_id = 1;")
+            client1.execute("abort;")
+            client2.execute("select count(no_o_id) from new_orders where no_w_id = 1 and no_d_id = 1;")
+            client2.execute("select min(no_o_id) from new_orders where no_w_id = 1 and no_d_id = 1;")
             expected = [
-                "| id | val |",
-                "| 1 | 100 |",
-                "| id | val |",
-                "| 1 | 100 |",
+                "| min |",
+                "| 3001 |",
+                "| count |",
+                "| 3 |",
+                "| min |",
+                "| 3001 |",
             ]
-        elif case.kind == "isolation_si_insert_visibility":
-            setup.execute("create table iso_insert (id int, val int);")
-            setup.execute("insert into iso_insert values (1, 10);")
-            setup.close()
-            clients.clear()
-
-            t1 = RmdbClient(DEFAULT_PORT, timeout)
-            t2 = RmdbClient(DEFAULT_PORT, timeout)
-            verifier = RmdbClient(DEFAULT_PORT, timeout)
-            clients.extend([t1, t2, verifier])
-            t1.execute("set transaction isolation level snapshot isolation;")
-            t2.execute("set transaction isolation level snapshot isolation;")
-            t1.execute("begin;")
-            t1.execute("insert into iso_insert values (2, 20);")
-            t1.execute("select * from iso_insert where id = 2;")
-            t2.execute("begin;")
-            t2.execute("select * from iso_insert;")
-            t1.execute("commit;")
-            t2.execute("select * from iso_insert;")
-            t2.execute("commit;")
-            verifier.execute("select * from iso_insert;")
+        elif case.kind == "txn_rc_update_visibility":
+            client1.execute("create table account (id int, balance int);")
+            client1.execute("insert into account values (1, 10);")
+            client1.execute("begin;")
+            client1.execute("update account set balance = 20 where id = 1;")
+            client2.execute("select balance from account where balance > 0;")
+            client1.execute("commit;")
+            client2.execute("select balance from account where balance > 0;")
             expected = [
-                "| id | val |",
-                "| 2 | 20 |",
-                "| id | val |",
-                "| 1 | 10 |",
-                "| id | val |",
-                "| 1 | 10 |",
-                "| id | val |",
-                "| 1 | 10 |",
-                "| 2 | 20 |",
+                "| balance |",
+                "| 10 |",
+                "| balance |",
+                "| 20 |",
             ]
-        elif case.kind == "isolation_si_dirty_read_self_write":
-            setup.execute("create table iso_dirty (id int, val int);")
-            setup.execute("insert into iso_dirty values (1, 100);")
-            setup.close()
-            clients.clear()
-
-            t1 = RmdbClient(DEFAULT_PORT, timeout)
-            t2 = RmdbClient(DEFAULT_PORT, timeout)
-            verifier = RmdbClient(DEFAULT_PORT, timeout)
-            clients.extend([t1, t2, verifier])
-            t1.execute("set transaction isolation level snapshot isolation;")
-            t2.execute("set transaction isolation level snapshot isolation;")
-            t1.execute("begin;")
-            t1.execute("update iso_dirty set val = 200 where id = 1;")
-            t1.execute("select * from iso_dirty where id = 1;")
-            t2.execute("begin;")
-            t2.execute("select * from iso_dirty where id = 1;")
-            t1.execute("abort;")
-            t2.execute("select * from iso_dirty where id = 1;")
-            t2.execute("commit;")
-            verifier.execute("select * from iso_dirty where id = 1;")
+        elif case.kind == "txn_abort_multitable_insert":
+            for stmt in [
+                "create table orders (o_id int, o_d_id int, o_w_id int, o_ol_cnt int);",
+                "create table new_orders (no_o_id int, no_d_id int, no_w_id int);",
+                "create table order_line (ol_o_id int, ol_d_id int, ol_w_id int, ol_number int);",
+                "create index orders(o_w_id,o_d_id,o_id);",
+                "create index new_orders(no_w_id,no_d_id,no_o_id);",
+                "create index order_line(ol_w_id,ol_d_id,ol_o_id,ol_number);",
+                "begin;",
+                "insert into orders values (3001, 1, 1, 2);",
+                "insert into new_orders values (3001, 1, 1);",
+                "insert into order_line values (3001, 1, 1, 1);",
+                "insert into order_line values (3001, 1, 1, 2);",
+                "abort;",
+                "select count(o_id) from orders where o_w_id = 1 and o_d_id = 1;",
+                "select count(no_o_id) from new_orders where no_w_id = 1 and no_d_id = 1;",
+                "select count(ol_o_id) from order_line where ol_w_id = 1 and ol_d_id = 1;",
+            ]:
+                client1.execute(stmt)
             expected = [
-                "| id | val |",
-                "| 1 | 200 |",
-                "| id | val |",
-                "| 1 | 100 |",
-                "| id | val |",
-                "| 1 | 100 |",
-                "| id | val |",
-                "| 1 | 100 |",
-            ]
-        elif case.kind == "isolation_si_read_write_delete_conflict":
-            setup.execute("create table iso_delete (id int, val int);")
-            setup.execute("insert into iso_delete values (1, 100);")
-            setup.close()
-            clients.clear()
-
-            t1 = RmdbClient(DEFAULT_PORT, timeout)
-            t2 = RmdbClient(DEFAULT_PORT, timeout)
-            verifier = RmdbClient(DEFAULT_PORT, timeout)
-            clients.extend([t1, t2, verifier])
-            t1.execute("set transaction isolation level snapshot isolation;")
-            t2.execute("set transaction isolation level snapshot isolation;")
-            t1.execute("begin;")
-            t1.execute("select * from iso_delete where id = 1;")
-            t2.execute("begin;")
-            t2.execute("delete from iso_delete where id = 1;")
-            t2.execute("commit;")
-            t1.execute("select * from iso_delete where id = 1;")
-            t1.execute("delete from iso_delete where id = 1;")
-            t1.execute("commit;")
-            verifier.execute("select * from iso_delete;")
-            expected = [
-                "| id | val |",
-                "| 1 | 100 |",
-                "| id | val |",
-                "| 1 | 100 |",
-                "abort",
-                "| id | val |",
-            ]
-        elif case.kind == "isolation_si_write_skew_allowed":
-            setup.execute("create table duty_si (doctor_id int, on_call int);")
-            setup.execute("insert into duty_si values (1, 1);")
-            setup.execute("insert into duty_si values (2, 1);")
-            setup.close()
-            clients.clear()
-
-            t1 = RmdbClient(DEFAULT_PORT, timeout)
-            t2 = RmdbClient(DEFAULT_PORT, timeout)
-            verifier = RmdbClient(DEFAULT_PORT, timeout)
-            clients.extend([t1, t2, verifier])
-            t1.execute("set transaction isolation level snapshot isolation;")
-            t2.execute("set transaction isolation level snapshot isolation;")
-            t1.execute("begin;")
-            t2.execute("begin;")
-            t1.execute("select * from duty_si where doctor_id = 2;")
-            t2.execute("select * from duty_si where doctor_id = 1;")
-            t1.execute("update duty_si set on_call = 0 where doctor_id = 1;")
-            t2.execute("update duty_si set on_call = 0 where doctor_id = 2;")
-            t1.execute("commit;")
-            t2.execute("commit;")
-            verifier.execute("select * from duty_si;")
-            expected = [
-                "| doctor_id | on_call |",
-                "| 2 | 1 |",
-                "| doctor_id | on_call |",
-                "| 1 | 1 |",
-                "| doctor_id | on_call |",
-                "| 1 | 0 |",
-                "| 2 | 0 |",
-            ]
-        elif case.kind == "isolation_ser_write_skew_abort":
-            setup.execute("create table duty_ser (doctor_id int, on_call int);")
-            setup.execute("insert into duty_ser values (1, 1);")
-            setup.execute("insert into duty_ser values (2, 1);")
-            setup.close()
-            clients.clear()
-
-            t1 = RmdbClient(DEFAULT_PORT, timeout)
-            t2 = RmdbClient(DEFAULT_PORT, timeout)
-            verifier = RmdbClient(DEFAULT_PORT, timeout)
-            clients.extend([t1, t2, verifier])
-            t1.execute("set transaction isolation level serializable;")
-            t2.execute("set transaction isolation level serializable;")
-            t1.execute("begin;")
-            t2.execute("begin;")
-            t1.execute("select * from duty_ser where doctor_id = 2;")
-            t2.execute("select * from duty_ser where doctor_id = 1;")
-            t1.execute("update duty_ser set on_call = 0 where doctor_id = 1;")
-            t2.execute("update duty_ser set on_call = 0 where doctor_id = 2;")
-            t1.execute("commit;")
-            t2.execute("commit;")
-            verifier.execute("select * from duty_ser;")
-            expected = [
-                "| doctor_id | on_call |",
-                "| 2 | 1 |",
-                "| doctor_id | on_call |",
-                "| 1 | 1 |",
-                "abort",
-                "| doctor_id | on_call |",
-                "| 1 | 0 |",
-                "| 2 | 1 |",
-            ]
-        elif case.kind == "isolation_ser_phantom_empty_predicate_abort":
-            setup.execute("create table booking_ser (id int, slot int);")
-            setup.close()
-            clients.clear()
-
-            t1 = RmdbClient(DEFAULT_PORT, timeout)
-            t2 = RmdbClient(DEFAULT_PORT, timeout)
-            verifier = RmdbClient(DEFAULT_PORT, timeout)
-            clients.extend([t1, t2, verifier])
-            t1.execute("set transaction isolation level serializable;")
-            t2.execute("set transaction isolation level serializable;")
-            t1.execute("begin;")
-            t2.execute("begin;")
-            t1.execute("select * from booking_ser where slot = 9;")
-            t2.execute("select * from booking_ser where slot = 9;")
-            t1.execute("insert into booking_ser values (1, 9);")
-            t2.execute("insert into booking_ser values (2, 9);")
-            t1.execute("commit;")
-            t2.execute("commit;")
-            verifier.execute("select * from booking_ser;")
-            expected = [
-                "| id | slot |",
-                "| id | slot |",
-                "abort",
-                "| id | slot |",
-                "| 1 | 9 |",
-            ]
-        elif case.kind == "isolation_ser_select_dangerous_abort":
-            setup.execute("create table select_ser (id int, val int);")
-            setup.execute("insert into select_ser values (1, 10);")
-            setup.execute("insert into select_ser values (2, 20);")
-            setup.execute("insert into select_ser values (3, 30);")
-            setup.close()
-            clients.clear()
-
-            t1 = RmdbClient(DEFAULT_PORT, timeout)
-            t2 = RmdbClient(DEFAULT_PORT, timeout)
-            verifier = RmdbClient(DEFAULT_PORT, timeout)
-            clients.extend([t1, t2, verifier])
-            t1.execute("set transaction isolation level serializable;")
-            t2.execute("set transaction isolation level serializable;")
-            t1.execute("begin;")
-            t2.execute("begin;")
-            t1.execute("select * from select_ser where id = 2;")
-            t2.execute("update select_ser set val = 200 where id = 2;")
-            t1.execute("update select_ser set val = 300 where id = 3;")
-            t2.execute("select * from select_ser where id = 3;")
-            t1.execute("commit;")
-            t2.execute("commit;")
-            verifier.execute("select * from select_ser;")
-            expected = [
-                "| id | val |",
-                "| 2 | 20 |",
-                "abort",
-                "| id | val |",
-                "| 1 | 10 |",
-                "| 2 | 20 |",
-                "| 3 | 300 |",
+                "| count |",
+                "| 0 |",
+                "| count |",
+                "| 0 |",
+                "| count |",
+                "| 0 |",
             ]
         else:
-            raise RuntimeError(f"unknown isolation case kind: {case.kind}")
+            for stmt in [
+                "create table orders (o_id int, o_d_id int, o_w_id int, o_ol_cnt int);",
+                "create table new_orders (no_o_id int, no_d_id int, no_w_id int);",
+                "create table order_line (ol_o_id int, ol_d_id int, ol_w_id int, ol_number int);",
+                "create index orders(o_w_id,o_d_id,o_id);",
+                "create index new_orders(no_w_id,no_d_id,no_o_id);",
+                "create index order_line(ol_w_id,ol_d_id,ol_o_id,ol_number);",
+                "begin;",
+                "insert into orders values (3001, 1, 1, 2);",
+                "insert into new_orders values (3001, 1, 1);",
+                "insert into order_line values (3001, 1, 1, 1);",
+            ]:
+                client1.execute(stmt)
+            response = client1.execute("insert into order_line values (3001, 1, 1, 1);")
+            if not response.startswith(b"abort"):
+                raise RuntimeError(f"expected duplicate order_line to abort explicit txn, got {response!r}")
+            client1.execute("commit;")
+            for stmt in [
+                "select count(o_id) from orders where o_w_id = 1 and o_d_id = 1;",
+                "select count(no_o_id) from new_orders where no_w_id = 1 and no_d_id = 1;",
+                "select count(ol_o_id) from order_line where ol_w_id = 1 and ol_d_id = 1;",
+            ]:
+                client1.execute(stmt)
+            expected = [
+                "abort",
+                "| count |",
+                "| 0 |",
+                "| count |",
+                "| 0 |",
+                "| count |",
+                "| 0 |",
+            ]
         time.sleep(0.1)
     except Exception as exc:
+        terminate_server(proc)
         detail = f"runtime error: {exc}"
         if show_server_log and server_log.exists():
             detail += "\n" + server_log.read_text(encoding="utf-8", errors="replace")[-4000:]
         return TestResult(case, False, detail)
     finally:
-        for client in clients:
-            client.close()
+        if client1 is not None:
+            client1.close()
+        if client2 is not None:
+            client2.close()
         terminate_server(proc)
-    detail = compare_lines(expected, read_actual_output(build_dir, db_name), case.name)
-    return TestResult(case, detail is None, detail or "passed")
 
-
-def setup_mvcc_table(client: RmdbClient) -> None:
-    for statement in [
-        "create table concurrency_test (id int, name char(8), score float);",
-        "insert into concurrency_test values (1, 'xiaohong', 90.0);",
-        "insert into concurrency_test values (2, 'xiaoming', 95.0);",
-        "insert into concurrency_test values (3, 'zhanghua', 88.5);",
-    ]:
-        client.execute(statement)
-
-
-def verify_mvcc_transaction_baseline(client: RmdbClient, build_dir: Path, db_name: str) -> str | None:
-    for statement in [
-        "create table mvcc_txn_probe (id int, name char(8), score float);",
-        "insert into mvcc_txn_probe values (1, 'base', 10.0);",
-        "begin;",
-        "insert into mvcc_txn_probe values (2, 'abort', 20.0);",
-        "abort;",
-        "select * from mvcc_txn_probe;",
-    ]:
-        client.execute(statement)
-    expected = ["| id | name | score |", "| 1 | base | 10.000000 |"]
-    detail = compare_lines(expected, read_actual_output(build_dir, db_name), "mvcc_transaction_baseline")
-    cleanup_outputs(build_dir, db_name)
-    return detail
-
-
-def run_mvcc_case(
-    case: TestCase,
-    server: Path,
-    build_dir: Path,
-    timeout: float,
-    connect_timeout: float,
-    keep_db: bool,
-    show_server_log: bool,
-) -> TestResult:
-    db_name = f"doc_test_{case.name}"
-    cleanup_outputs(build_dir, db_name)
-    if not keep_db:
-        cleanup_db(build_dir, db_name)
-    server_log = TEST_ROOT / f"{case.name}.server.log"
-    proc = start_server(server, build_dir, db_name, server_log)
-    clients: list[RmdbClient] = []
-    try:
-        wait_for_server(DEFAULT_PORT, connect_timeout)
-        setup = RmdbClient(DEFAULT_PORT, timeout)
-        clients.append(setup)
-        baseline_detail = verify_mvcc_transaction_baseline(setup, build_dir, db_name)
-        if baseline_detail is not None:
-            return TestResult(case, False, "MVCC transaction baseline failed:\n" + baseline_detail)
-        setup_mvcc_table(setup)
-        setup.close()
-        clients.clear()
-
-        t1 = RmdbClient(DEFAULT_PORT, timeout)
-        t2 = RmdbClient(DEFAULT_PORT, timeout)
-        clients.extend([t1, t2])
-        kind = case.kind
-        if kind in {"mvcc_abort", "mvcc_dirty_read"}:
-            t1.execute("begin;")
-            t2.execute("begin;")
-            t1.execute("update concurrency_test set score = 100.0 where id = 2;")
-            t2.execute("select * from concurrency_test where id = 2;")
-            t1.execute("abort;")
-            t1.execute("select * from concurrency_test where id = 2;")
-            t2.execute("commit;")
-            expected = [
-                "| id | name | score |",
-                "| 2 | xiaoming | 95.000000 |",
-                "| id | name | score |",
-                "| 2 | xiaoming | 95.000000 |",
-            ]
-        elif kind == "mvcc_deadlock":
-            t1.execute("begin;")
-            t2.execute("begin;")
-            t1.execute("update concurrency_test set score = 91.0 where id = 1;")
-            t2.execute("update concurrency_test set score = 96.0 where id = 2;")
-            errors: list[str] = []
-            responses: list[str] = []
-            def run_cross(client: RmdbClient, statement: str) -> None:
-                try:
-                    responses.append(client.execute(statement).decode("utf-8", errors="replace").lower())
-                except Exception as exc:
-                    errors.append(str(exc))
-            a = threading.Thread(target=run_cross, args=(t1, "update concurrency_test set score = 92.0 where id = 2;"))
-            b = threading.Thread(target=run_cross, args=(t2, "update concurrency_test set score = 97.0 where id = 1;"))
-            a.start(); b.start(); a.join(timeout); b.join(timeout)
-            if a.is_alive() or b.is_alive():
-                raise RuntimeError("deadlock was not resolved before timeout")
-            if not errors and not any(("abort" in response or "failure" in response) for response in responses):
-                raise RuntimeError("deadlock conflict completed without abort/failure signal")
-            t1.execute("abort;")
-            t2.execute("abort;")
-            cleanup_outputs(build_dir, db_name)
-            verifier = RmdbClient(DEFAULT_PORT, timeout)
-            clients.append(verifier)
-            verifier.execute("select * from concurrency_test where id = 2;")
-            expected = ["| id | name | score |", "| 2 | xiaoming | 95.000000 |"]
-        elif kind == "mvcc_insert_delete":
-            t1.execute("begin;")
-            t2.execute("begin;")
-            t1.execute("insert into concurrency_test values (4, 'newrow', 77.0);")
-            t2.execute("delete from concurrency_test where id = 4;")
-            t1.execute("commit;")
-            t2.execute("abort;")
-            t1.execute("select * from concurrency_test where id = 4;")
-            expected = ["| id | name | score |", "| 4 | newrow | 77.000000 |"]
-        elif kind == "mvcc_insert":
-            t1.execute("begin;")
-            t1.execute("insert into concurrency_test values (4, 'insert', 80.0);")
-            t1.execute("commit;")
-            t2.execute("select * from concurrency_test where id = 4;")
-            expected = ["| id | name | score |", "| 4 | insert | 80.000000 |"]
-        elif kind == "mvcc_lost_update":
-            t1.execute("begin;")
-            t2.execute("begin;")
-            t1.execute("select * from concurrency_test where id = 2;")
-            t2.execute("update concurrency_test set score = 96.0 where id = 2;")
-            t2.execute("commit;")
-            t1.execute("update concurrency_test set score = 97.0 where id = 2;")
-            t1.execute("commit;")
-            t2.execute("select * from concurrency_test where id = 2;")
-            expected = [
-                "| id | name | score |",
-                "| 2 | xiaoming | 95.000000 |",
-                "| id | name | score |",
-                "| 2 | xiaoming | 97.000000 |",
-            ]
-        elif kind == "mvcc_read_write_delete":
-            t1.execute("begin;")
-            t1.execute("select * from concurrency_test where id = 3;")
-            t2.execute("begin;")
-            t2.execute("delete from concurrency_test where id = 3;")
-            t2.execute("commit;")
-            t1.execute("select * from concurrency_test where id = 3;")
-            t1.execute("commit;")
-            expected = [
-                "| id | name | score |",
-                "| 3 | zhanghua | 88.500000 |",
-                "| id | name | score |",
-                "| 3 | zhanghua | 88.500000 |",
-            ]
-        elif kind == "mvcc_scan":
-            t1.execute("begin;")
-            t1.execute("select * from concurrency_test;")
-            t2.execute("begin;")
-            t2.execute("insert into concurrency_test values (4, 'scanrow', 70.0);")
-            t2.execute("commit;")
-            t1.execute("select * from concurrency_test;")
-            t1.execute("commit;")
-            expected = [
-                "| id | name | score |",
-                "| 1 | xiaohong | 90.000000 |",
-                "| 2 | xiaoming | 95.000000 |",
-                "| 3 | zhanghua | 88.500000 |",
-                "| id | name | score |",
-                "| 1 | xiaohong | 90.000000 |",
-                "| 2 | xiaoming | 95.000000 |",
-                "| 3 | zhanghua | 88.500000 |",
-            ]
-        elif kind == "mvcc_timestamp":
-            t1.execute("begin;")
-            t1.execute("select * from concurrency_test where id = 1;")
-            t1.execute("commit;")
-            t2.execute("begin;")
-            t2.execute("update concurrency_test set score = 91.0 where id = 1;")
-            t2.execute("commit;")
-            t1.execute("select * from concurrency_test where id = 1;")
-            expected = [
-                "| id | name | score |",
-                "| 1 | xiaohong | 90.000000 |",
-                "| id | name | score |",
-                "| 1 | xiaohong | 91.000000 |",
-            ]
-        elif kind == "mvcc_tuple_reconstruct":
-            t1.execute("begin;")
-            t2.execute("begin;")
-            t2.execute("update concurrency_test set score = 96.0 where id = 2;")
-            t2.execute("commit;")
-            t1.execute("select * from concurrency_test where id = 2;")
-            t1.execute("commit;")
-            expected = ["| id | name | score |", "| 2 | xiaoming | 95.000000 |"]
-        elif kind == "mvcc_update":
-            t1.execute("begin;")
-            t1.execute("update concurrency_test set score = 91.0 where id = 1;")
-            t1.execute("commit;")
-            t2.execute("select * from concurrency_test where id = 1;")
-            expected = ["| id | name | score |", "| 1 | xiaohong | 91.000000 |"]
-        elif kind == "mvcc_write_write_delete_insert":
-            t1.execute("begin;")
-            t2.execute("begin;")
-            t1.execute("delete from concurrency_test where id = 2;")
-            t2.execute("insert into concurrency_test values (2, 'again', 99.0);")
-            t1.execute("commit;")
-            t2.execute("abort;")
-            t1.execute("select * from concurrency_test where id = 2;")
-            expected = ["| id | name | score |"]
-        elif kind == "mvcc_write_write_update":
-            t1.execute("begin;")
-            t2.execute("begin;")
-            t1.execute("update concurrency_test set score = 96.0 where id = 2;")
-            t2.execute("update concurrency_test set score = 97.0 where id = 2;")
-            t1.execute("commit;")
-            t2.execute("abort;")
-            t1.execute("select * from concurrency_test where id = 2;")
-            expected = ["| id | name | score |", "| 2 | xiaoming | 96.000000 |"]
-        else:
-            raise RuntimeError(f"unknown MVCC case kind: {kind}")
-        time.sleep(0.1)
-    except Exception as exc:
-        detail = f"runtime error: {exc}"
-        if show_server_log and server_log.exists():
-            detail += "\n" + server_log.read_text(encoding="utf-8", errors="replace")[-4000:]
-        return TestResult(case, False, detail)
-    finally:
-        for client in clients:
-            client.close()
-        terminate_server(proc)
-    detail = compare_lines(expected, read_actual_output(build_dir, db_name), case.name)
-    return TestResult(case, detail is None, detail or "passed")
+    detail = compare_lines(
+        expected,
+        read_actual_output(build_dir, db_name),
+        case.name,
+        preserve_table_order=True,
+    )
+    if detail is None:
+        if not show_server_log and server_log.exists():
+            server_log.unlink()
+        if not keep_db:
+            cleanup_db(build_dir, db_name)
+        return TestResult(case, True, "passed")
+    if show_server_log and server_log.exists():
+        detail += "\n\n--- server log tail ---\n"
+        detail += server_log.read_text(encoding="utf-8", errors="replace")[-4000:]
+    return TestResult(case, False, detail)
 
 
 def recovery_workload(client: RmdbClient, rows: int, use_index: bool, use_checkpoint: bool, workers: int) -> None:
@@ -1498,6 +1363,373 @@ def run_recovery_trial(
         terminate_server(proc)
 
 
+def recovery_script(case: TestCase) -> tuple[list[str], list[str], list[str]]:
+    if case.kind == "recovery_script_undo_uncommitted":
+        before_crash = [
+            "create table rec_undo (id int, val int);",
+            "insert into rec_undo values (1, 10);",
+            "insert into rec_undo values (2, 20);",
+            "begin;",
+            "update rec_undo set val = 100 where id = 1;",
+            "delete from rec_undo where id = 2;",
+            "insert into rec_undo values (3, 30);",
+        ]
+        after_restart = ["select * from rec_undo;"]
+        expected = ["| id | val |", "| 1 | 10 |", "| 2 | 20 |"]
+    elif case.kind == "recovery_script_redo_committed":
+        before_crash = [
+            "create table rec_redo (id int, val int);",
+            "insert into rec_redo values (1, 10);",
+            "insert into rec_redo values (2, 20);",
+            "insert into rec_redo values (3, 30);",
+            "begin;",
+            "update rec_redo set val = 110 where id = 1;",
+            "delete from rec_redo where id = 2;",
+            "insert into rec_redo values (4, 40);",
+            "commit;",
+        ]
+        after_restart = ["select * from rec_redo;"]
+        expected = ["| id | val |", "| 1 | 110 |", "| 3 | 30 |", "| 4 | 40 |"]
+    elif case.kind == "recovery_script_index_consistency":
+        before_crash = [
+            "create table rec_idx (id int, val int);",
+            "create index rec_idx(id);",
+            "insert into rec_idx values (1, 10);",
+            "insert into rec_idx values (2, 20);",
+            "begin;",
+            "update rec_idx set id = 3 where id = 1;",
+            "delete from rec_idx where id = 2;",
+            "insert into rec_idx values (4, 40);",
+            "commit;",
+            "begin;",
+            "insert into rec_idx values (5, 50);",
+            "update rec_idx set id = 6 where id = 3;",
+            "delete from rec_idx where id = 4;",
+        ]
+        after_restart = [
+            "select * from rec_idx where id = 3;",
+            "select * from rec_idx where id = 2;",
+            "select * from rec_idx where id = 4;",
+            "select * from rec_idx where id = 5;",
+            "select * from rec_idx where id = 6;",
+        ]
+        expected = [
+            "| id | val |",
+            "| 3 | 10 |",
+            "| id | val |",
+            "| id | val |",
+            "| 4 | 40 |",
+            "| id | val |",
+            "| id | val |",
+        ]
+    elif case.kind == "recovery_script_checkpoint_boundary":
+        before_crash = [
+            "create table rec_ckpt (id int, val int);",
+            "insert into rec_ckpt values (1, 10);",
+            "begin;",
+            "update rec_ckpt set val = 11 where id = 1;",
+            "commit;",
+            "create static_checkpoint;",
+            "begin;",
+            "insert into rec_ckpt values (2, 20);",
+            "commit;",
+            "begin;",
+            "update rec_ckpt set val = 12 where id = 1;",
+            "commit;",
+            "begin;",
+            "insert into rec_ckpt values (3, 30);",
+            "update rec_ckpt set val = 200 where id = 2;",
+            "delete from rec_ckpt where id = 1;",
+        ]
+        after_restart = ["select * from rec_ckpt;"]
+        expected = ["| id | val |", "| 1 | 12 |", "| 2 | 20 |"]
+    elif case.kind == "recovery_script_restart_new_writes":
+        before_crash = [
+            "create table rec_restart (id int, val int);",
+            "insert into rec_restart values (1, 10);",
+            "begin;",
+            "insert into rec_restart values (2, 200);",
+        ]
+        after_restart = [
+            "begin;",
+            "insert into rec_restart values (2, 20);",
+            "update rec_restart set val = 15 where id = 1;",
+            "commit;",
+            "select * from rec_restart;",
+        ]
+        expected = ["| id | val |", "| 1 | 15 |", "| 2 | 20 |"]
+    elif case.kind == "recovery_script_multitable_atomic":
+        before_crash = [
+            "create table rec_a (id int, val int);",
+            "create table rec_b (id int, val int);",
+            "begin;",
+            "insert into rec_a values (1, 10);",
+            "insert into rec_b values (1, 100);",
+            "commit;",
+            "begin;",
+            "update rec_a set val = 99 where id = 1;",
+            "insert into rec_b values (2, 200);",
+        ]
+        after_restart = [
+            "select * from rec_a;",
+            "select * from rec_b;",
+        ]
+        expected = ["| id | val |", "| 1 | 10 |", "| id | val |", "| 1 | 100 |"]
+    else:
+        raise RuntimeError(f"unknown recovery script case kind: {case.kind}")
+    return before_crash, after_restart, expected
+
+
+def run_recovery_script_case(
+    case: TestCase,
+    server: Path,
+    build_dir: Path,
+    timeout: float,
+    connect_timeout: float,
+    keep_db: bool,
+    show_server_log: bool,
+) -> TestResult:
+    db_name = f"doc_test_{case.name}"
+    cleanup_outputs(build_dir, db_name)
+    if not keep_db:
+        cleanup_db(build_dir, db_name)
+
+    before_crash, after_restart, expected = recovery_script(case)
+    server_log = TEST_ROOT / f"{case.name}.server.log"
+    proc = start_server(server, build_dir, db_name, server_log)
+    client: RmdbClient | None = None
+    try:
+        wait_for_server(DEFAULT_PORT, connect_timeout)
+        client = RmdbClient(DEFAULT_PORT, timeout)
+        for statement in before_crash:
+            client.execute(statement)
+        client.execute("crash;")
+        client.close()
+        client = None
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
+    except Exception as exc:
+        if client is not None:
+            client.close()
+        terminate_server(proc)
+        detail = f"runtime error before restart: {exc}"
+        if show_server_log and server_log.exists():
+            detail += "\n" + server_log.read_text(encoding="utf-8", errors="replace")[-4000:]
+        return TestResult(case, False, detail)
+
+    restart_log = TEST_ROOT / f"{case.name}.restart.server.log"
+    proc = start_server(server, build_dir, db_name, restart_log)
+    try:
+        wait_for_server(DEFAULT_PORT, max(connect_timeout, 20.0))
+        cleanup_outputs(build_dir, db_name)
+        client = RmdbClient(DEFAULT_PORT, timeout)
+        for statement in after_restart:
+            client.execute(statement)
+        time.sleep(0.1)
+        detail = compare_lines(expected, read_actual_output(build_dir, db_name), case.name)
+        return TestResult(case, detail is None, detail or "passed")
+    except Exception as exc:
+        detail = f"runtime error after restart: {exc}"
+        if show_server_log and restart_log.exists():
+            detail += "\n" + restart_log.read_text(encoding="utf-8", errors="replace")[-4000:]
+        return TestResult(case, False, detail)
+    finally:
+        if client is not None:
+            client.close()
+        terminate_server(proc)
+
+
+def run_recovery_log_validation_case(
+    case: TestCase,
+    server: Path,
+    build_dir: Path,
+    timeout: float,
+    connect_timeout: float,
+    keep_db: bool,
+    show_server_log: bool,
+) -> TestResult:
+    db_name = f"doc_test_{case.name}"
+    cleanup_outputs(build_dir, db_name)
+    if not keep_db:
+        cleanup_db(build_dir, db_name)
+
+    server_log = TEST_ROOT / f"{case.name}.server.log"
+    restart_log = TEST_ROOT / f"{case.name}.restart.server.log"
+    proc = start_server(server, build_dir, db_name, server_log)
+    client: RmdbClient | None = None
+    try:
+        wait_for_server(DEFAULT_PORT, connect_timeout)
+        client = RmdbClient(DEFAULT_PORT, timeout)
+        for statement in [
+            "create table rec_log_guard (id int, val int);",
+            "insert into rec_log_guard values (1, 10);",
+            "begin;",
+            "insert into rec_log_guard values (2, 20);",
+        ]:
+            client.execute(statement)
+        client.execute("crash;")
+        client.close()
+        client = None
+        proc.wait(timeout=5)
+
+        db_path = build_dir / db_name
+        log_path = db_path / "db.log"
+        checkpoint_path = db_path / "db.chkpt"
+        header_format = "=iqIqq"
+        header_size = struct.calcsize(header_format)
+        if header_size != 32:
+            raise RuntimeError(f"unexpected test WAL header size: {header_size}")
+        with log_path.open("ab") as log_file:
+            nested_length_offset = log_file.tell()
+            nested_total_length = 64
+            log_file.write(
+                struct.pack(header_format, 1, nested_length_offset, nested_total_length, 987654321, -1)
+            )
+            log_file.write(struct.pack("=i", 2_147_483_647))
+            log_file.write(b"\0" * (nested_total_length - header_size - struct.calcsize("=i")))
+
+            oversized_offset = log_file.tell()
+            log_file.write(struct.pack(header_format, 6, oversized_offset, 0xFFFFFFFF, -1, -1))
+        checkpoint_path.write_text(str(oversized_offset), encoding="utf-8")
+
+        proc = start_server(server, build_dir, db_name, restart_log)
+        wait_for_server(DEFAULT_PORT, max(connect_timeout, 20.0))
+        cleanup_outputs(build_dir, db_name)
+        client = RmdbClient(DEFAULT_PORT, timeout)
+        client.execute("select * from rec_log_guard;")
+        time.sleep(0.1)
+        detail = compare_lines(
+            ["| id | val |", "| 1 | 10 |"],
+            read_actual_output(build_dir, db_name),
+            case.name,
+        )
+        if detail is not None:
+            return TestResult(case, False, detail)
+    except Exception as exc:
+        detail = f"runtime error: {exc}"
+        if show_server_log:
+            for log_file in [server_log, restart_log]:
+                if log_file.exists():
+                    detail += f"\n\n--- {log_file.name} tail ---\n"
+                    detail += log_file.read_text(encoding="utf-8", errors="replace")[-4000:]
+        return TestResult(case, False, detail)
+    finally:
+        if client is not None:
+            client.close()
+        terminate_server(proc)
+
+    if not show_server_log:
+        for log_file in [server_log, restart_log]:
+            if log_file.exists():
+                log_file.unlink()
+    if not keep_db:
+        cleanup_db(build_dir, db_name)
+    return TestResult(case, True, "passed")
+
+
+def run_recovery_streaming_log_case(
+    case: TestCase,
+    server: Path,
+    build_dir: Path,
+    timeout: float,
+    connect_timeout: float,
+    keep_db: bool,
+    show_server_log: bool,
+) -> TestResult:
+    db_name = f"doc_test_{case.name}"
+    cleanup_outputs(build_dir, db_name)
+    if not keep_db:
+        cleanup_db(build_dir, db_name)
+
+    server_log = TEST_ROOT / f"{case.name}.server.log"
+    restart_log = TEST_ROOT / f"{case.name}.restart.server.log"
+    proc = start_server(server, build_dir, db_name, server_log)
+    client: RmdbClient | None = None
+    peak_rss_kb = 0
+    recovery_time = float("inf")
+    try:
+        wait_for_server(DEFAULT_PORT, connect_timeout)
+        client = RmdbClient(DEFAULT_PORT, timeout)
+        for statement in [
+            "create table rec_stream (id int, val int);",
+            "insert into rec_stream values (1, 10);",
+            "begin;",
+            "insert into rec_stream values (2, 20);",
+        ]:
+            client.execute(statement)
+        client.execute("crash;")
+        client.close()
+        client = None
+        proc.wait(timeout=5)
+
+        log_path = build_dir / db_name / "db.log"
+        valid_log_size = log_path.stat().st_size
+        with log_path.open("r+b") as log_file:
+            log_file.truncate(valid_log_size + 4 * 1024 * 1024 * 1024)
+
+        start = time.perf_counter()
+        proc = start_server(server, build_dir, db_name, restart_log)
+        deadline = start + max(connect_timeout, 30.0)
+        ready = False
+        while time.perf_counter() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(f"server exited during streaming recovery: {proc.returncode}")
+            rss_kb = read_process_rss_kb(proc.pid)
+            if rss_kb is not None:
+                peak_rss_kb = max(peak_rss_kb, rss_kb)
+            try:
+                probe = socket.create_connection(("127.0.0.1", DEFAULT_PORT), timeout=0.1)
+                probe.close()
+                ready = True
+                break
+            except OSError:
+                time.sleep(0.02)
+        if not ready:
+            raise RuntimeError("server did not finish bounded streaming recovery")
+        recovery_time = time.perf_counter() - start
+        if peak_rss_kb > 3 * 1024 * 1024:
+            raise RuntimeError(f"streaming recovery RSS exceeded bound: {peak_rss_kb} KiB")
+
+        cleanup_outputs(build_dir, db_name)
+        client = RmdbClient(DEFAULT_PORT, timeout)
+        client.execute("select * from rec_stream;")
+        time.sleep(0.1)
+        detail = compare_lines(
+            ["| id | val |", "| 1 | 10 |"],
+            read_actual_output(build_dir, db_name),
+            case.name,
+        )
+        if detail is not None:
+            return TestResult(case, False, detail)
+    except Exception as exc:
+        detail = f"runtime error: {exc}"
+        if show_server_log:
+            for log_file in [server_log, restart_log]:
+                if log_file.exists():
+                    detail += f"\n\n--- {log_file.name} tail ---\n"
+                    detail += log_file.read_text(encoding="utf-8", errors="replace")[-4000:]
+        return TestResult(case, False, detail)
+    finally:
+        if client is not None:
+            client.close()
+        terminate_server(proc)
+
+    if not show_server_log:
+        for log_file in [server_log, restart_log]:
+            if log_file.exists():
+                log_file.unlink()
+    if not keep_db:
+        cleanup_db(build_dir, db_name)
+    return TestResult(
+        case,
+        True,
+        f"passed, recovery_time={recovery_time:.3f}s, peak_rss_kb={peak_rss_kb}",
+    )
+
+
 def run_recovery_case(
     case: TestCase,
     server: Path,
@@ -1509,6 +1741,17 @@ def run_recovery_case(
     rows: int,
     recovery_ratio: float,
 ) -> TestResult:
+    if case.kind == "recovery_streaming_log":
+        return run_recovery_streaming_log_case(
+            case, server, build_dir, timeout, connect_timeout, keep_db, show_server_log
+        )
+    if case.kind == "recovery_log_validation":
+        return run_recovery_log_validation_case(
+            case, server, build_dir, timeout, connect_timeout, keep_db, show_server_log
+        )
+    if case.kind.startswith("recovery_script_"):
+        return run_recovery_script_case(case, server, build_dir, timeout, connect_timeout, keep_db, show_server_log)
+
     use_index = case.kind == "recovery_index"
     use_checkpoint = case.kind == "recovery_with_checkpoint"
     workers = 4 if case.kind in {"recovery_multi", "recovery_large"} else 1
@@ -1570,12 +1813,19 @@ def run_case(case: TestCase, server: Path, build_dir: Path, timeout: float, conn
         return run_optimizer_case(case, server, build_dir, timeout, connect_timeout, keep_db, show_server_log)
     if case.name in {"02_02_insert_select", "05_04_order_limit"}:
         return run_static_case(case, server, build_dir, timeout, connect_timeout, keep_db, show_server_log)
+    if case.kind == "connection_resilience":
+        return run_connection_resilience_case(
+            case, server, build_dir, timeout, connect_timeout, keep_db, show_server_log
+        )
     if case.kind.startswith("txn_"):
+        if case.kind in {
+            "txn_rc_delete_abort_visibility",
+            "txn_rc_update_visibility",
+            "txn_abort_multitable_insert",
+            "txn_error_aborts_multitable",
+        }:
+            return run_abort_atomicity_case(case, server, build_dir, timeout, connect_timeout, keep_db, show_server_log)
         return run_transaction_case(case, server, build_dir, timeout, connect_timeout, keep_db, show_server_log)
-    if case.kind.startswith("isolation_"):
-        return run_isolation_case(case, server, build_dir, timeout, connect_timeout, keep_db, show_server_log)
-    if case.kind.startswith("mvcc_"):
-        return run_mvcc_case(case, server, build_dir, timeout, connect_timeout, keep_db, show_server_log)
     if case.kind.startswith("recovery_"):
         return run_recovery_case(case, server, build_dir, timeout, connect_timeout, keep_db, show_server_log,
                                  recovery_row_count, recovery_ratio)
@@ -1591,6 +1841,7 @@ def run_case(case: TestCase, server: Path, build_dir: Path, timeout: float, conn
         proc = subprocess.Popen(
             [str(server), db_name],
             cwd=build_dir,
+            env={**os.environ, "RMDB_PORT": str(DEFAULT_PORT)},
             stdout=log_file,
             stderr=subprocess.STDOUT,
             text=True,
@@ -1651,7 +1902,12 @@ def run_case(case: TestCase, server: Path, build_dir: Path, timeout: float, conn
 
 
 def main() -> int:
+    global DEFAULT_PORT
     args = parse_args()
+    if args.port < 1 or args.port > 65535:
+        print(f"Invalid TCP port: {args.port}", file=sys.stderr)
+        return 2
+    DEFAULT_PORT = args.port
     build_dir = args.build_dir.resolve()
     server = (args.server or (build_dir / "bin" / "rmdb")).resolve()
     cases = discover_cases(args.cases)

@@ -1,0 +1,46 @@
+{
+  "ranking": false,
+  "baselines": [
+    {
+      "commit": "e90120d",
+      "mutable": false
+    },
+    {
+      "commit": "0298e5c",
+      "mutable": false
+    }
+  ],
+  "campaign": {
+    "rounds": 2,
+    "swap_slots_between_rounds": true,
+    "scale": 50,
+    "clients": 16,
+    "warmup_seconds": 30,
+    "measure_seconds": 360,
+    "txn_probs": [45, 43, 4, 4, 4]
+  },
+  "studies": [
+    {
+      "name": "dual-360-8g",
+      "memory_max_bytes": 8589934592
+    },
+    {
+      "name": "dual-360-7g",
+      "memory_max_bytes": 7516192768
+    },
+    {
+      "name": "dual-360-6g",
+      "memory_max_bytes": 6442450944
+    }
+  ],
+  "memory_wall_rule": {
+    "comparison_window_seconds": 60,
+    "minimum_rate_drop_fraction": 0.2,
+    "requires_memory_psi_or_event_growth": true,
+    "rate_signals": [
+      "cpu",
+      "network",
+      "wal_growth"
+    ]
+  }
+}

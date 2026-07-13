@@ -11,6 +11,8 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <atomic>
+#include <cstdint>
+#include <functional>
 
 #include "common/config.h"
 #include "defs.h"
@@ -19,8 +21,8 @@ See the Mulan PSL v2 for more details. */
 /* 标识事务状态 */
 enum class TransactionState { DEFAULT, GROWING, SHRINKING, COMMITTED, ABORTED };
 
-/* 系统的隔离级别，当前赛题中为可串行化隔离级别 */
-enum class IsolationLevel { READ_UNCOMMITTED, REPEATABLE_READ, READ_COMMITTED, SNAPSHOT, SERIALIZABLE };
+/* 系统的隔离级别 */
+enum class IsolationLevel { READ_UNCOMMITTED, REPEATABLE_READ, READ_COMMITTED, SNAPSHOT_ISOLATION, SERIALIZABLE };
 
 /* 事务写操作类型，包括插入、删除、更新三种操作 */
 enum class WType { INSERT_TUPLE = 0, DELETE_TUPLE, UPDATE_TUPLE};
@@ -45,9 +47,15 @@ class WriteRecord {
         : wtype_(wtype), tab_name_(tab_name), rid_(rid) {}
 
     // constructor for delete & update operation
-    WriteRecord(WType wtype, const std::string &tab_name, const Rid &rid, const RmRecord &record)
-        : wtype_(wtype), tab_name_(tab_name), rid_(rid), record_(record) {}
+    WriteRecord(WType wtype, const std::string &tab_name, const Rid &rid, const RmRecord &record,
+                bool index_keys_changed = true)
+        : wtype_(wtype), tab_name_(tab_name), rid_(rid), record_(record),
+          index_keys_changed_(index_keys_changed) {}
 
+    WriteRecord(const WriteRecord &) = default;
+    WriteRecord &operator=(const WriteRecord &) = default;
+    WriteRecord(WriteRecord &&) noexcept = default;
+    WriteRecord &operator=(WriteRecord &&) noexcept = default;
     ~WriteRecord() = default;
 
     inline RmRecord &GetRecord() { return record_; }
@@ -58,15 +66,20 @@ class WriteRecord {
 
     inline std::string &GetTableName() { return tab_name_; }
 
+    inline bool IndexKeysChanged() const { return index_keys_changed_; }
+
    private:
     WType wtype_;
     std::string tab_name_;
     Rid rid_;
     RmRecord record_;
+    bool index_keys_changed_{true};
 };
 
 /* 多粒度锁，加锁对象的类型，包括记录和表 */
 enum class LockDataType { TABLE = 0, RECORD = 1 };
+
+using lock_data_key_t = uint64_t;
 
 /**
  * @description: 加锁对象的唯一标识
@@ -90,14 +103,17 @@ class LockDataId {
         type_ = type;
     }
 
-    inline int64_t Get() const {
+    inline lock_data_key_t Get() const {
+        const auto fd_key = static_cast<lock_data_key_t>(static_cast<uint32_t>(fd_) & 0x7fffU);
         if (type_ == LockDataType::TABLE) {
             // fd_
-            return static_cast<int64_t>(fd_);
+            return fd_key << 48;
         } else {
             // fd_, rid_.page_no, rid.slot_no
-            return ((static_cast<int64_t>(type_)) << 63) | ((static_cast<int64_t>(fd_)) << 31) |
-                   ((static_cast<int64_t>(rid_.page_no)) << 16) | rid_.slot_no;
+            return (static_cast<lock_data_key_t>(1) << 63) |
+                   (fd_key << 48) |
+                   (static_cast<lock_data_key_t>(static_cast<uint32_t>(rid_.page_no)) << 16) |
+                   static_cast<lock_data_key_t>(static_cast<uint16_t>(rid_.slot_no));
         }
     }
 
@@ -113,7 +129,7 @@ class LockDataId {
 
 template <>
 struct std::hash<LockDataId> {
-    size_t operator()(const LockDataId &obj) const { return std::hash<int64_t>()(obj.Get()); }
+    size_t operator()(const LockDataId &obj) const { return std::hash<lock_data_key_t>()(obj.Get()); }
 };
 
 /* 事务回滚原因 */

@@ -34,14 +34,14 @@ alpha [a-zA-Z]
 digit [0-9]
 white_space [ \t]+
 new_line "\r"|"\n"|"\r\n"
-sign "+"|"-"
 identifier {alpha}(_|{alpha}|{digit})*
-value_int {sign}?{digit}+
-value_float {sign}?{digit}+\.({digit}+)?
+value_int {digit}+
+value_float {digit}+\.({digit}+)?
 value_string '[^']*'
-single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
+single_op ";"|"("|")"|","|"*"|"/"|"="|">"|"<"|"."|"+"|"-"
 
 %x STATE_COMMENT
+%x STATE_LOAD
 
 %%
     /* block comment */
@@ -56,6 +56,13 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 {new_line} { /* ignore new line */ }
     /* keywords */
 "SHOW" { return SHOW; }
+"LOAD" { BEGIN(STATE_LOAD); return LOAD; }
+<STATE_LOAD>{white_space} { /* skip whitespace before load path */ }
+<STATE_LOAD>[^ \t\r\n;]+ {
+    yylval->sv_str = yytext;
+    BEGIN(INITIAL);
+    return VALUE_STRING;
+}
 "BEGIN" { return TXN_BEGIN; }
 "COMMIT" { return TXN_COMMIT; }
 "ABORT" { return TXN_ABORT; }
@@ -82,6 +89,7 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "INT" { return INT; }
 "CHAR" { return CHAR; }
 "FLOAT" { return FLOAT; }
+"DATETIME" { return DATETIME; }
 "INDEX" { return INDEX; }
 "AND" { return AND; }
 "JOIN" {return JOIN;}
@@ -106,6 +114,7 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "ASC" { return ASC; }
 "ENABLE_NESTLOOP" { return ENABLE_NESTLOOP; }
 "ENABLE_SORTMERGE" { return ENABLE_SORTMERGE; }
+"STATIC_CHECKPOINT" { return STATIC_CHECKPOINT; }
 "TRUE" { 
     yylval->sv_bool = true;
     return VALUE_BOOL; 

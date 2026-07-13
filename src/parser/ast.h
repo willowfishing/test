@@ -45,6 +45,14 @@ enum SetKnobType {
     EnableNestLoop, EnableSortMerge
 };
 
+enum SetClauseOp {
+    SET_OP_ASSIGN,
+    SET_OP_ADD,
+    SET_OP_SUB,
+    SET_OP_MUL,
+    SET_OP_DIV
+};
+
 // Base class for tree nodes
 struct TreeNode {
     virtual ~TreeNode() = default;  // enable polymorphism
@@ -134,6 +142,14 @@ struct DropIndex : public TreeNode {
             tab_name(std::move(tab_name_)), col_names(std::move(col_names_)) {}
 };
 
+struct LoadStmt : public TreeNode {
+    std::string file_name;
+    std::string tab_name;
+
+    LoadStmt(std::string file_name_, std::string tab_name_)
+        : file_name(std::move(file_name_)), tab_name(std::move(tab_name_)) {}
+};
+
 struct Expr : public TreeNode {
 };
 
@@ -188,10 +204,22 @@ struct SelectItem : public TreeNode {
 
 struct SetClause : public TreeNode {
     std::string col_name;
+    std::string rhs_col_name;
     std::shared_ptr<Value> val;
+    bool rhs_is_col;
+    SetClauseOp op;
 
     SetClause(std::string col_name_, std::shared_ptr<Value> val_) :
-            col_name(std::move(col_name_)), val(std::move(val_)) {}
+            col_name(std::move(col_name_)), rhs_col_name(), val(std::move(val_)), rhs_is_col(false),
+            op(SET_OP_ASSIGN) {}
+
+    SetClause(std::string col_name_, std::string rhs_col_name_) :
+            col_name(std::move(col_name_)), rhs_col_name(std::move(rhs_col_name_)), val(nullptr), rhs_is_col(true),
+            op(SET_OP_ASSIGN) {}
+
+    SetClause(std::string col_name_, std::string rhs_col_name_, std::shared_ptr<Value> val_, SetClauseOp op_) :
+            col_name(std::move(col_name_)), rhs_col_name(std::move(rhs_col_name_)), val(std::move(val_)),
+            rhs_is_col(true), op(op_) {}
 };
 
 struct BinaryExpr : public TreeNode {
@@ -347,6 +375,9 @@ struct SelectStmt : public TreeNode {
                     }
                 }
             }
+};
+
+struct CreateCheckpoint : public TreeNode {
 };
 
 struct ExplainStmt : public TreeNode {

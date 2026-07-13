@@ -12,6 +12,9 @@ See the Mulan PSL v2 for more details. */
 
 #include "common/config.h"
 
+#include <cstdint>
+#include <shared_mutex>
+
 /**
  * @description: 存储层每个Page的id的声明
  */
@@ -65,11 +68,19 @@ class Page {
 
     static constexpr size_t OFFSET_PAGE_START = 0;
     static constexpr size_t OFFSET_LSN = 0;
-    static constexpr size_t OFFSET_PAGE_HDR = 4;
+    static constexpr size_t OFFSET_PAGE_HDR = sizeof(lsn_t);
 
     inline lsn_t get_page_lsn() { return *reinterpret_cast<lsn_t *>(get_data() + OFFSET_LSN) ; }
 
     inline void set_page_lsn(lsn_t page_lsn) { memcpy(get_data() + OFFSET_LSN, &page_lsn, sizeof(lsn_t)); }
+
+    void r_latch() { page_latch_.lock_shared(); }
+
+    void r_unlatch() { page_latch_.unlock_shared(); }
+
+    void w_latch() { page_latch_.lock(); }
+
+    void w_unlatch() { page_latch_.unlock(); }
 
    private:
     void reset_memory() { memset(data_, OFFSET_PAGE_START, PAGE_SIZE); }  // 将data_的PAGE_SIZE个字节填充为0
@@ -87,4 +98,13 @@ class Page {
 
     /** The pin count of this page. */
     int pin_count_ = 0;
+
+    /** In-memory generation used to validate buffer pool fast-path caches. */
+    uint64_t generation_ = 0;
+
+    /** True while the frame is being replaced and must not be served from fast-path caches. */
+    bool is_replacing_ = false;
+
+    /** In-memory latch used by index crabbing. It is never persisted. */
+    std::shared_mutex page_latch_;
 };

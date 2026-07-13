@@ -9,12 +9,13 @@ class UnionExecutor : public AbstractExecutor {
     std::vector<std::unique_ptr<AbstractExecutor>> children_;
     std::vector<ColMeta> cols_;
     size_t len_;
-    std::vector<std::unique_ptr<RmRecord>> tuples_;
+    std::vector<RmRecord> tuples_;
     size_t cursor_ = 0;
 
-    void copy_cell(RmRecord *dst, const ColMeta &dst_col, const RmRecord *src, const ColMeta &src_col) const {
+    void copy_cell(RmRecord *dst, const ColMeta &dst_col, const TupleView &src, const ColMeta &src_col,
+                   size_t src_idx) const {
         char *dst_data = dst->data + dst_col.offset;
-        const char *src_data = src->data + src_col.offset;
+        const char *src_data = src.cell_at(src_col, src_idx);
         if (dst_col.type == src_col.type) {
             memset(dst_data, 0, dst_col.len);
             memcpy(dst_data, src_data, std::min(dst_col.len, src_col.len));
@@ -44,12 +45,15 @@ class UnionExecutor : public AbstractExecutor {
                 throw RMDBError("union column count mismatch");
             }
             for (; !child->is_end(); child->nextTuple()) {
-                auto src = child->Next();
-                auto out = std::make_unique<RmRecord>(len_);
-                for (size_t i = 0; i < cols_.size(); ++i) {
-                    copy_cell(out.get(), cols_[i], src.get(), src_cols[i]);
+                auto src = child->ReadTupleView();
+                if (!src) {
+                    break;
                 }
-                std::string key(out->data, len_);
+                RmRecord out(static_cast<int>(len_));
+                for (size_t i = 0; i < cols_.size(); ++i) {
+                    copy_cell(&out, cols_[i], *src.view, src_cols[i], i);
+                }
+                std::string key(out.data, len_);
                 if (seen.insert(key).second) {
                     tuples_.push_back(std::move(out));
                 }
@@ -65,9 +69,16 @@ class UnionExecutor : public AbstractExecutor {
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        auto rec = std::make_unique<RmRecord>(len_);
-        memcpy(rec->data, tuples_[cursor_]->data, len_);
+        if (cursor_ >= tuples_.size()) {
+            return nullptr;
+        }
+        auto rec = std::make_unique<RmRecord>(static_cast<int>(len_));
+        memcpy(rec->data, tuples_[cursor_].data, len_);
         return rec;
+    }
+
+    const RmRecord *CurrentTuple() const override {
+        return cursor_ >= tuples_.size() ? nullptr : &tuples_[cursor_];
     }
 
     bool is_end() const override { return cursor_ >= tuples_.size(); }

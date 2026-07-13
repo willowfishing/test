@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 #include <algorithm>
+#include <queue>
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
@@ -22,8 +23,28 @@ class SortExecutor : public AbstractExecutor {
     std::vector<ColMeta> cols_;
     size_t len_;
     std::vector<std::pair<ColMeta, bool>> order_cols_;
-    std::vector<std::unique_ptr<RmRecord>> tuples_;
+    std::vector<RmRecord> tuples_;
     size_t cursor_;
+    int limit_ = -1;
+
+    int compare_records(const RmRecord &lhs, const RmRecord &rhs) const {
+        for (const auto &order_col : order_cols_) {
+            const auto &col = order_col.first;
+            int cmp = compare_value(lhs.data + col.offset, rhs.data + col.offset, col.type, col.len);
+            if (cmp != 0) {
+                return order_col.second ? -cmp : cmp;
+            }
+        }
+        return 0;
+    }
+
+    bool output_less(const RmRecord &lhs, const RmRecord &rhs) const {
+        return compare_records(lhs, rhs) < 0;
+    }
+
+    bool output_worse(const RmRecord &lhs, const RmRecord &rhs) const {
+        return compare_records(lhs, rhs) > 0;
+    }
 
    public:
     SortExecutor(std::unique_ptr<AbstractExecutor> prev, TabCol sel_cols, bool is_desc) {
@@ -44,20 +65,54 @@ class SortExecutor : public AbstractExecutor {
         cursor_ = 0;
     }
 
+    void set_limit(int limit) { limit_ = limit; }
+
     void beginTuple() override { 
         tuples_.clear();
-        for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
-            tuples_.push_back(prev_->Next());
+        if (limit_ == 0) {
+            prev_->beginTuple();
+            cursor_ = 0;
+            return;
         }
-        std::sort(tuples_.begin(), tuples_.end(), [&](const auto &lhs, const auto &rhs) {
-            for (auto &order_col : order_cols_) {
-                const auto &col = order_col.first;
-                int cmp = compare_value(lhs->data + col.offset, rhs->data + col.offset, col.type, col.len);
-                if (cmp != 0) {
-                    return order_col.second ? cmp > 0 : cmp < 0;
+        if (limit_ > 0 && !order_cols_.empty()) {
+            auto worse = [&](const RmRecord &lhs, const RmRecord &rhs) {
+                return output_less(lhs, rhs);
+            };
+            std::priority_queue<RmRecord, std::vector<RmRecord>, decltype(worse)> heap(worse);
+            for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
+                auto tuple = prev_->ReadTupleView();
+                if (!tuple) {
+                    break;
+                }
+                RmRecord rec(static_cast<int>(len_));
+                materialize_tuple_view(*tuple.view, cols_, &rec, len_);
+                if (static_cast<int>(heap.size()) < limit_) {
+                    heap.push(std::move(rec));
+                } else if (output_less(rec, heap.top())) {
+                    heap.pop();
+                    heap.push(std::move(rec));
                 }
             }
-            return false;
+            tuples_.reserve(heap.size());
+            while (!heap.empty()) {
+                tuples_.push_back(heap.top());
+                heap.pop();
+            }
+            std::sort(tuples_.begin(), tuples_.end(),
+                      [&](const auto &lhs, const auto &rhs) { return output_less(lhs, rhs); });
+            cursor_ = 0;
+            return;
+        }
+        for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
+            auto tuple = prev_->ReadTupleView();
+            if (!tuple) {
+                break;
+            }
+            tuples_.emplace_back(static_cast<int>(len_));
+            materialize_tuple_view(*tuple.view, cols_, &tuples_.back(), len_);
+        }
+        std::sort(tuples_.begin(), tuples_.end(), [&](const auto &lhs, const auto &rhs) {
+            return output_less(lhs, rhs);
         });
         cursor_ = 0;
     }
@@ -69,9 +124,16 @@ class SortExecutor : public AbstractExecutor {
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        auto rec = std::make_unique<RmRecord>(len_);
-        memcpy(rec->data, tuples_[cursor_]->data, len_);
+        if (cursor_ >= tuples_.size()) {
+            return nullptr;
+        }
+        auto rec = std::make_unique<RmRecord>(static_cast<int>(len_));
+        memcpy(rec->data, tuples_[cursor_].data, len_);
         return rec;
+    }
+
+    const RmRecord *CurrentTuple() const override {
+        return cursor_ >= tuples_.size() ? nullptr : &tuples_[cursor_];
     }
 
     bool is_end() const override { return cursor_ >= tuples_.size(); }
