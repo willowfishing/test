@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
+#include "executor_seq_scan.h"
 #include "index/ix.h"
 #include "system/sm.h"
 
@@ -23,35 +24,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
     std::vector<ColMeta> cols_;                 // join后获得的记录的字段
 
     std::vector<Condition> fed_conds_;          // join条件
-    std::vector<CompiledCondition> compiled_conds_;
-    bool compiled_conds_valid_ = false;
     bool isend;
-    bool has_current_ = false;
-    mutable RmRecord current_record_;
-    TupleView current_view_;
-    std::vector<const char *> current_cells_;
-
-    bool set_current_from_children() {
-        auto left_view = left_->CurrentTupleView();
-        auto right_view = right_->CurrentTupleView();
-        if (left_view == nullptr || right_view == nullptr) {
-            return false;
-        }
-        const auto &left_cols = left_->cols();
-        const auto &right_cols = right_->cols();
-        current_cells_.resize(left_cols.size() + right_cols.size());
-        size_t out_idx = 0;
-        for (size_t i = 0; i < left_cols.size(); ++i) {
-            current_cells_[out_idx++] = left_view->cell_at(left_cols[i], i);
-        }
-        for (size_t i = 0; i < right_cols.size(); ++i) {
-            current_cells_[out_idx++] = right_view->cell_at(right_cols[i], i);
-        }
-        current_view_.record = nullptr;
-        current_view_.cells = &current_cells_;
-        return compiled_conds_valid_ ? eval_compiled_conds_view(current_view_, compiled_conds_)
-                                     : eval_conds_view(cols_, current_view_, fed_conds_);
-    }
 
    public:
     NestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left, std::unique_ptr<AbstractExecutor> right, 
@@ -67,74 +40,119 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
 
         cols_.insert(cols_.end(), right_cols.begin(), right_cols.end());
         isend = false;
-        current_record_.Resize(static_cast<int>(len_));
         fed_conds_ = std::move(conds);
-        compiled_conds_valid_ = compile_conds(cols_, fed_conds_, &compiled_conds_);
 
+    }
+
+    size_t tupleLen() const override { return len_; }
+
+    const std::vector<ColMeta> &cols() const override {
+        return cols_;
+    }
+
+    bool check_join_condition(const RmRecord &left_rec, const RmRecord &right_rec) {
+        if (fed_conds_.empty()) return true;
+        for (auto &cond : fed_conds_) {
+            // Find the column in either left or right
+            const ColMeta *lhs_col = nullptr;
+            char *lhs_buf = nullptr;
+            for (const auto &c : left_->cols()) {
+                if (c.tab_name == cond.lhs_col.tab_name && c.name == cond.lhs_col.col_name) {
+                    lhs_col = &c;
+                    lhs_buf = left_rec.data + c.offset;
+                    break;
+                }
+            }
+            if (!lhs_col) {
+                for (const auto &c : right_->cols()) {
+                    if (c.tab_name == cond.lhs_col.tab_name && c.name == cond.lhs_col.col_name) {
+                        lhs_col = &c;
+                        lhs_buf = right_rec.data + c.offset;
+                        break;
+                    }
+                }
+            }
+            if (!lhs_col) continue;
+
+            char *rhs_buf = nullptr;
+            const ColMeta *rhs_col = nullptr;
+            for (const auto &c : left_->cols()) {
+                if (c.tab_name == cond.rhs_col.tab_name && c.name == cond.rhs_col.col_name) {
+                    rhs_col = &c;
+                    rhs_buf = left_rec.data + c.offset;
+                    break;
+                }
+            }
+            if (!rhs_col) {
+                for (const auto &c : right_->cols()) {
+                    if (c.tab_name == cond.rhs_col.tab_name && c.name == cond.rhs_col.col_name) {
+                        rhs_col = &c;
+                        rhs_buf = right_rec.data + c.offset;
+                        break;
+                    }
+                }
+            }
+            if (!rhs_col) continue;
+
+            int cmp = SeqScanExecutor::compare_value(lhs_col->type, rhs_col->type, lhs_buf, rhs_buf,
+                                                      lhs_col->len, rhs_col->len);
+            if (!SeqScanExecutor::check_cmp(cmp, cond.op)) return false;
+        }
+        return true;
     }
 
     void beginTuple() override {
-        isend = false;
-        has_current_ = false;
         left_->beginTuple();
-        right_->beginTuple();
-        while (!left_->is_end()) {
-            while (!right_->is_end()) {
-                if (set_current_from_children()) {
-                    has_current_ = true;
-                    return;
-                }
-                right_->nextTuple();
-            }
-            left_->nextTuple();
+        if (!left_->is_end()) {
             right_->beginTuple();
+            // Find first matching pair
+            while (!left_->is_end()) {
+                while (!right_->is_end()) {
+                    auto left_rec = left_->Next();
+                    auto right_rec = right_->Next();
+                    if (check_join_condition(*left_rec, *right_rec)) {
+                        return;
+                    }
+                    right_->nextTuple();
+                }
+                left_->nextTuple();
+                if (!left_->is_end()) {
+                    right_->beginTuple();
+                }
+            }
         }
-        isend = true;
     }
 
     void nextTuple() override {
-        if (isend) {
-            return;
-        }
-        has_current_ = false;
         right_->nextTuple();
         while (!left_->is_end()) {
             while (!right_->is_end()) {
-                if (set_current_from_children()) {
-                    has_current_ = true;
+                auto left_rec = left_->Next();
+                auto right_rec = right_->Next();
+                if (check_join_condition(*left_rec, *right_rec)) {
                     return;
                 }
                 right_->nextTuple();
             }
             left_->nextTuple();
-            right_->beginTuple();
+            if (!left_->is_end()) {
+                right_->beginTuple();
+            }
         }
-        isend = true;
+    }
+
+    bool is_end() const override {
+        return left_->is_end();
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        if (!has_current_) {
-            return nullptr;
-        }
-        auto rec = std::make_unique<RmRecord>(static_cast<int>(len_));
-        materialize_tuple_view(current_view_, cols_, rec.get(), len_);
-        return rec;
+        auto left_rec = left_->Next();
+        auto right_rec = right_->Next();
+        auto join_rec = std::make_unique<RmRecord>(len_);
+        memcpy(join_rec->data, left_rec->data, left_->tupleLen());
+        memcpy(join_rec->data + left_->tupleLen(), right_rec->data, right_->tupleLen());
+        return join_rec;
     }
 
-    const TupleView *CurrentTupleView() const override { return has_current_ ? &current_view_ : nullptr; }
-
-    const RmRecord *CurrentTuple() const override {
-        if (!has_current_) {
-            return nullptr;
-        }
-        materialize_tuple_view(current_view_, cols_, &current_record_, len_);
-        return &current_record_;
-    }
-
-    bool is_end() const override { return isend; }
-    size_t tupleLen() const override { return len_; }
-    const std::vector<ColMeta> &cols() const override { return cols_; }
-    std::string getType() override { return "NestedLoopJoinExecutor"; }
-    ColMeta get_col_offset(const TabCol &target) override { return *get_col(cols_, target); }
     Rid &rid() override { return _abstract_rid; }
 };

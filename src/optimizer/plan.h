@@ -15,8 +15,6 @@ See the Mulan PSL v2 for more details. */
 #include <memory>
 #include <string>
 #include <vector>
-#include "common/index_runtime.h"
-#include "common/runtime_feedback.h"
 #include "parser/ast.h"
 
 #include "parser/parser.h"
@@ -33,7 +31,6 @@ typedef enum PlanTag{
     T_DropIndex,
     T_SetKnob,
     T_Insert,
-    T_Load,
     T_Update,
     T_Delete,
     T_select,
@@ -41,66 +38,49 @@ typedef enum PlanTag{
     T_Transaction_commit,
     T_Transaction_abort,
     T_Transaction_rollback,
-    T_SetTransactionIsolation,
+    T_SetIsolationLevel,
     T_SeqScan,
     T_IndexScan,
     T_NestLoop,
-    T_IndexNestLoop,
-    T_HashJoin,
     T_SortMerge,    // sort merge join
     T_Sort,
     T_Projection,
-    T_Aggregate,
-    T_MinMaxIndexAggregate,
-    T_CountIndexAggregate,
-    T_Limit,
-    T_SemiJoin,
-    T_Union,
-    T_Explain,
-    T_Checkpoint
+    T_Filter,
+    T_Aggregation,  // aggregate + group by + having
+    T_Limit,        // limit output rows
+    T_Union         // union set operation
 } PlanTag;
-
-struct PlanRuntimeCache {
-    const TabMeta *tab = nullptr;
-    RmFileHandle *fh = nullptr;
-    std::vector<ColMeta> full_cols;
-    size_t full_len = 0;
-    bool has_table = false;
-
-    IndexMeta index_meta;
-    IxIndexHandle *ih = nullptr;
-    bool has_index = false;
-
-    std::vector<rmdb::IndexBinding> index_bindings;
-    bool has_index_bindings = false;
-};
 
 // 查询执行计划
 class Plan
 {
 public:
     PlanTag tag;
-    std::shared_ptr<const PlanRuntimeCache> runtime_cache_;
-    uint32_t template_node_id_ = rmdb::kInvalidRuntimeNodeId;
-    std::shared_ptr<rmdb::RuntimeNodeFeedback> runtime_feedback_;
+    size_t rows_ = 0;
     virtual ~Plan() = default;
+};
+
+// 过滤节点 (选择运算)
+class FilterPlan : public Plan {
+public:
+    FilterPlan(std::shared_ptr<Plan> subplan, std::vector<Condition> conds)
+        : subplan_(std::move(subplan)), conds_(std::move(conds)) {
+        tag = T_Filter;
+    }
+    std::shared_ptr<Plan> subplan_;
+    std::vector<Condition> conds_;
 };
 
 class ScanPlan : public Plan
 {
     public:
-        ScanPlan(PlanTag tag, SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds,
-                 std::vector<std::string> index_col_names, std::string visible_name = "")
+        ScanPlan(PlanTag tag, SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, std::vector<std::string> index_col_names)
         {
             Plan::tag = tag;
             tab_name_ = std::move(tab_name);
-            visible_name_ = visible_name.empty() ? tab_name_ : std::move(visible_name);
             conds_ = std::move(conds);
             TabMeta &tab = sm_manager->db_.get_table(tab_name_);
             cols_ = tab.cols;
-            for (auto &col : cols_) {
-                col.tab_name = visible_name_;
-            }
             len_ = cols_.back().offset + cols_.back().len;
             fed_conds_ = conds_;
             index_col_names_ = index_col_names;
@@ -109,27 +89,23 @@ class ScanPlan : public Plan
         ~ScanPlan(){}
         // 以下变量同ScanExecutor中的变量
         std::string tab_name_;                     
-        std::string visible_name_;
         std::vector<ColMeta> cols_;                
         std::vector<Condition> conds_;             
         size_t len_;                               
         std::vector<Condition> fed_conds_;
         std::vector<std::string> index_col_names_;
-        std::vector<TabCol> required_cols_;
     
 };
 
 class JoinPlan : public Plan
 {
     public:
-        JoinPlan(PlanTag tag, std::shared_ptr<Plan> left, std::shared_ptr<Plan> right, std::vector<Condition> conds,
-                 std::vector<std::string> index_col_names = {})
+        JoinPlan(PlanTag tag, std::shared_ptr<Plan> left, std::shared_ptr<Plan> right, std::vector<Condition> conds)
         {
             Plan::tag = tag;
             left_ = std::move(left);
             right_ = std::move(right);
             conds_ = std::move(conds);
-            index_col_names_ = std::move(index_col_names);
             type = INNER_JOIN;
         }
         ~JoinPlan(){}
@@ -139,25 +115,12 @@ class JoinPlan : public Plan
         std::shared_ptr<Plan> right_;
         // 连接条件
         std::vector<Condition> conds_;
-        std::vector<std::string> index_col_names_;
         // future TODO: 后续可以支持的连接类型
         JoinType type;
-};
-
-class SemiJoinPlan : public Plan
-{
-    public:
-        SemiJoinPlan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right, std::vector<Condition> conds)
-        {
-            Plan::tag = T_SemiJoin;
-            left_ = std::move(left);
-            right_ = std::move(right);
-            conds_ = std::move(conds);
-        }
-        ~SemiJoinPlan(){}
-        std::shared_ptr<Plan> left_;
-        std::shared_ptr<Plan> right_;
-        std::vector<Condition> conds_;
+        // INLJ: 右表（内表）是否有可用于点查的索引
+        bool is_inlj_ = false;
+        // INLJ: 右表（内表）用于索引点查的索引列名
+        std::vector<std::string> inner_index_cols_;
 };
 
 class ProjectionPlan : public Plan
@@ -185,33 +148,63 @@ class SortPlan : public Plan
             sel_col_ = sel_col;
             is_desc_ = is_desc;
         }
-        SortPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<std::pair<TabCol, bool>> order_cols)
-        {
-            Plan::tag = tag;
-            subplan_ = std::move(subplan);
-            order_cols_ = std::move(order_cols);
-            if (!order_cols_.empty()) {
-                sel_col_ = order_cols_[0].first;
-                is_desc_ = order_cols_[0].second;
-            } else {
-                is_desc_ = false;
-            }
-        }
         ~SortPlan(){}
         std::shared_ptr<Plan> subplan_;
         TabCol sel_col_;
         bool is_desc_;
-        std::vector<std::pair<TabCol, bool>> order_cols_;
-        int limit_ = -1;
-        
+        // Task 5: 支持多列排序
+        std::vector<TabCol> sort_cols_;
+        std::vector<bool> is_desc_list_;
+        bool multi_col = false;
+        void init_multi(std::vector<TabCol> cols, std::vector<bool> descs) {
+            sort_cols_ = std::move(cols);
+            is_desc_list_ = std::move(descs);
+            multi_col = true;
+            if (!sort_cols_.empty()) {
+                sel_col_ = sort_cols_[0];
+                is_desc_ = is_desc_list_[0];
+            }
+        }
+};
+
+// Forward declaration of aggregate info type (mirrors Query::AggInfo)
+struct AggInfo {
+    enum AggType { COUNT_ALL, COUNT_COL, MAX, MIN, SUM, AVG };
+    AggType agg_type;
+    TabCol col;
+    std::string alias;
+};
+
+class AggregationPlan : public Plan
+{
+    public:
+        AggregationPlan(PlanTag tag, std::shared_ptr<Plan> subplan,
+                        std::vector<TabCol> group_by,
+                        std::vector<AggInfo> aggs,
+                        std::vector<Condition> having,
+                        std::vector<TabCol> out_cols)
+        {
+            Plan::tag = tag;
+            subplan_ = std::move(subplan);
+            group_by_ = std::move(group_by);
+            aggs_ = std::move(aggs);
+            having_ = std::move(having);
+            out_cols_ = std::move(out_cols);
+        }
+        ~AggregationPlan(){}
+        std::shared_ptr<Plan> subplan_;
+        std::vector<TabCol> group_by_;
+        std::vector<AggInfo> aggs_;
+        std::vector<Condition> having_;
+        std::vector<TabCol> out_cols_;  // output column order
 };
 
 class LimitPlan : public Plan
 {
     public:
-        LimitPlan(std::shared_ptr<Plan> subplan, int limit)
+        LimitPlan(PlanTag tag, std::shared_ptr<Plan> subplan, int limit)
         {
-            Plan::tag = T_Limit;
+            Plan::tag = tag;
             subplan_ = std::move(subplan);
             limit_ = limit;
         }
@@ -220,116 +213,20 @@ class LimitPlan : public Plan
         int limit_;
 };
 
-class AggregatePlan : public Plan
-{
-    public:
-        AggregatePlan(std::shared_ptr<Plan> subplan,
-                      std::vector<std::shared_ptr<ast::SelectItem>> select_items,
-                      std::vector<TabCol> group_cols,
-                      std::vector<std::shared_ptr<ast::HavingExpr>> having_conds,
-                      std::vector<TabCol> output_cols)
-        {
-            Plan::tag = T_Aggregate;
-            subplan_ = std::move(subplan);
-            select_items_ = std::move(select_items);
-            group_cols_ = std::move(group_cols);
-            having_conds_ = std::move(having_conds);
-            output_cols_ = std::move(output_cols);
-        }
-        ~AggregatePlan(){}
-        std::shared_ptr<Plan> subplan_;
-        std::vector<std::shared_ptr<ast::SelectItem>> select_items_;
-        std::vector<TabCol> group_cols_;
-        std::vector<std::shared_ptr<ast::HavingExpr>> having_conds_;
-        std::vector<TabCol> output_cols_;
-};
-
-class MinMaxIndexAggregatePlan : public Plan
-{
-    public:
-        MinMaxIndexAggregatePlan(std::string tab_name,
-                                 std::string visible_name,
-                                 std::vector<Condition> conds,
-                                 std::vector<std::string> index_col_names,
-                                 TabCol agg_col,
-                                 ast::AggType agg_type,
-                                 std::vector<TabCol> output_cols)
-        {
-            Plan::tag = T_MinMaxIndexAggregate;
-            tab_name_ = std::move(tab_name);
-            visible_name_ = visible_name.empty() ? tab_name_ : std::move(visible_name);
-            conds_ = std::move(conds);
-            index_col_names_ = std::move(index_col_names);
-            agg_col_ = std::move(agg_col);
-            agg_type_ = agg_type;
-            output_cols_ = std::move(output_cols);
-        }
-        ~MinMaxIndexAggregatePlan(){}
-        std::string tab_name_;
-        std::string visible_name_;
-        std::vector<Condition> conds_;
-        std::vector<std::string> index_col_names_;
-        TabCol agg_col_;
-        ast::AggType agg_type_;
-        std::vector<TabCol> output_cols_;
-};
-
-class CountIndexAggregatePlan : public Plan
-{
-    public:
-        CountIndexAggregatePlan(std::string tab_name,
-                                std::string visible_name,
-                                std::vector<Condition> conds,
-                                std::vector<std::string> index_col_names,
-                                bool count_star,
-                                TabCol count_col,
-                                std::vector<TabCol> output_cols)
-        {
-            Plan::tag = T_CountIndexAggregate;
-            tab_name_ = std::move(tab_name);
-            visible_name_ = visible_name.empty() ? tab_name_ : std::move(visible_name);
-            conds_ = std::move(conds);
-            index_col_names_ = std::move(index_col_names);
-            count_star_ = count_star;
-            count_col_ = std::move(count_col);
-            output_cols_ = std::move(output_cols);
-        }
-        ~CountIndexAggregatePlan(){}
-        std::string tab_name_;
-        std::string visible_name_;
-        std::vector<Condition> conds_;
-        std::vector<std::string> index_col_names_;
-        bool count_star_ = false;
-        TabCol count_col_;
-        std::vector<TabCol> output_cols_;
-};
-
-class ExplainPlan : public Plan
-{
-    public:
-        ExplainPlan(std::vector<std::string> lines)
-        {
-            Plan::tag = T_Explain;
-            lines_ = std::move(lines);
-        }
-        ~ExplainPlan(){}
-        std::vector<std::string> lines_;
-};
-
+// Task 6: UNION plan — contains sub-plans for each branch
 class UnionPlan : public Plan
 {
     public:
-        UnionPlan(std::vector<std::shared_ptr<Plan>> subplans, std::vector<ColMeta> cols)
+        UnionPlan(std::vector<std::shared_ptr<Plan>> branches,
+                  std::vector<ColMeta> output_cols)
         {
             Plan::tag = T_Union;
-            subplans_ = std::move(subplans);
-            cols_ = std::move(cols);
-            len_ = cols_.empty() ? 0 : cols_.back().offset + cols_.back().len;
+            branches_ = std::move(branches);
+            output_cols_ = std::move(output_cols);
         }
         ~UnionPlan(){}
-        std::vector<std::shared_ptr<Plan>> subplans_;
-        std::vector<ColMeta> cols_;
-        size_t len_;
+        std::vector<std::shared_ptr<Plan>> branches_;
+        std::vector<ColMeta> output_cols_;
 };
 
 // dml语句，包括insert; delete; update; select语句　
@@ -347,20 +244,14 @@ class DMLPlan : public Plan
             conds_ = std::move(conds);
             set_clauses_ = std::move(set_clauses);
         }
-        DMLPlan(PlanTag tag, std::string tab_name, std::string file_name)
-        {
-            Plan::tag = tag;
-            tab_name_ = std::move(tab_name);
-            file_name_ = std::move(file_name);
-        }
         ~DMLPlan(){}
         std::shared_ptr<Plan> subplan_;
         std::string tab_name_;
-        std::string file_name_;
         std::vector<Value> values_;
         std::vector<Condition> conds_;
         std::vector<SetClause> set_clauses_;
-        std::vector<TabCol> output_cols_;
+        bool is_explain_analyze = false;
+        bool is_select_star = false;
 };
 
 // ddl语句, 包括create/drop table; create/drop index;
@@ -391,18 +282,6 @@ class OtherPlan : public Plan
         }
         ~OtherPlan(){}
         std::string tab_name_;
-};
-
-class SetTransactionIsolationPlan : public Plan
-{
-    public:
-        explicit SetTransactionIsolationPlan(IsolationLevel isolation_level)
-        {
-            Plan::tag = T_SetTransactionIsolation;
-            isolation_level_ = isolation_level;
-        }
-        ~SetTransactionIsolationPlan(){}
-        IsolationLevel isolation_level_;
 };
 
 // Set Knob Plan

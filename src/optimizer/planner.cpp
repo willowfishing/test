@@ -10,16 +10,8 @@ See the Mulan PSL v2 for more details. */
 
 #include "planner.h"
 
-#include <algorithm>
-#include <cctype>
-#include <cstdlib>
-#include <functional>
-#include <map>
 #include <memory>
-#include <set>
-#include <sstream>
 
-#include "common/index_runtime.h"
 #include "execution/executor_delete.h"
 #include "execution/executor_index_scan.h"
 #include "execution/executor_insert.h"
@@ -28,882 +20,112 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_seq_scan.h"
 #include "execution/executor_update.h"
 #include "index/ix.h"
-#include "record/rm_scan.h"
 #include "record_printer.h"
 
-namespace {
-std::string col_to_string(const std::shared_ptr<ast::Col> &col) {
-    return col->tab_name.empty() ? col->col_name : col->tab_name + "." + col->col_name;
-}
-
-std::string value_to_string(const std::shared_ptr<ast::Value> &value) {
-    if (auto int_lit = std::dynamic_pointer_cast<ast::IntLit>(value)) {
-        return std::to_string(int_lit->val);
-    }
-    if (auto float_lit = std::dynamic_pointer_cast<ast::FloatLit>(value)) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "%.6f", float_lit->val);
-        return buf;
-    }
-    if (auto str_lit = std::dynamic_pointer_cast<ast::StringLit>(value)) {
-        return "'" + str_lit->val + "'";
-    }
-    return "";
-}
-
-std::string op_to_string(ast::SvCompOp op) {
-    switch (op) {
-        case ast::SV_OP_EQ: return "=";
-        case ast::SV_OP_NE: return "<>";
-        case ast::SV_OP_LT: return "<";
-        case ast::SV_OP_GT: return ">";
-        case ast::SV_OP_LE: return "<=";
-        case ast::SV_OP_GE: return ">=";
-    }
-    return "";
-}
-
-std::string cond_to_string(const std::shared_ptr<ast::BinaryExpr> &cond) {
-    std::string rhs;
-    if (auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs)) {
-        rhs = col_to_string(rhs_col);
-    } else if (auto rhs_val = std::dynamic_pointer_cast<ast::Value>(cond->rhs)) {
-        rhs = value_to_string(rhs_val);
-    }
-    return col_to_string(cond->lhs) + op_to_string(cond->op) + rhs;
-}
-
-std::string join_tables_string(const std::set<std::string> &tables) {
-    std::string out;
-    bool first = true;
-    for (auto &table : tables) {
-        if (!first) {
-            out += ", ";
-        }
-        out += table;
-        first = false;
-    }
-    return out;
-}
-
-std::string project_columns_string(std::vector<std::string> cols) {
-    std::sort(cols.begin(), cols.end());
-    std::string out;
-    for (size_t i = 0; i < cols.size(); ++i) {
-        if (i != 0) {
-            out += ", ";
-        }
-        out += cols[i];
-    }
-    return out;
-}
-
-bool table_has_filter(const std::vector<std::shared_ptr<ast::BinaryExpr>> &conds, const std::string &visible) {
-    for (auto &cond : conds) {
-        auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
-        if (cond->lhs->tab_name == visible &&
-            (std::dynamic_pointer_cast<ast::Value>(cond->rhs) || (rhs_col && rhs_col->tab_name == visible))) {
+// 检查表在指定列上是否存在索引（用于 INLJ 判断）
+bool has_index_on_column(SmManager *sm_manager, std::string tab_name, std::string col_name,
+                          std::vector<std::string> &index_col_names) {
+    index_col_names.clear();
+    TabMeta &tab = sm_manager->db_.get_table(tab_name);
+    for (auto &index : tab.indexes) {
+        if (index.cols.size() == 1 && index.cols[0].name == col_name) {
+            index_col_names.push_back(col_name);
             return true;
         }
     }
     return false;
 }
 
-std::string ast_col_key(const std::shared_ptr<ast::Col> &col) {
-    return col->tab_name + "\x1f" + col->col_name;
-}
-
-std::string condition_col_key(const TabCol &col) {
-    return col.tab_name + "\x1f" + col.col_name;
-}
-
-std::string condition_key(const Condition &cond) {
-    std::string key = condition_col_key(cond.lhs_col) + "\x1e" + std::to_string(static_cast<int>(cond.op)) + "\x1e";
-    if (!cond.is_rhs_val) {
-        return key + condition_col_key(cond.rhs_col);
-    }
-    key += "v" + std::to_string(static_cast<int>(cond.rhs_val.type)) + "\x1e";
-    if (cond.rhs_val.type == TYPE_INT) {
-        key += std::to_string(cond.rhs_val.int_val);
-    } else if (cond.rhs_val.type == TYPE_FLOAT) {
-        key += std::to_string(cond.rhs_val.float_val);
-    } else {
-        key += cond.rhs_val.str_val;
-    }
-    return key;
-}
-
-void add_required_col(std::vector<TabCol> *cols, const TabCol &col) {
-    if (col.col_name.empty()) {
+// 递归设置子树中的 ScanPlan 为 IndexScan
+void set_index_scan(std::shared_ptr<Plan> plan, const std::vector<std::string> &index_col_names) {
+    if (auto sp = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+        sp->tag = T_IndexScan;
+        sp->index_col_names_ = index_col_names;
         return;
     }
-    auto it = std::find_if(cols->begin(), cols->end(), [&](const TabCol &existing) {
-        return existing.tab_name == col.tab_name && existing.col_name == col.col_name;
-    });
-    if (it == cols->end()) {
-        cols->push_back(col);
+    if (auto fp = std::dynamic_pointer_cast<FilterPlan>(plan)) {
+        set_index_scan(fp->subplan_, index_col_names);
+        return;
+    }
+    if (auto pp = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+        set_index_scan(pp->subplan_, index_col_names);
+        return;
     }
 }
 
-void add_condition_required_cols(std::vector<TabCol> *cols, const std::vector<Condition> &conds) {
-    for (const auto &cond : conds) {
-        add_required_col(cols, cond.lhs_col);
-        if (!cond.is_rhs_val) {
-            add_required_col(cols, cond.rhs_col);
+// 为 JoinPlan 检测并标记 INLJ（右表有可用索引）
+void try_mark_inlj(SmManager *sm, std::shared_ptr<JoinPlan> jp,
+                   const std::vector<Condition> &join_conds) {
+    if (jp->conds_.empty() && join_conds.empty()) return;
+    const auto &conds = jp->conds_.empty() ? join_conds : jp->conds_;
+    // 收集右子树的所有表名
+    std::vector<std::string> right_tables;
+    auto collect = [](auto &&self, std::shared_ptr<Plan> plan, std::vector<std::string> &tabs) -> void {
+        if (auto sp = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+            tabs.push_back(sp->tab_name_);
+        } else if (auto fp = std::dynamic_pointer_cast<FilterPlan>(plan)) {
+            self(self, fp->subplan_, tabs);
+        } else if (auto pp = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+            self(self, pp->subplan_, tabs);
+        } else if (auto jp2 = std::dynamic_pointer_cast<JoinPlan>(plan)) {
+            self(self, jp2->left_, tabs);
+            self(self, jp2->right_, tabs);
+        }
+    };
+    collect(collect, jp->right_, right_tables);
+    for (auto &jc : conds) {
+        for (auto &rtab : right_tables) {
+            std::string inner_col;
+            if (jc.lhs_col.tab_name == rtab && !jc.is_rhs_val) {
+                inner_col = jc.lhs_col.col_name;
+            } else if (!jc.is_rhs_val && jc.rhs_col.tab_name == rtab) {
+                inner_col = jc.rhs_col.col_name;
+            }
+            if (!inner_col.empty()) {
+                std::vector<std::string> idx_names;
+                if (has_index_on_column(sm, rtab, inner_col, idx_names)) {
+                    jp->is_inlj_ = true;
+                    jp->inner_index_cols_ = idx_names;
+                    set_index_scan(jp->right_, idx_names);
+                    return;
+                }
+            }
         }
     }
 }
 
-bool is_simple_count_query(const std::shared_ptr<Query> &query) {
-    if (query == nullptr || !query->has_aggregate || query->has_group || !query->group_cols.empty() ||
-        !query->having_conds.empty() || query->select_items.size() != 1 || query->cols.size() != 1 ||
-        query->tables.size() != 1 || !query->order_cols.empty()) {
-        return false;
-    }
-    const auto &item = query->select_items[0];
-    return item != nullptr && item->is_agg && item->agg_type == ast::AGG_COUNT &&
-           (item->count_star || item->col != nullptr);
-}
-
-std::vector<TabCol> scan_required_cols_for_index_choice(const std::shared_ptr<Query> &query,
-                                                        const std::string &visible,
-                                                        const std::vector<Condition> &local_conds) {
-    std::vector<TabCol> required;
-    if (query == nullptr) {
-        return required;
-    }
-    if (query->has_aggregate || query->has_group) {
-        for (const auto &group_col : query->group_cols) {
-            add_required_col(&required, group_col);
-        }
-        for (const auto &item : query->select_items) {
-            if (item == nullptr) {
-                continue;
-            }
-            if (item->is_agg && !item->count_star && item->col != nullptr) {
-                add_required_col(&required, {item->col->tab_name, item->col->col_name});
-            } else if (!item->is_agg && item->col != nullptr) {
-                add_required_col(&required, {item->col->tab_name, item->col->col_name});
-            }
-        }
-        for (const auto &having : query->having_conds) {
-            if (having != nullptr && having->lhs != nullptr && !having->lhs->count_star &&
-                having->lhs->col != nullptr) {
-                add_required_col(&required, {having->lhs->col->tab_name, having->lhs->col->col_name});
-            }
-        }
-    } else {
-        for (const auto &col : query->cols) {
-            add_required_col(&required, col);
-        }
-    }
-    for (const auto &order_col : query->order_cols) {
-        add_required_col(&required, order_col.first);
-    }
-    add_condition_required_cols(&required, local_conds);
-    add_condition_required_cols(&required, query->conds);
-
-    std::vector<TabCol> visible_required;
-    for (const auto &col : required) {
-        if (col.tab_name == visible) {
-            add_required_col(&visible_required, col);
-        }
-    }
-    return visible_required;
-}
-
-void propagate_equal_join_value_filters(std::vector<std::shared_ptr<ast::BinaryExpr>> &conds) {
-    std::map<std::string, std::shared_ptr<ast::Col>> key_to_col;
-    std::map<std::string, std::vector<std::string>> graph;
-    for (const auto &cond : conds) {
-        auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
-        if (!rhs_col || cond->op != ast::SV_OP_EQ || cond->lhs->tab_name == rhs_col->tab_name) {
-            continue;
-        }
-        std::string lhs_key = ast_col_key(cond->lhs);
-        std::string rhs_key = ast_col_key(rhs_col);
-        key_to_col[lhs_key] = cond->lhs;
-        key_to_col[rhs_key] = rhs_col;
-        graph[lhs_key].push_back(rhs_key);
-        graph[rhs_key].push_back(lhs_key);
-    }
-
-    std::map<std::string, std::vector<std::shared_ptr<ast::Col>>> component_cols;
-    std::set<std::string> visited;
-    for (const auto &entry : key_to_col) {
-        if (!visited.insert(entry.first).second) {
-            continue;
-        }
-        std::vector<std::string> stack{entry.first};
-        std::vector<std::shared_ptr<ast::Col>> cols;
-        while (!stack.empty()) {
-            std::string current = stack.back();
-            stack.pop_back();
-            cols.push_back(key_to_col.at(current));
-            for (const auto &next : graph[current]) {
-                if (visited.insert(next).second) {
-                    stack.push_back(next);
-                }
-            }
-        }
-        for (const auto &col : cols) {
-            component_cols[ast_col_key(col)] = cols;
-        }
-    }
-
-    std::set<std::string> existing;
-    for (const auto &cond : conds) {
-        existing.insert(cond_to_string(cond));
-    }
-    std::vector<std::shared_ptr<ast::BinaryExpr>> additions;
-    for (const auto &cond : conds) {
-        if (!std::dynamic_pointer_cast<ast::Value>(cond->rhs)) {
-            continue;
-        }
-        auto comp_it = component_cols.find(ast_col_key(cond->lhs));
-        if (comp_it == component_cols.end()) {
-            continue;
-        }
-        for (const auto &target_col : comp_it->second) {
-            if (target_col->tab_name == cond->lhs->tab_name && target_col->col_name == cond->lhs->col_name) {
-                continue;
-            }
-            auto derived_lhs = std::make_shared<ast::Col>(target_col->tab_name, target_col->col_name);
-            auto derived = std::make_shared<ast::BinaryExpr>(derived_lhs, cond->op, cond->rhs);
-            if (existing.insert(cond_to_string(derived)).second) {
-                additions.push_back(std::move(derived));
-            }
-        }
-    }
-    conds.insert(conds.end(), additions.begin(), additions.end());
-}
-
-void propagate_equal_join_value_filters(std::vector<Condition> &conds) {
-    std::map<std::string, TabCol> key_to_col;
-    std::map<std::string, std::vector<std::string>> graph;
-    for (const auto &cond : conds) {
-        if (cond.is_rhs_val || cond.op != OP_EQ || cond.lhs_col.tab_name == cond.rhs_col.tab_name) {
-            continue;
-        }
-        std::string lhs_key = condition_col_key(cond.lhs_col);
-        std::string rhs_key = condition_col_key(cond.rhs_col);
-        key_to_col[lhs_key] = cond.lhs_col;
-        key_to_col[rhs_key] = cond.rhs_col;
-        graph[lhs_key].push_back(rhs_key);
-        graph[rhs_key].push_back(lhs_key);
-    }
-
-    std::map<std::string, std::vector<TabCol>> component_cols;
-    std::set<std::string> visited;
-    for (const auto &entry : key_to_col) {
-        if (!visited.insert(entry.first).second) {
-            continue;
-        }
-        std::vector<std::string> stack{entry.first};
-        std::vector<TabCol> cols;
-        while (!stack.empty()) {
-            std::string current = stack.back();
-            stack.pop_back();
-            cols.push_back(key_to_col.at(current));
-            for (const auto &next : graph[current]) {
-                if (visited.insert(next).second) {
-                    stack.push_back(next);
-                }
-            }
-        }
-        for (const auto &col : cols) {
-            component_cols[condition_col_key(col)] = cols;
-        }
-    }
-
-    std::set<std::string> existing;
-    for (const auto &cond : conds) {
-        existing.insert(condition_key(cond));
-    }
-    std::vector<Condition> additions;
-    for (const auto &cond : conds) {
-        if (!cond.is_rhs_val) {
-            continue;
-        }
-        auto comp_it = component_cols.find(condition_col_key(cond.lhs_col));
-        if (comp_it == component_cols.end()) {
-            continue;
-        }
-        for (const auto &target_col : comp_it->second) {
-            if (target_col.tab_name == cond.lhs_col.tab_name && target_col.col_name == cond.lhs_col.col_name) {
-                continue;
-            }
-            Condition derived = cond;
-            derived.lhs_col = target_col;
-            if (existing.insert(condition_key(derived)).second) {
-                additions.push_back(std::move(derived));
-            }
-        }
-    }
-    conds.insert(conds.end(), additions.begin(), additions.end());
-}
-
-std::string table_filter_string(const std::vector<std::shared_ptr<ast::BinaryExpr>> &conds, const std::string &visible) {
-    std::vector<std::string> filters;
-    for (auto &cond : conds) {
-        auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
-        if (cond->lhs->tab_name == visible &&
-            (std::dynamic_pointer_cast<ast::Value>(cond->rhs) || (rhs_col && rhs_col->tab_name == visible))) {
-            filters.push_back(cond_to_string(cond));
-        }
-    }
-    std::sort(filters.begin(), filters.end());
-    std::string out;
-    for (size_t i = 0; i < filters.size(); ++i) {
-        if (i != 0) {
-            out += ", ";
-        }
-        out += filters[i];
-    }
-    return out;
-}
-
-std::vector<std::string> make_explain_lines(const std::shared_ptr<ast::SelectStmt> &select, SmManager *sm_manager) {
-    std::map<std::string, std::string> alias_to_table;
-    std::vector<std::string> input_visible;
-    std::vector<std::string> input_tables;
-    for (auto &ref : select->table_refs) {
-        alias_to_table[ref->visible_name()] = ref->tab_name;
-        input_visible.push_back(ref->visible_name());
-        input_tables.push_back(ref->tab_name);
-    }
-    if (input_visible.size() == 1) {
-        const std::string &default_alias = input_visible.front();
-        for (auto &item : select->select_items) {
-            if (item->col && item->col->tab_name.empty()) {
-                item->col->tab_name = default_alias;
-            }
-        }
-        for (auto &cond : select->conds) {
-            if (cond->lhs->tab_name.empty()) {
-                cond->lhs->tab_name = default_alias;
-            }
-            if (auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs)) {
-                if (rhs_col->tab_name.empty()) {
-                    rhs_col->tab_name = default_alias;
-                }
-            }
-        }
-    }
-    auto explain_conds = select->conds;
-    propagate_equal_join_value_filters(explain_conds);
-
-    auto table_rows = [&](const std::string &alias) {
-        int rows = 0;
-        auto fh = sm_manager->fhs_.at(alias_to_table[alias]).get();
-        for (RmScan scan(fh); !scan.is_end(); scan.next()) {
-            rows++;
-        }
-        return rows;
-    };
-
-    auto table_has_join_index = [&](const std::string &alias, const std::shared_ptr<ast::BinaryExpr> &cond) {
-        std::vector<std::string> cols;
-        auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
-        if (cond->lhs->tab_name == alias) {
-            cols.push_back(cond->lhs->col_name);
-        } else if (rhs_col && rhs_col->tab_name == alias) {
-            cols.push_back(rhs_col->col_name);
-        }
-        if (cols.empty()) {
-            return false;
-        }
-        auto &tab = sm_manager->db_.get_table(alias_to_table[alias]);
-        return tab.is_index(cols, true);
-    };
-
-    auto read_col = [&](const std::string &alias, const Rid &rid, const std::string &col_name) {
-        auto &tab = sm_manager->db_.get_table(alias_to_table[alias]);
-        auto col = tab.get_col(col_name);
-        auto rec = sm_manager->fhs_.at(alias_to_table[alias])->get_record(rid, nullptr);
-        std::string raw(rec->data + col->offset, col->len);
-        return std::pair<ColMeta, std::string>(*col, raw);
-    };
-
-    auto compare_raw = [&](const ColMeta &lhs_col, const std::string &lhs_raw,
-                           const ColMeta &rhs_col, const std::string &rhs_raw,
-                           ast::SvCompOp op) {
-        int cmp = 0;
-        if (lhs_col.type == TYPE_FLOAT || rhs_col.type == TYPE_FLOAT) {
-            float lhs = lhs_col.type == TYPE_FLOAT ? *reinterpret_cast<const float *>(lhs_raw.data())
-                                                   : static_cast<float>(*reinterpret_cast<const int *>(lhs_raw.data()));
-            float rhs = rhs_col.type == TYPE_FLOAT ? *reinterpret_cast<const float *>(rhs_raw.data())
-                                                   : static_cast<float>(*reinterpret_cast<const int *>(rhs_raw.data()));
-            cmp = (lhs > rhs) - (lhs < rhs);
-        } else if (lhs_col.type == TYPE_INT) {
-            int lhs = *reinterpret_cast<const int *>(lhs_raw.data());
-            int rhs = *reinterpret_cast<const int *>(rhs_raw.data());
-            cmp = (lhs > rhs) - (lhs < rhs);
-        } else {
-            std::string lhs = lhs_raw;
-            std::string rhs = rhs_raw;
-            lhs.resize(strlen(lhs.c_str()));
-            rhs.resize(strlen(rhs.c_str()));
-            cmp = lhs.compare(rhs);
-        }
-        switch (op) {
-            case ast::SV_OP_EQ: return cmp == 0;
-            case ast::SV_OP_NE: return cmp != 0;
-            case ast::SV_OP_LT: return cmp < 0;
-            case ast::SV_OP_GT: return cmp > 0;
-            case ast::SV_OP_LE: return cmp <= 0;
-            case ast::SV_OP_GE: return cmp >= 0;
-        }
-        return false;
-    };
-
-    auto compare_value_cond = [&](const std::string &alias, const Rid &rid,
-                                  const std::shared_ptr<ast::BinaryExpr> &cond) {
-        auto [lhs_col, lhs_raw] = read_col(alias, rid, cond->lhs->col_name);
-        ColMeta rhs_col = lhs_col;
-        std::string rhs_raw(lhs_col.len, '\0');
-        if (auto int_lit = std::dynamic_pointer_cast<ast::IntLit>(cond->rhs)) {
-            int value = int_lit->val;
-            if (lhs_col.type == TYPE_FLOAT) {
-                float f = static_cast<float>(value);
-                memcpy(rhs_raw.data(), &f, sizeof(float));
-                rhs_col.type = TYPE_FLOAT;
-                rhs_col.len = sizeof(float);
-            } else {
-                memcpy(rhs_raw.data(), &value, sizeof(int));
-                rhs_col.type = TYPE_INT;
-                rhs_col.len = sizeof(int);
-            }
-        } else if (auto float_lit = std::dynamic_pointer_cast<ast::FloatLit>(cond->rhs)) {
-            float value = float_lit->val;
-            memcpy(rhs_raw.data(), &value, sizeof(float));
-            rhs_col.type = TYPE_FLOAT;
-            rhs_col.len = sizeof(float);
-        } else if (auto str_lit = std::dynamic_pointer_cast<ast::StringLit>(cond->rhs)) {
-            rhs_raw.assign(lhs_col.len, '\0');
-            memcpy(rhs_raw.data(), str_lit->val.c_str(), std::min<int>(lhs_col.len, str_lit->val.size()));
-            rhs_col.type = TYPE_STRING;
-        }
-        return compare_raw(lhs_col, lhs_raw, rhs_col, rhs_raw, cond->op);
-    };
-
-    std::map<std::string, std::vector<std::shared_ptr<ast::BinaryExpr>>> local_conds;
-    std::vector<std::shared_ptr<ast::BinaryExpr>> join_conds;
-    for (auto &cond : explain_conds) {
-        auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
-        if (rhs_col && rhs_col->tab_name != cond->lhs->tab_name) {
-            join_conds.push_back(cond);
-        } else {
-            local_conds[cond->lhs->tab_name].push_back(cond);
-        }
-    }
-    auto compare_filter_cond = [&](const std::string &alias, const Rid &rid,
-                                   const std::shared_ptr<ast::BinaryExpr> &cond) {
-        if (std::dynamic_pointer_cast<ast::Value>(cond->rhs)) {
-            return compare_value_cond(alias, rid, cond);
-        }
-        auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
-        auto [lhs_col, lhs_raw] = read_col(alias, rid, cond->lhs->col_name);
-        auto [rhs_meta, rhs_raw] = read_col(alias, rid, rhs_col->col_name);
-        return compare_raw(lhs_col, lhs_raw, rhs_meta, rhs_raw, cond->op);
-    };
-
-    auto filtered_rows = [&](const std::string &alias) {
-        int rows = 0;
-        auto fh = sm_manager->fhs_.at(alias_to_table[alias]).get();
-        for (RmScan scan(fh); !scan.is_end(); scan.next()) {
-            bool pass = true;
-            for (auto &cond : local_conds[alias]) {
-                if (!compare_filter_cond(alias, scan.rid(), cond)) {
-                    pass = false;
-                    break;
-                }
-            }
-            if (pass) {
-                rows++;
-            }
-        }
-        return rows;
-    };
-
-    auto join_count = [&](const std::set<std::string> &aliases) {
-        std::vector<std::string> order;
-        for (auto &alias : input_visible) {
-            if (aliases.count(alias)) {
-                order.push_back(alias);
-            }
-        }
-        std::map<std::string, Rid> current;
-        int rows = 0;
-        std::function<void(size_t)> dfs = [&](size_t idx) {
-            if (idx == order.size()) {
-                for (auto &cond : explain_conds) {
-                    auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
-                    if (rhs_col) {
-                        if (!aliases.count(cond->lhs->tab_name) || !aliases.count(rhs_col->tab_name)) {
-                            continue;
-                        }
-                        auto [lhs_col, lhs_raw] = read_col(cond->lhs->tab_name, current[cond->lhs->tab_name],
-                                                           cond->lhs->col_name);
-                        auto [rhs_meta, rhs_raw] = read_col(rhs_col->tab_name, current[rhs_col->tab_name],
-                                                            rhs_col->col_name);
-                        if (!compare_raw(lhs_col, lhs_raw, rhs_meta, rhs_raw, cond->op)) {
-                            return;
-                        }
-                    } else if (aliases.count(cond->lhs->tab_name) &&
-                               !compare_filter_cond(cond->lhs->tab_name, current[cond->lhs->tab_name], cond)) {
-                        return;
-                    }
-                }
-                rows++;
-                return;
-            }
-            auto &alias = order[idx];
-            auto fh = sm_manager->fhs_.at(alias_to_table[alias]).get();
-            for (RmScan scan(fh); !scan.is_end(); scan.next()) {
-                current[alias] = scan.rid();
-                dfs(idx + 1);
-            }
-        };
-        dfs(0);
-        return rows;
-    };
-
-    auto prefix_records = [&](const std::set<std::string> &aliases) {
-        std::vector<std::string> order;
-        for (auto &alias : input_visible) {
-            if (aliases.count(alias)) {
-                order.push_back(alias);
-            }
-        }
-        std::vector<std::map<std::string, Rid>> records;
-        std::map<std::string, Rid> current;
-        std::function<void(size_t)> dfs = [&](size_t idx) {
-            if (idx == order.size()) {
-                for (auto &cond : explain_conds) {
-                    auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
-                    if (rhs_col) {
-                        if (!aliases.count(cond->lhs->tab_name) || !aliases.count(rhs_col->tab_name)) {
-                            continue;
-                        }
-                        auto [lhs_col, lhs_raw] = read_col(cond->lhs->tab_name, current[cond->lhs->tab_name],
-                                                           cond->lhs->col_name);
-                        auto [rhs_meta, rhs_raw] = read_col(rhs_col->tab_name, current[rhs_col->tab_name],
-                                                            rhs_col->col_name);
-                        if (!compare_raw(lhs_col, lhs_raw, rhs_meta, rhs_raw, cond->op)) {
-                            return;
-                        }
-                    } else if (aliases.count(cond->lhs->tab_name) &&
-                               !compare_filter_cond(cond->lhs->tab_name, current[cond->lhs->tab_name], cond)) {
-                        return;
-                    }
-                }
-                records.push_back(current);
-                return;
-            }
-            auto &alias = order[idx];
-            auto fh = sm_manager->fhs_.at(alias_to_table[alias]).get();
-            for (RmScan scan(fh); !scan.is_end(); scan.next()) {
-                current[alias] = scan.rid();
-                dfs(idx + 1);
-            }
-        };
-        dfs(0);
-        return records;
-    };
-
-    auto find_index_cond = [&](const std::string &right_alias,
-                               const std::vector<std::shared_ptr<ast::BinaryExpr>> &conds)
-        -> std::shared_ptr<ast::BinaryExpr> {
-        for (auto &cond : conds) {
-            if (cond->op == ast::SV_OP_EQ && table_has_join_index(right_alias, cond)) {
-                return cond;
-            }
-        }
-        return nullptr;
-    };
-
-    auto index_hit_count = [&](const std::set<std::string> &outer_aliases, const std::string &right_alias,
-                               const std::shared_ptr<ast::BinaryExpr> &index_cond) {
-        if (index_cond == nullptr) {
-            return 0;
-        }
-        auto rhs_col = std::dynamic_pointer_cast<ast::Col>(index_cond->rhs);
-        std::shared_ptr<ast::Col> right_col;
-        std::shared_ptr<ast::Col> outer_col;
-        if (index_cond->lhs->tab_name == right_alias && rhs_col && outer_aliases.count(rhs_col->tab_name)) {
-            right_col = index_cond->lhs;
-            outer_col = rhs_col;
-        } else if (rhs_col && rhs_col->tab_name == right_alias && outer_aliases.count(index_cond->lhs->tab_name)) {
-            right_col = rhs_col;
-            outer_col = index_cond->lhs;
-        } else {
-            return 0;
-        }
-
-        int rows = 0;
-        auto prefixes = prefix_records(outer_aliases);
-        auto right_fh = sm_manager->fhs_.at(alias_to_table[right_alias]).get();
-        for (auto &prefix : prefixes) {
-            auto [outer_meta, outer_raw] = read_col(outer_col->tab_name, prefix[outer_col->tab_name], outer_col->col_name);
-            for (RmScan scan(right_fh); !scan.is_end(); scan.next()) {
-                auto [right_meta, right_raw] = read_col(right_alias, scan.rid(), right_col->col_name);
-                if (!compare_raw(right_meta, right_raw, outer_meta, outer_raw, ast::SV_OP_EQ)) {
-                    continue;
-                }
-                bool pass_local = true;
-                for (auto &cond : local_conds[right_alias]) {
-                    if (!compare_filter_cond(right_alias, scan.rid(), cond)) {
-                        pass_local = false;
-                        break;
-                    }
-                }
-                if (pass_local) {
-                    rows++;
-                }
-            }
-        }
-        return rows;
-    };
-
-    std::vector<std::string> lines;
-    std::set<std::string> all_aliases(input_visible.begin(), input_visible.end());
-    int final_rows = input_visible.empty() ? 0 : join_count(all_aliases);
-    int project_rows = select->has_limit && select->limit >= 0 ? std::min(final_rows, select->limit) : final_rows;
-    if (select->select_items.empty()) {
-        lines.push_back("Project(columns=[*], rows=" + std::to_string(project_rows) + ")");
-    } else {
-        std::vector<std::string> cols;
-        for (auto &item : select->select_items) {
-            if (!item->is_agg && item->col) {
-                cols.push_back(col_to_string(item->col));
-            }
-        }
-        lines.push_back("Project(columns=[" + project_columns_string(cols) + "], rows=" + std::to_string(project_rows) + ")");
-    }
-
-    std::set<std::string> joined_aliases;
-    std::map<std::string, int> leaf_multiplier;
-    std::map<std::string, int> leaf_output_rows;
-    std::map<std::string, std::shared_ptr<ast::BinaryExpr>> leaf_index_cond;
-    std::map<std::string, bool> leaf_index;
-    std::map<std::string, int> leaf_depth;
-    std::vector<std::string> leaf_order;
-    std::vector<std::string> join_lines;
-    if (!join_conds.empty()) {
-        struct JoinStep {
-            std::set<std::string> aliases;
-            std::vector<std::shared_ptr<ast::BinaryExpr>> conds;
-        };
-        std::vector<JoinStep> join_steps;
-
-        int table_count = static_cast<int>(input_visible.size());
-        if (!input_visible.empty()) {
-            const std::string &first_alias = input_visible.front();
-            leaf_multiplier[first_alias] = 1;
-            leaf_output_rows[first_alias] = filtered_rows(first_alias);
-            leaf_index[first_alias] = false;
-            leaf_depth[first_alias] = table_count;
-            leaf_order.push_back(first_alias);
-            joined_aliases.insert(first_alias);
-        }
-
-        for (size_t i = 1; i < input_visible.size(); ++i) {
-            const std::string &right_alias = input_visible[i];
-            std::vector<std::shared_ptr<ast::BinaryExpr>> step_conds;
-            for (auto &cond : join_conds) {
-                auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
-                if (!rhs_col) {
-                    continue;
-                }
-                bool lhs_right = cond->lhs->tab_name == right_alias && joined_aliases.count(rhs_col->tab_name);
-                bool rhs_right = rhs_col->tab_name == right_alias && joined_aliases.count(cond->lhs->tab_name);
-                if (lhs_right || rhs_right) {
-                    step_conds.push_back(cond);
-                }
-            }
-            int prefix_rows = join_count(joined_aliases);
-            leaf_multiplier[right_alias] = prefix_rows;
-            leaf_index_cond[right_alias] = find_index_cond(right_alias, step_conds);
-            leaf_index[right_alias] = leaf_index_cond[right_alias] != nullptr;
-            leaf_depth[right_alias] = table_count - static_cast<int>(i) + 1;
-            if (leaf_index[right_alias]) {
-                leaf_output_rows[right_alias] = index_hit_count(joined_aliases, right_alias, leaf_index_cond[right_alias]);
-            } else {
-                leaf_output_rows[right_alias] = filtered_rows(right_alias) * prefix_rows;
-            }
-            leaf_order.push_back(right_alias);
-            joined_aliases.insert(right_alias);
-            if (!step_conds.empty()) {
-                join_steps.push_back({joined_aliases, step_conds});
-            }
-        }
-        for (auto &step : join_steps) {
-            std::set<std::string> joined_tables;
-            for (auto &alias : step.aliases) {
-                joined_tables.insert(alias_to_table[alias]);
-            }
-            std::vector<std::string> conds;
-            for (auto &cond : step.conds) {
-                conds.push_back(cond_to_string(cond));
-            }
-            std::sort(conds.begin(), conds.end());
-            int join_rows = join_count(step.aliases);
-            join_lines.push_back("Join(tables=[" + join_tables_string(joined_tables) + "], condition=[" +
-                                 project_columns_string(conds) + "], rows=" + std::to_string(join_rows) + ")");
-        }
-        for (int i = static_cast<int>(join_lines.size()) - 1; i >= 0; --i) {
-            int depth = static_cast<int>(join_lines.size()) - i;
-            lines.push_back(std::string(depth, '\t') + join_lines[i]);
-        }
-    }
-
-    bool has_filters = false;
-    for (auto &visible : input_visible) {
-        has_filters = has_filters || table_has_filter(explain_conds, visible);
-    }
-    if (join_conds.empty() && has_filters) {
-        std::sort(leaf_order.begin(), leaf_order.end(), [&](const std::string &lhs, const std::string &rhs) {
-            return alias_to_table[lhs] < alias_to_table[rhs];
-        });
-    }
-    for (auto &visible : input_visible) {
-        if (std::find(leaf_order.begin(), leaf_order.end(), visible) == leaf_order.end()) {
-            leaf_order.push_back(visible);
-        }
-    }
-
-    for (auto &visible : leaf_order) {
-        std::vector<std::string> projected;
-        if (!select->select_items.empty()) {
-            for (auto &item : select->select_items) {
-                if (!item->is_agg && item->col && item->col->tab_name == visible) {
-                    projected.push_back(col_to_string(item->col));
-                }
-            }
-            for (auto &cond : join_conds) {
-                auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
-                if (cond->lhs->tab_name == visible) {
-                    projected.push_back(col_to_string(cond->lhs));
-                }
-                if (rhs_col->tab_name == visible) {
-                    projected.push_back(col_to_string(rhs_col));
-                }
-            }
-            std::sort(projected.begin(), projected.end());
-            projected.erase(std::unique(projected.begin(), projected.end()), projected.end());
-            if (!projected.empty() && !join_conds.empty()) {
-                int base_rows = leaf_output_rows.count(visible) ? leaf_output_rows[visible] : filtered_rows(visible);
-                lines.push_back(std::string(leaf_depth[visible], '\t') + "Project(columns=[" +
-                                project_columns_string(projected) + "], rows=" + std::to_string(base_rows) + ")");
-            }
-        }
-        std::string filter = table_filter_string(explain_conds, visible);
-        if (!filter.empty()) {
-            int filter_rows = filtered_rows(visible) * (join_conds.empty() ? 1 : leaf_multiplier[visible]);
-            int filter_depth = join_conds.empty() ? 1 : leaf_depth[visible] + (projected.empty() ? 0 : 1);
-            lines.push_back(std::string(filter_depth, '\t') + "Filter(condition=[" + filter +
-                            "], rows=" + std::to_string(filter_rows) + ")");
-        }
-        int scan_rows = leaf_index[visible] ? leaf_output_rows[visible]
-                                            : table_rows(visible) * (join_conds.empty() ? 1 : leaf_multiplier[visible]);
-        std::string scan = "Scan(table=" + alias_to_table[visible] + ", type=" +
-                           (leaf_index[visible] ? "IndexScan" : "SeqScan");
-        if (leaf_index[visible]) {
-            auto index_cond = leaf_index_cond[visible];
-            auto rhs_col = std::dynamic_pointer_cast<ast::Col>(index_cond->rhs);
-            if (index_cond->lhs->tab_name == visible) {
-                scan += ", using_index=(" + index_cond->lhs->col_name + ")";
-            } else if (rhs_col && rhs_col->tab_name == visible) {
-                scan += ", using_index=(" + rhs_col->col_name + ")";
-            }
-        }
-        scan += ", rows=" + std::to_string(scan_rows) + ")";
-        int scan_depth = 0;
-        if (join_conds.empty()) {
-            scan_depth = filter.empty() ? 1 : 2;
-        } else {
-            scan_depth = leaf_depth[visible] + (projected.empty() ? 0 : 1) + (filter.empty() ? 0 : 1);
-        }
-        lines.push_back(std::string(scan_depth, '\t') + scan);
-    }
-    return lines;
-}
-}
-
-bool Planner::get_index_cols(std::string tab_name, std::string visible_name, std::vector<Condition> curr_conds,
-                             std::vector<std::string>& index_col_names,
-                             const std::vector<TabCol> &required_cols,
-                             bool allow_covering_full_scan) {
+// 目前的索引匹配规则为：完全匹配索引字段，且全部为单点查询，不会自动调整where条件的顺序
+bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_conds, std::vector<std::string>& index_col_names) {
     index_col_names.clear();
     TabMeta& tab = sm_manager_->db_.get_table(tab_name);
-    size_t best_matched_prefix = 0;
-    size_t best_equality_prefix = 0;
-    int best_priority = -1;
-    bool best_covering = false;
-    bool best_unique_point = false;
-    bool best_has_access_predicate = false;
-    std::vector<std::string> best_index_cols;
-    for (auto &index : tab.indexes) {
-        size_t matched_prefix = 0;
-        size_t equality_prefix = 0;
-        for (auto &index_col : index.cols) {
-            auto cond_it = std::find_if(curr_conds.begin(), curr_conds.end(), [&](const Condition &cond) {
-                return cond.is_rhs_val && cond.lhs_col.tab_name == visible_name &&
-                       cond.lhs_col.col_name == index_col.name && cond.op != OP_NE;
-            });
-            if (cond_it == curr_conds.end()) {
+
+    // 按每个索引的列顺序从左到右匹配条件，支持 EQ/GT/LT/GE/LE
+    for(auto& index : tab.indexes) {
+        std::vector<std::string> matched;
+        for(auto& idx_col : index.cols) {
+            bool found = false;
+            CompOp matched_op = OP_EQ;
+            for(auto& cond : curr_conds) {
+                if(!cond.is_rhs_val) continue;
+                if(cond.lhs_col.tab_name != tab_name) continue;
+                if(cond.lhs_col.col_name != idx_col.name) continue;
+                matched.push_back(idx_col.name);
+                matched_op = cond.op;
+                found = true;
                 break;
             }
-            matched_prefix++;
-            if (cond_it->op != OP_EQ) {
-                break;
+            if(!found) break;           // 前缀中断，此索引不能使用
+            if(matched_op != OP_EQ) break;  // 范围条件终止前缀（后续列不参与边界）
+        }
+        if(!matched.empty()) {
+            // 返回完整索引列名
+            for(auto& col : index.cols) {
+                index_col_names.push_back(col.name);
             }
-            equality_prefix++;
-        }
-        bool covering = (!required_cols.empty() || allow_covering_full_scan) &&
-                        rmdb::index_covers_required_and_conditions(index, required_cols, curr_conds, visible_name);
-        if (matched_prefix == 0 && !(allow_covering_full_scan && covering)) {
-            continue;
-        }
-        bool unique_point = index.unique && equality_prefix == static_cast<size_t>(index.col_num);
-        bool has_access_predicate = matched_prefix > 0;
-        int priority = (index.hidden ? 0 : 2) + (index.unique ? 1 : 0);
-        bool better = best_index_cols.empty();
-        if (!better && unique_point != best_unique_point) {
-            better = unique_point;
-        } else if (!better && unique_point && best_unique_point && equality_prefix != best_equality_prefix) {
-            better = equality_prefix > best_equality_prefix;
-        } else if (!better && !unique_point && !best_unique_point &&
-                   has_access_predicate != best_has_access_predicate) {
-            better = has_access_predicate;
-        } else if (!better && covering != best_covering) {
-            better = covering;
-        } else if (!better && equality_prefix != best_equality_prefix) {
-            better = equality_prefix > best_equality_prefix;
-        } else if (!better && matched_prefix != best_matched_prefix) {
-            better = matched_prefix > best_matched_prefix;
-        } else if (!better) {
-            better = priority > best_priority;
-        }
-        if (better) {
-            best_matched_prefix = matched_prefix;
-            best_equality_prefix = equality_prefix;
-            best_priority = priority;
-            best_covering = covering;
-            best_unique_point = unique_point;
-            best_has_access_predicate = has_access_predicate;
-            best_index_cols.clear();
-            for (auto &col : index.cols) {
-                best_index_cols.push_back(col.name);
-            }
+            return true;
         }
     }
-    if (best_index_cols.empty()) {
-        return false;
-    }
-    index_col_names = std::move(best_index_cols);
-    return true;
+    return false;
 }
 
 /**
@@ -914,13 +136,17 @@ bool Planner::get_index_cols(std::string tab_name, std::string visible_name, std
  * @return std::vector<Condition>
  */
 std::vector<Condition> pop_conds(std::vector<Condition> &conds, std::string tab_names) {
-    // auto has_tab = [&](const std::string &tab_name) {
-    //     return std::find(tab_names.begin(), tab_names.end(), tab_name) != tab_names.end();
-    // };
     std::vector<Condition> solved_conds;
     auto it = conds.begin();
     while (it != conds.end()) {
-        if ((tab_names.compare(it->lhs_col.tab_name) == 0 && it->is_rhs_val) || (it->lhs_col.tab_name.compare(it->rhs_col.tab_name) == 0)) {
+        bool match_tab = (tab_names.compare(it->lhs_col.tab_name) == 0 && it->is_rhs_val);
+        bool same_table = (it->lhs_col.tab_name.compare(it->rhs_col.tab_name) == 0);
+        // 自连接检测：同一表名但不同别名 → 保留为连接条件
+        bool self_join = same_table && !it->is_rhs_val &&
+            !it->lhs_col.display_tab_name.empty() &&
+            !it->rhs_col.display_tab_name.empty() &&
+            it->lhs_col.display_tab_name != it->rhs_col.display_tab_name;
+        if (!self_join && (match_tab || same_table)) {
             solved_conds.emplace_back(std::move(*it));
             it = conds.erase(it);
         } else {
@@ -930,17 +156,68 @@ std::vector<Condition> pop_conds(std::vector<Condition> &conds, std::string tab_
     return solved_conds;
 }
 
+std::string first_scan_table(std::shared_ptr<Plan> plan) {
+    if (auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+        return x->tab_name_;
+    }
+    if (auto x = std::dynamic_pointer_cast<FilterPlan>(plan)) {
+        return first_scan_table(x->subplan_);
+    }
+    if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+        return first_scan_table(x->subplan_);
+    }
+    return "";
+}
+
+void add_needed_col(const TabCol &col, const std::string &table, std::vector<TabCol> &needed) {
+    if (col.tab_name != table) return;
+    if (std::find_if(needed.begin(), needed.end(), [&](const TabCol &c) {
+            return c.tab_name == col.tab_name && c.col_name == col.col_name;
+        }) == needed.end()) {
+        needed.push_back(col);
+    }
+}
+
+std::shared_ptr<Plan> maybe_push_projection(std::shared_ptr<Plan> plan, const std::string &table,
+                                            const std::vector<Condition> &conds,
+                                            const std::vector<TabCol> &sel_cols,
+                                            bool is_select_star) {
+    // SELECT * 不需要投影下推 (所有列都需要)
+    if (sel_cols.empty() || is_select_star) {
+        return plan;
+    }
+    std::vector<TabCol> needed;
+    for (auto &col : sel_cols) {
+        add_needed_col(col, table, needed);
+    }
+    for (auto &cond : conds) {
+        add_needed_col(cond.lhs_col, table, needed);
+        if (!cond.is_rhs_val) {
+            add_needed_col(cond.rhs_col, table, needed);
+        }
+    }
+    if (needed.empty()) {
+        return plan;
+    }
+    std::sort(needed.begin(), needed.end());
+    return std::make_shared<ProjectionPlan>(T_Projection, plan, needed);
+}
+
 int push_conds(Condition *cond, std::shared_ptr<Plan> plan)
 {
     if(auto x = std::dynamic_pointer_cast<ScanPlan>(plan))
     {
-        if(x->visible_name_.compare(cond->lhs_col.tab_name) == 0) {
+        if(x->tab_name_.compare(cond->lhs_col.tab_name) == 0) {
             return 1;
-        } else if(x->visible_name_.compare(cond->rhs_col.tab_name) == 0){
+        } else if(x->tab_name_.compare(cond->rhs_col.tab_name) == 0){
             return 2;
         } else {
             return 0;
         }
+    }
+    else if(auto x = std::dynamic_pointer_cast<FilterPlan>(plan))
+    {
+        return push_conds(cond, x->subplan_);
     }
     else if(auto x = std::dynamic_pointer_cast<JoinPlan>(plan))
     {
@@ -977,124 +254,15 @@ std::shared_ptr<Plan> pop_scan(int *scantbl, std::string table, std::vector<std:
                 std::vector<std::shared_ptr<Plan>> plans)
 {
     for (size_t i = 0; i < plans.size(); i++) {
-        auto x = std::dynamic_pointer_cast<ScanPlan>(plans[i]);
-        if(x->visible_name_.compare(table) == 0)
+        auto tab_name = first_scan_table(plans[i]);
+        if(tab_name.compare(table) == 0)
         {
             scantbl[i] = 1;
-            joined_tables.emplace_back(x->tab_name_);
+            joined_tables.emplace_back(tab_name);
             return plans[i];
         }
     }
     return nullptr;
-}
-
-std::vector<std::string> get_join_index_cols(SmManager *sm_manager, const std::string &right_table,
-                                             const std::string &right_visible,
-                                             const std::vector<Condition> &join_conds) {
-    auto &tab = sm_manager->db_.get_table(right_table);
-    size_t best_prefix = 0;
-    int best_priority = -1;
-    std::vector<std::string> best_cols;
-    for (const auto &index : tab.indexes) {
-        size_t prefix = 0;
-        for (const auto &index_col : index.cols) {
-            auto cond_it = std::find_if(join_conds.begin(), join_conds.end(), [&](const Condition &cond) {
-                if (cond.is_rhs_val || cond.op != OP_EQ) {
-                    return false;
-                }
-                return (cond.rhs_col.tab_name == right_visible && cond.rhs_col.col_name == index_col.name) ||
-                       (cond.lhs_col.tab_name == right_visible && cond.lhs_col.col_name == index_col.name);
-            });
-            if (cond_it == join_conds.end()) {
-                break;
-            }
-            prefix++;
-        }
-        int priority = (index.hidden ? 0 : 2) + (index.unique ? 1 : 0);
-        if (prefix > best_prefix || (prefix == best_prefix && prefix > 0 && priority > best_priority)) {
-            best_prefix = prefix;
-            best_priority = priority;
-            best_cols.clear();
-            for (const auto &col : index.cols) {
-                best_cols.push_back(col.name);
-            }
-        }
-    }
-    return best_prefix == 0 ? std::vector<std::string>{} : best_cols;
-}
-
-bool find_plan_col(const std::shared_ptr<Plan> &plan, const TabCol &target, ColMeta *out) {
-    if (plan == nullptr) {
-        return false;
-    }
-    if (auto scan = std::dynamic_pointer_cast<ScanPlan>(plan)) {
-        for (const auto &col : scan->cols_) {
-            if (col.tab_name == target.tab_name && col.name == target.col_name) {
-                *out = col;
-                return true;
-            }
-        }
-        return false;
-    }
-    if (auto join = std::dynamic_pointer_cast<JoinPlan>(plan)) {
-        return find_plan_col(join->left_, target, out) || find_plan_col(join->right_, target, out);
-    }
-    if (auto projection = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
-        return find_plan_col(projection->subplan_, target, out);
-    }
-    return false;
-}
-
-bool has_hash_join_key(const std::shared_ptr<Plan> &left, const std::shared_ptr<Plan> &right,
-                       const std::vector<Condition> &join_conds) {
-    for (const auto &cond : join_conds) {
-        if (cond.is_rhs_val || cond.op != OP_EQ) {
-            continue;
-        }
-        ColMeta left_col;
-        ColMeta right_col;
-        bool lhs_left = find_plan_col(left, cond.lhs_col, &left_col);
-        bool rhs_right = find_plan_col(right, cond.rhs_col, &right_col);
-        if (!lhs_left || !rhs_right) {
-            bool rhs_left = find_plan_col(left, cond.rhs_col, &left_col);
-            bool lhs_right = find_plan_col(right, cond.lhs_col, &right_col);
-            if (!rhs_left || !lhs_right) {
-                continue;
-            }
-        }
-        if (left_col.type == right_col.type && left_col.len == right_col.len) {
-            return true;
-        }
-    }
-    return false;
-}
-
-enum class JoinAlgoPreference {
-    kAuto,
-    kNested,
-    kHash,
-    kMerge,
-};
-
-JoinAlgoPreference join_algo_preference() {
-    const char *value = std::getenv("RMDB_JOIN_ALGO");
-    if (value == nullptr) {
-        return JoinAlgoPreference::kAuto;
-    }
-    std::string mode(value);
-    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-    if (mode == "nested" || mode == "nlj") {
-        return JoinAlgoPreference::kNested;
-    }
-    if (mode == "hash") {
-        return JoinAlgoPreference::kHash;
-    }
-    if (mode == "merge" || mode == "sortmerge" || mode == "sort-merge" || mode == "smj") {
-        return JoinAlgoPreference::kMerge;
-    }
-    return JoinAlgoPreference::kAuto;
 }
 
 
@@ -1122,85 +290,202 @@ std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> quer
 
 std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
 {
+    auto x = std::dynamic_pointer_cast<ast::SelectStmt>(query->parse);
     std::vector<std::string> tables = query->tables;
-    auto base_table = [&](const std::string &visible) -> const std::string & {
-        auto it = query->alias_to_table.find(visible);
-        return it == query->alias_to_table.end() ? visible : it->second;
-    };
-    propagate_equal_join_value_filters(query->conds);
+    std::vector<Condition> all_conds = query->conds;
     // // Scan table , 生成表算子列表tab_nodes
     std::vector<std::shared_ptr<Plan>> table_scan_executors(tables.size());
     for (size_t i = 0; i < tables.size(); i++) {
         auto curr_conds = pop_conds(query->conds, tables[i]);
         // int index_no = get_indexNo(tables[i], curr_conds);
         std::vector<std::string> index_col_names;
-        const std::string &base = base_table(tables[i]);
-        auto required_cols = scan_required_cols_for_index_choice(query, tables[i], curr_conds);
-        bool index_exist = get_index_cols(base, tables[i], curr_conds, index_col_names, required_cols,
-                                          is_simple_count_query(query));
+        bool index_exist = get_index_cols(tables[i], curr_conds, index_col_names);
+        std::shared_ptr<Plan> scan;
         if (index_exist == false) {  // 该表没有索引
             index_col_names.clear();
-            table_scan_executors[i] = 
-                std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, base, curr_conds, index_col_names, tables[i]);
+            scan = std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, tables[i], curr_conds, index_col_names);
         } else {  // 存在索引
-            table_scan_executors[i] =
-                std::make_shared<ScanPlan>(T_IndexScan, sm_manager_, base, curr_conds, index_col_names, tables[i]);
+            scan = std::make_shared<ScanPlan>(T_IndexScan, sm_manager_, tables[i], curr_conds, index_col_names);
+        }
+        if (query->is_explain_analyze && !curr_conds.empty()) {
+            // 独立树结构：条件移入 FilterPlan，ScanPlan 不再持有
+            if (auto sp = std::dynamic_pointer_cast<ScanPlan>(scan)) {
+                sp->conds_.clear();
+                sp->fed_conds_.clear();
+            }
+            table_scan_executors[i] = std::make_shared<FilterPlan>(scan, curr_conds);
+        } else {
+            table_scan_executors[i] = scan;
+        }
+        if (query->is_explain_analyze && tables.size() > 1) {
+            table_scan_executors[i] = maybe_push_projection(table_scan_executors[i], tables[i], all_conds, query->cols, query->is_select_star);
         }
     }
     // 只有一个表，不需要join。
-    if(tables.size() == 1) {
+    if(tables.size() == 1)
+    {
         return table_scan_executors[0];
     }
-    auto conds = std::move(query->conds);
-    std::map<CompOp, CompOp> swap_op = {
-        {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
-    };
-    std::shared_ptr<Plan> table_join_executors = table_scan_executors[0];
-    std::set<std::string> joined_tables{tables[0]};
 
-    for (size_t i = 1; i < tables.size(); ++i) {
-        const std::string &right_table = tables[i];
-        std::vector<Condition> join_conds;
-        auto it = conds.begin();
-        while (it != conds.end()) {
-            if (!it->is_rhs_val &&
-                ((joined_tables.count(it->lhs_col.tab_name) && it->rhs_col.tab_name == right_table) ||
-                 (it->lhs_col.tab_name == right_table && joined_tables.count(it->rhs_col.tab_name)))) {
-                Condition cond = *it;
-                if (cond.lhs_col.tab_name == right_table) {
-                    std::swap(cond.lhs_col, cond.rhs_col);
-                    cond.op = swap_op.at(cond.op);
+    // EXPLAIN ANALYZE: 按FROM表顺序构建左深树
+    if (query->is_explain_analyze) {
+        // 严格按 FROM 顺序构建左深树，不做表重排
+        std::vector<Condition> remaining_conds = std::move(query->conds);
+        std::shared_ptr<Plan> join_root = table_scan_executors[0];
+        std::vector<std::string> joined_tables{tables[0]};
+
+        auto is_joined = [&](const std::string &tab_name) {
+            return std::find(joined_tables.begin(), joined_tables.end(), tab_name) != joined_tables.end();
+        };
+
+        for (size_t i = 1; i < tables.size(); i++) {
+            std::vector<Condition> join_conds;
+            auto it = remaining_conds.begin();
+            while (it != remaining_conds.end()) {
+                bool lhs_joined = is_joined(it->lhs_col.tab_name);
+                bool rhs_joined = !it->is_rhs_val && is_joined(it->rhs_col.tab_name);
+                bool lhs_new = it->lhs_col.tab_name == tables[i];
+                bool rhs_new = !it->is_rhs_val && it->rhs_col.tab_name == tables[i];
+                if ((lhs_joined && rhs_new) || (rhs_joined && lhs_new)) {
+                    join_conds.push_back(*it);
+                    it = remaining_conds.erase(it);
+                } else {
+                    ++it;
                 }
-                join_conds.push_back(cond);
-                it = conds.erase(it);
-            } else {
-                ++it;
+            }
+            auto jp = std::make_shared<JoinPlan>(T_NestLoop, std::move(join_root),
+                                                  std::move(table_scan_executors[i]), join_conds);
+            // 检查右表（内表）是否有可用于 INLJ 的索引
+            for (auto &jc : join_conds) {
+                std::string inner_col;
+                // 判断右表 tables[i] 是连接条件的哪一侧
+                if (jc.lhs_col.tab_name == tables[i] && !jc.is_rhs_val) {
+                    inner_col = jc.lhs_col.col_name;
+                } else if (!jc.is_rhs_val && jc.rhs_col.tab_name == tables[i]) {
+                    inner_col = jc.rhs_col.col_name;
+                }
+                if (!inner_col.empty()) {
+                    std::vector<std::string> idx_names;
+                    if (has_index_on_column(sm_manager_, tables[i], inner_col, idx_names)) {
+                        jp->is_inlj_ = true;
+                        jp->inner_index_cols_ = idx_names;
+                        // 更新右侧子树中的 ScanPlan 为 IndexScan
+                        set_index_scan(jp->right_, idx_names);
+                        break;
+                    }
+                }
+            }
+            join_root = std::move(jp);
+            joined_tables.push_back(tables[i]);
+        }
+
+        if (!remaining_conds.empty()) {
+            if (auto top_join = std::dynamic_pointer_cast<JoinPlan>(join_root)) {
+                top_join->conds_.insert(top_join->conds_.end(), remaining_conds.begin(), remaining_conds.end());
             }
         }
-        auto index_col_names = get_join_index_cols(sm_manager_, base_table(right_table), right_table, join_conds);
-        PlanTag join_tag = T_NestLoop;
-        auto preference = join_algo_preference();
-        bool has_hash_key = has_hash_join_key(table_join_executors, table_scan_executors[i], join_conds);
-        bool multi_table_left = std::dynamic_pointer_cast<JoinPlan>(table_join_executors) != nullptr;
-        if (!index_col_names.empty() && preference != JoinAlgoPreference::kHash &&
-            preference != JoinAlgoPreference::kMerge) {
-            join_tag = T_IndexNestLoop;
-        } else if (has_hash_key && preference == JoinAlgoPreference::kMerge) {
-            join_tag = T_SortMerge;
-        } else if (has_hash_key &&
-                   (preference == JoinAlgoPreference::kHash ||
-                    (preference == JoinAlgoPreference::kAuto && multi_table_left))) {
-            join_tag = T_HashJoin;
+        return join_root;
+    }
+
+    // 获取where条件
+    auto conds = std::move(query->conds);
+    std::shared_ptr<Plan> table_join_executors;
+    
+    int scantbl[tables.size()];
+    for(size_t i = 0; i < tables.size(); i++)
+    {
+        scantbl[i] = -1;
+    }
+    // 假设在ast中已经添加了jointree，这里需要修改的逻辑是，先处理jointree，然后再考虑剩下的部分
+    if(conds.size() >= 1)
+    {
+        // 有连接条件
+
+        // 根据连接条件，生成第一层join
+        std::vector<std::string> joined_tables(tables.size());
+        auto it = conds.begin();
+        while (it != conds.end()) {
+            std::shared_ptr<Plan> left , right;
+            left = pop_scan(scantbl, it->lhs_col.tab_name, joined_tables, table_scan_executors);
+            right = pop_scan(scantbl, it->rhs_col.tab_name, joined_tables, table_scan_executors);
+            std::vector<Condition> join_conds{*it};
+            //建立join
+            // 判断使用哪种join方式
+            if(enable_nestedloop_join && enable_sortmerge_join) {
+                // 默认nested loop join
+                table_join_executors = std::make_shared<JoinPlan>(T_NestLoop, std::move(left), std::move(right), join_conds);
+            } else if(enable_nestedloop_join) {
+                table_join_executors = std::make_shared<JoinPlan>(T_NestLoop, std::move(left), std::move(right), join_conds);
+            } else if(enable_sortmerge_join) {
+                table_join_executors = std::make_shared<JoinPlan>(T_SortMerge, std::move(left), std::move(right), join_conds);
+            } else {
+                // error
+                throw RMDBError("No join executor selected!");
+            }
+            try_mark_inlj(sm_manager_, std::dynamic_pointer_cast<JoinPlan>(table_join_executors), join_conds);
+
+            // table_join_executors = std::make_shared<JoinPlan>(T_NestLoop, std::move(left), std::move(right), join_conds);
+            it = conds.erase(it);
+            break;
         }
-        table_join_executors = std::make_shared<JoinPlan>(join_tag, std::move(table_join_executors),
-                                                          table_scan_executors[i], join_conds, index_col_names);
-        joined_tables.insert(right_table);
+        // 根据连接条件，生成第2-n层join
+        it = conds.begin();
+        while (it != conds.end()) {
+            std::shared_ptr<Plan> left_need_to_join_executors = nullptr;
+            std::shared_ptr<Plan> right_need_to_join_executors = nullptr;
+            bool isneedreverse = false;
+            if (std::find(joined_tables.begin(), joined_tables.end(), it->lhs_col.tab_name) == joined_tables.end()) {
+                left_need_to_join_executors = pop_scan(scantbl, it->lhs_col.tab_name, joined_tables, table_scan_executors);
+            }
+            if (std::find(joined_tables.begin(), joined_tables.end(), it->rhs_col.tab_name) == joined_tables.end()) {
+                right_need_to_join_executors = pop_scan(scantbl, it->rhs_col.tab_name, joined_tables, table_scan_executors);
+                isneedreverse = true;
+            } 
+
+            if(left_need_to_join_executors != nullptr && right_need_to_join_executors != nullptr) {
+                std::vector<Condition> join_conds{*it};
+                std::shared_ptr<Plan> temp_join_executors = std::make_shared<JoinPlan>(T_NestLoop,
+                                                                    std::move(left_need_to_join_executors),
+                                                                    std::move(right_need_to_join_executors),
+                                                                    join_conds);
+                try_mark_inlj(sm_manager_, std::dynamic_pointer_cast<JoinPlan>(temp_join_executors), join_conds);
+                table_join_executors = std::make_shared<JoinPlan>(T_NestLoop, std::move(temp_join_executors),
+                                                                    std::move(table_join_executors),
+                                                                    std::vector<Condition>());
+            } else if(left_need_to_join_executors != nullptr || right_need_to_join_executors != nullptr) {
+                if(isneedreverse) {
+                    // 新表通过 rhs_col 找到 → 放在右侧（内表），条件不需要交换
+                    std::vector<Condition> join_conds{*it};
+                    table_join_executors = std::make_shared<JoinPlan>(T_NestLoop, std::move(table_join_executors),
+                                                                        std::move(right_need_to_join_executors), join_conds);
+                    try_mark_inlj(sm_manager_, std::dynamic_pointer_cast<JoinPlan>(table_join_executors), join_conds);
+                } else {
+                    // 新表通过 lhs_col 找到 → 放在左侧（外表）
+                    std::vector<Condition> join_conds{*it};
+                    table_join_executors = std::make_shared<JoinPlan>(T_NestLoop, std::move(left_need_to_join_executors),
+                                                                        std::move(table_join_executors), join_conds);
+                }
+            } else {
+                push_conds(std::move(&(*it)), table_join_executors);
+            }
+            it = conds.erase(it);
+        }
+    } else {
+        table_join_executors = table_scan_executors[0];
+        scantbl[0] = 1;
     }
 
-    for (auto &cond : conds) {
-        push_conds(&cond, table_join_executors);
+    //连接剩余表
+    for (size_t i = 0; i < tables.size(); i++) {
+        if(scantbl[i] == -1) {
+            table_join_executors = std::make_shared<JoinPlan>(T_NestLoop, std::move(table_scan_executors[i]), 
+                                                    std::move(table_join_executors), std::vector<Condition>());
+        }
     }
 
+    if (auto jp = std::dynamic_pointer_cast<JoinPlan>(table_join_executors)) {
+    } else {
+    }
     return table_join_executors;
 
 }
@@ -1208,294 +493,70 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
 
 std::shared_ptr<Plan> Planner::generate_sort_plan(std::shared_ptr<Query> query, std::shared_ptr<Plan> plan)
 {
-    if(query->order_cols.empty()) {
-        return plan;
-    }
-    return std::make_shared<SortPlan>(T_Sort, std::move(plan), query->order_cols);
-}
-
-namespace {
-std::shared_ptr<Plan> try_minmax_index_aggregate(SmManager *sm_manager,
-                                                 const std::shared_ptr<Query> &query,
-                                                 const std::shared_ptr<Plan> &scan_plan,
-                                                 Context *context) {
-    if (query == nullptr || context == nullptr || context->txn_ == nullptr ||
-        context->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED) {
-        return nullptr;
-    }
-    if (!query->has_aggregate || query->has_group || !query->group_cols.empty() || !query->having_conds.empty() ||
-        query->select_items.size() != 1 || query->cols.size() != 1 || query->tables.size() != 1 ||
-        !query->order_cols.empty()) {
-        return nullptr;
-    }
-
-    const auto &item = query->select_items[0];
-    if (item == nullptr || !item->is_agg || item->count_star || item->col == nullptr ||
-        item->agg_type != ast::AGG_MIN) {
-        return nullptr;
-    }
-
-    auto scan = std::dynamic_pointer_cast<ScanPlan>(scan_plan);
-    if (scan == nullptr || scan->tag != T_IndexScan || scan->index_col_names_.empty()) {
-        return nullptr;
-    }
-
-    TabMeta &tab = sm_manager->db_.get_table(scan->tab_name_);
-    IndexMeta index_meta;
-    try {
-        index_meta = *tab.get_index_meta(scan->index_col_names_, true);
-    } catch (RMDBError &) {
-        return nullptr;
-    }
-    if (index_meta.col_num <= 1) {
-        return nullptr;
-    }
-
-    int prefix_cols = 0;
-    for (const auto &index_col : index_meta.cols) {
-        if (index_col.name == item->col->col_name) {
-            break;
+    auto x = std::dynamic_pointer_cast<ast::SelectStmt>(query->parse);
+    if(!x->has_sort) {
+        // 检查 query->has_order_by (Task 5 新路径)
+        if (!query->has_order_by) {
+            return plan;
         }
-        auto cond_it = std::find_if(scan->conds_.begin(), scan->conds_.end(), [&](const Condition &cond) {
-            return cond.is_rhs_val && cond.op == OP_EQ && cond.rhs_val.raw != nullptr &&
-                   cond.lhs_col.tab_name == scan->visible_name_ && cond.lhs_col.col_name == index_col.name;
-        });
-        if (cond_it == scan->conds_.end()) {
-            return nullptr;
-        }
-        prefix_cols++;
-    }
-    if (prefix_cols <= 0 || prefix_cols >= index_meta.col_num ||
-        index_meta.cols[prefix_cols].name != item->col->col_name) {
-        return nullptr;
-    }
-
-    TabCol agg_col{scan->visible_name_, item->col->col_name};
-    return std::make_shared<MinMaxIndexAggregatePlan>(scan->tab_name_, scan->visible_name_, scan->conds_,
-                                                      scan->index_col_names_, agg_col, item->agg_type, query->cols);
-}
-
-std::shared_ptr<Plan> try_count_index_aggregate(SmManager *sm_manager,
-                                                const std::shared_ptr<Query> &query,
-                                                const std::shared_ptr<Plan> &scan_plan,
-                                                Context *context) {
-    if (query == nullptr || context == nullptr || context->txn_ == nullptr ||
-        (context->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED &&
-         context->txn_->get_isolation_level() != IsolationLevel::SNAPSHOT_ISOLATION) ||
-        !is_simple_count_query(query)) {
-        return nullptr;
-    }
-
-    auto scan = std::dynamic_pointer_cast<ScanPlan>(scan_plan);
-    if (scan == nullptr || scan->tag != T_IndexScan || scan->index_col_names_.empty()) {
-        return nullptr;
-    }
-
-    TabMeta &tab = sm_manager->db_.get_table(scan->tab_name_);
-    IndexMeta index_meta;
-    try {
-        index_meta = *tab.get_index_meta(scan->index_col_names_, true);
-    } catch (RMDBError &) {
-        return nullptr;
-    }
-
-    const auto &item = query->select_items[0];
-    std::vector<TabCol> required_cols;
-    TabCol count_col;
-    // RMDB has no NULL value semantics, and AggregateExecutor already treats
-    // COUNT(col) as a per-row count.  The CountIndex fast path can therefore
-    // plan COUNT(col) as COUNT(*) and avoid requiring the counted column to be
-    // present in the chosen index.
-    const bool count_all_rows = item->count_star || item->col != nullptr;
-    if (!rmdb::index_covers_required_and_conditions(index_meta, required_cols, scan->conds_, scan->visible_name_)) {
-        return nullptr;
-    }
-
-    return std::make_shared<CountIndexAggregatePlan>(scan->tab_name_, scan->visible_name_, scan->conds_,
-                                                     scan->index_col_names_, count_all_rows, count_col,
-                                                     query->cols);
-}
-}  // namespace
-
-void Planner::apply_required_columns(const std::shared_ptr<Plan> &plan, const std::vector<TabCol> &required) {
-    auto add_unique = [](std::vector<TabCol> *cols, const TabCol &col) {
-        if (col.col_name.empty()) {
-            return;
-        }
-        auto it = std::find_if(cols->begin(), cols->end(), [&](const TabCol &existing) {
-            return existing.tab_name == col.tab_name && existing.col_name == col.col_name;
-        });
-        if (it == cols->end()) {
-            cols->push_back(col);
-        }
-    };
-    auto add_condition_cols = [&](std::vector<TabCol> *cols, const std::vector<Condition> &conds) {
-        for (const auto &cond : conds) {
-            add_unique(cols, cond.lhs_col);
-            if (!cond.is_rhs_val) {
-                add_unique(cols, cond.rhs_col);
+        // 使用 query->order_by 构建排序计划
+        if (query->order_by.size() == 1) {
+            return std::make_shared<SortPlan>(T_Sort, std::move(plan),
+                                              query->order_by[0].first, query->order_by[0].second);
+        } else {
+            std::vector<TabCol> scols;
+            std::vector<bool> sdescs;
+            for (auto &ob : query->order_by) {
+                scols.push_back(ob.first);
+                sdescs.push_back(ob.second);
             }
+            auto sp = std::make_shared<SortPlan>(T_Sort, std::move(plan), scols[0], sdescs[0]);
+            sp->init_multi(std::move(scols), std::move(sdescs));
+            return sp;
         }
-    };
-    auto add_agg_item_col = [&](std::vector<TabCol> *cols, const std::shared_ptr<ast::SelectItem> &item) {
-        if (item != nullptr && item->is_agg && !item->count_star && item->col != nullptr) {
-            add_unique(cols, {item->col->tab_name, item->col->col_name});
-        }
-    };
-
-    if (plan == nullptr) {
-        return;
     }
-    if (auto scan = std::dynamic_pointer_cast<ScanPlan>(plan)) {
-        std::vector<TabCol> scan_required = required;
-        add_condition_cols(&scan_required, scan->conds_);
-        scan->required_cols_.clear();
-        for (const auto &col : scan_required) {
-            if (col.tab_name == scan->visible_name_) {
-                add_unique(&scan->required_cols_, col);
+    // Task 6: UNION 查询使用 query->order_by (已包含正确解析的列引用)
+    if (query->is_union && query->has_order_by) {
+        if (query->order_by.size() == 1) {
+            return std::make_shared<SortPlan>(T_Sort, std::move(plan),
+                                              query->order_by[0].first, query->order_by[0].second);
+        } else {
+            std::vector<TabCol> scols;
+            std::vector<bool> sdescs;
+            for (auto &ob : query->order_by) {
+                scols.push_back(ob.first);
+                sdescs.push_back(ob.second);
             }
-        }
-        return;
-    }
-    if (auto projection = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
-        apply_required_columns(projection->subplan_, projection->sel_cols_);
-        return;
-    }
-    if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
-        std::vector<TabCol> child_required = required;
-        for (const auto &order_col : sort->order_cols_) {
-            add_unique(&child_required, order_col.first);
-        }
-        if (sort->order_cols_.empty()) {
-            add_unique(&child_required, sort->sel_col_);
-        }
-        apply_required_columns(sort->subplan_, child_required);
-        return;
-    }
-    if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
-        apply_required_columns(limit->subplan_, required);
-        return;
-    }
-    if (auto aggregate = std::dynamic_pointer_cast<AggregatePlan>(plan)) {
-        std::vector<TabCol> child_required;
-        for (const auto &group_col : aggregate->group_cols_) {
-            add_unique(&child_required, group_col);
-        }
-        for (const auto &item : aggregate->select_items_) {
-            add_agg_item_col(&child_required, item);
-        }
-        for (const auto &having : aggregate->having_conds_) {
-            add_agg_item_col(&child_required, having->lhs);
-        }
-        apply_required_columns(aggregate->subplan_, child_required);
-        return;
-    }
-    if (auto join = std::dynamic_pointer_cast<JoinPlan>(plan)) {
-        std::vector<TabCol> child_required = required;
-        add_condition_cols(&child_required, join->conds_);
-        apply_required_columns(join->left_, child_required);
-        apply_required_columns(join->right_, child_required);
-        return;
-    }
-    if (auto semi = std::dynamic_pointer_cast<SemiJoinPlan>(plan)) {
-        std::vector<TabCol> child_required = required;
-        add_condition_cols(&child_required, semi->conds_);
-        apply_required_columns(semi->left_, child_required);
-        apply_required_columns(semi->right_, child_required);
-        return;
-    }
-    if (auto union_plan = std::dynamic_pointer_cast<UnionPlan>(plan)) {
-        for (auto &subplan : union_plan->subplans_) {
-            apply_required_columns(subplan, required);
+            auto sp = std::make_shared<SortPlan>(T_Sort, std::move(plan), scols[0], sdescs[0]);
+            sp->init_multi(std::move(scols), std::move(sdescs));
+            return sp;
         }
     }
-}
-
-void Planner::attach_runtime_cache(const std::shared_ptr<Plan> &plan) {
-    if (plan == nullptr) {
-        return;
+    std::vector<std::string> tables = query->tables;
+    std::vector<ColMeta> all_cols;
+    for (auto &sel_tab_name : tables) {
+        // 这里db_不能写成get_db(), 注意要传指针
+        const auto &sel_tab_cols = sm_manager_->db_.get_table(sel_tab_name).cols;
+        all_cols.insert(all_cols.end(), sel_tab_cols.begin(), sel_tab_cols.end());
     }
-
-    auto build_cache = [&](const std::string &tab_name, const std::string &visible_name,
-                           const std::vector<std::string> *index_cols) {
-        auto cache = std::make_shared<PlanRuntimeCache>();
-        TabMeta &tab = sm_manager_->db_.get_table(tab_name);
-        cache->tab = &tab;
-        cache->fh = sm_manager_->fhs_.at(tab_name).get();
-        cache->full_cols = tab.cols;
-        const std::string &effective_visible = visible_name.empty() ? tab_name : visible_name;
-        for (auto &col : cache->full_cols) {
-            col.tab_name = effective_visible;
+    // 多列排序
+    std::vector<TabCol> sort_cols;
+    std::vector<bool> sort_descs;
+    for (size_t i = 0; i < x->order->cols.size(); i++) {
+        TabCol sel_col;
+        for (auto &col : all_cols) {
+            if(col.name.compare(x->order->cols[i]->col_name) == 0 )
+                sel_col = {.tab_name = col.tab_name, .col_name = col.name};
         }
-        cache->full_len = cache->full_cols.empty() ? 0 : cache->full_cols.back().offset + cache->full_cols.back().len;
-        cache->has_table = true;
-        if (index_cols != nullptr && !index_cols->empty()) {
-            cache->index_meta = *tab.get_index_meta(*index_cols, true);
-            cache->ih = rmdb::resolve_index_handle(sm_manager_, tab_name, cache->index_meta);
-            cache->has_index = true;
-        }
-        cache->index_bindings = rmdb::bind_table_indexes(sm_manager_, tab_name, tab);
-        cache->has_index_bindings = true;
-        return cache;
-    };
-
-    if (auto dml = std::dynamic_pointer_cast<DMLPlan>(plan)) {
-        attach_runtime_cache(dml->subplan_);
-        if (!dml->tab_name_.empty() && (dml->tag == T_Insert || dml->tag == T_Update || dml->tag == T_Delete)) {
-            dml->runtime_cache_ = build_cache(dml->tab_name_, dml->tab_name_, nullptr);
-        }
-        return;
+        sort_cols.push_back(sel_col);
+        sort_descs.push_back(x->order->orderby_dirs[i] == ast::OrderBy_DESC);
     }
-    if (auto scan = std::dynamic_pointer_cast<ScanPlan>(plan)) {
-        scan->runtime_cache_ = build_cache(scan->tab_name_, scan->visible_name_,
-                                           scan->tag == T_IndexScan ? &scan->index_col_names_ : nullptr);
-        return;
+    if (sort_cols.size() == 1) {
+        return std::make_shared<SortPlan>(T_Sort, std::move(plan), sort_cols[0], sort_descs[0]);
     }
-    if (auto join = std::dynamic_pointer_cast<JoinPlan>(plan)) {
-        attach_runtime_cache(join->left_);
-        attach_runtime_cache(join->right_);
-        if (join->tag == T_IndexNestLoop) {
-            if (auto right_scan = std::dynamic_pointer_cast<ScanPlan>(join->right_)) {
-                join->runtime_cache_ =
-                    build_cache(right_scan->tab_name_, right_scan->visible_name_, &join->index_col_names_);
-            }
-        }
-        return;
-    }
-    if (auto projection = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
-        attach_runtime_cache(projection->subplan_);
-        return;
-    }
-    if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
-        attach_runtime_cache(sort->subplan_);
-        return;
-    }
-    if (auto aggregate = std::dynamic_pointer_cast<AggregatePlan>(plan)) {
-        attach_runtime_cache(aggregate->subplan_);
-        return;
-    }
-    if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
-        attach_runtime_cache(limit->subplan_);
-        return;
-    }
-    if (auto semi = std::dynamic_pointer_cast<SemiJoinPlan>(plan)) {
-        attach_runtime_cache(semi->left_);
-        attach_runtime_cache(semi->right_);
-        return;
-    }
-    if (auto count = std::dynamic_pointer_cast<CountIndexAggregatePlan>(plan)) {
-        count->runtime_cache_ = build_cache(count->tab_name_, count->visible_name_, &count->index_col_names_);
-        return;
-    }
-    if (auto minmax = std::dynamic_pointer_cast<MinMaxIndexAggregatePlan>(plan)) {
-        minmax->runtime_cache_ = build_cache(minmax->tab_name_, minmax->visible_name_, &minmax->index_col_names_);
-        return;
-    }
-    if (auto union_plan = std::dynamic_pointer_cast<UnionPlan>(plan)) {
-        for (auto &subplan : union_plan->subplans_) {
-            attach_runtime_cache(subplan);
-        }
-    }
+    auto sp = std::make_shared<SortPlan>(T_Sort, std::move(plan), sort_cols[0], sort_descs[0]);
+    sp->init_multi(std::move(sort_cols), std::move(sort_descs));
+    return sp;
 }
 
 
@@ -1506,39 +567,72 @@ void Planner::attach_runtime_cache(const std::shared_ptr<Plan> &plan) {
  * @param tab_names select plan 目标的表
  * @param conds select plan 选取条件
  */
-std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query, Context *context,
-                                                    bool keep_root_projection) {
+std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query, Context *context) {
     //逻辑优化
     query = logical_optimization(std::move(query), context);
 
     //物理优化
     auto sel_cols = query->cols;
+    auto aggs = query->aggs;
     std::shared_ptr<Plan> plannerRoot = physical_optimization(query, context);
-    if (!query->has_aggregate && !query->has_group && query->has_limit && query->limit >= 0) {
-        if (auto sort_plan = std::dynamic_pointer_cast<SortPlan>(plannerRoot)) {
-            sort_plan->limit_ = query->limit;
-        }
-    }
-    if (query->has_aggregate || query->has_group) {
-        auto minmax_plan = try_minmax_index_aggregate(sm_manager_, query, plannerRoot, context);
-        if (minmax_plan != nullptr) {
-            plannerRoot = std::move(minmax_plan);
+
+    // 如果查询有聚合函数或 GROUP BY，插入 AggregationPlan
+    if (query->has_agg || query->has_group_by) {
+        // 构建输出列顺序: GROUP BY cols + aggregate cols
+        std::vector<TabCol> out_cols;
+        if (query->is_select_star) {
+            // SELECT * with aggregates not meaningful, but handle gracefully
+            for (auto &c : sel_cols) out_cols.push_back(c);
         } else {
-            auto count_plan = try_count_index_aggregate(sm_manager_, query, plannerRoot, context);
-            if (count_plan != nullptr) {
-                plannerRoot = std::move(count_plan);
-            } else {
-                plannerRoot = std::make_shared<AggregatePlan>(std::move(plannerRoot), query->select_items,
-                                                              query->group_cols, query->having_conds, sel_cols);
+            // 基于 query->aggs (已解析列名) 和 sel_cols 构建输出列
+            // 先添加 GROUP BY 列
+            for (auto &c : query->group_by) {
+                out_cols.push_back(c);
+            }
+            // 再添加聚合列（使用已解析的列名）
+            for (auto &a : query->aggs) {
+                TabCol tc;
+                if (a.agg_type == Query::AggInfo::COUNT_ALL) {
+                    tc.tab_name = "";
+                    tc.col_name = a.alias.empty() ? "COUNT(*)" : a.alias;
+                } else {
+                    tc.tab_name = a.col.tab_name;   // 已由 analyzer 解析
+                    if (a.alias.empty()) {
+                        // 无别名时使用聚合函数名+列名作为唯一列名，避免同一列的多个聚合重名
+                        const char* agg_names[] = {"COUNT_ALL", "COUNT", "MAX", "MIN", "SUM", "AVG"};
+                        tc.col_name = std::string(agg_names[a.agg_type]) + "(" + a.col.col_name + ")";
+                    } else {
+                        tc.col_name = a.alias;
+                    }
+                }
+                out_cols.push_back(tc);
             }
         }
-    } else if (keep_root_projection) {
-        plannerRoot = std::make_shared<ProjectionPlan>(T_Projection, std::move(plannerRoot), std::move(sel_cols));
+        // 更新 sel_cols 为输出列（用于后续的 ProjectionPlan）
+        sel_cols = out_cols;
+        // 转换 Query::AggInfo 到 AggInfo
+        std::vector<AggInfo> agg_infos;
+        for (auto &qa : query->aggs) {
+            AggInfo ai;
+            ai.agg_type = static_cast<AggInfo::AggType>(qa.agg_type);
+            ai.col = qa.col;
+            ai.alias = qa.alias;
+            agg_infos.push_back(ai);
+        }
+        plannerRoot = std::make_shared<AggregationPlan>(T_Aggregation, std::move(plannerRoot),
+                                                         std::move(query->group_by),
+                                                         std::move(agg_infos),
+                                                         std::move(query->having),
+                                                         std::move(out_cols));
     }
-    if (query->has_limit) {
-        plannerRoot = std::make_shared<LimitPlan>(std::move(plannerRoot), query->limit);
+
+    // 添加 LIMIT 节点（如果有）
+    if (query->has_limit && query->limit >= 0) {
+        plannerRoot = std::make_shared<LimitPlan>(T_Limit, std::move(plannerRoot), query->limit);
     }
-    apply_required_columns(plannerRoot, sel_cols);
+
+    plannerRoot = std::make_shared<ProjectionPlan>(T_Projection, std::move(plannerRoot),
+                                                        std::move(sel_cols));
 
     return plannerRoot;
 }
@@ -1547,80 +641,7 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
 std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context *context)
 {
     std::shared_ptr<Plan> plannerRoot;
-    if (query->parse == nullptr && query->kind == StmtKind::Insert) {
-        plannerRoot = std::make_shared<DMLPlan>(T_Insert, std::shared_ptr<Plan>(), query->target_table,
-                                                query->values, std::vector<Condition>(), std::vector<SetClause>());
-    } else if (query->parse == nullptr && query->kind == StmtKind::Load) {
-        plannerRoot = std::make_shared<DMLPlan>(T_Load, query->target_table, query->load_file);
-    } else if (query->parse == nullptr && query->kind == StmtKind::Delete) {
-        std::shared_ptr<Plan> table_scan_executors;
-        std::vector<std::string> index_col_names;
-        bool index_exist = get_index_cols(query->target_table, query->target_table, query->conds, index_col_names);
-
-        if (index_exist == false) {
-            index_col_names.clear();
-            table_scan_executors =
-                std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, query->target_table, query->conds, index_col_names);
-        } else {
-            table_scan_executors =
-                std::make_shared<ScanPlan>(T_IndexScan, sm_manager_, query->target_table, query->conds, index_col_names);
-        }
-
-        plannerRoot = std::make_shared<DMLPlan>(T_Delete, table_scan_executors, query->target_table,
-                                                std::vector<Value>(), query->conds, std::vector<SetClause>());
-    } else if (query->parse == nullptr && query->kind == StmtKind::Update) {
-        std::shared_ptr<Plan> table_scan_executors;
-        std::vector<std::string> index_col_names;
-        bool index_exist = get_index_cols(query->target_table, query->target_table, query->conds, index_col_names);
-
-        if (index_exist == false) {
-            index_col_names.clear();
-            table_scan_executors =
-                std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, query->target_table, query->conds, index_col_names);
-        } else {
-            table_scan_executors =
-                std::make_shared<ScanPlan>(T_IndexScan, sm_manager_, query->target_table, query->conds, index_col_names);
-        }
-        plannerRoot = std::make_shared<DMLPlan>(T_Update, table_scan_executors, query->target_table,
-                                                std::vector<Value>(), query->conds, query->set_clauses);
-    } else if (query->parse == nullptr && query->kind == StmtKind::Select) {
-        if (!query->union_queries.empty()) {
-            std::vector<std::shared_ptr<Plan>> subplans;
-            for (auto &subquery : query->union_queries) {
-                subplans.push_back(generate_select_plan(subquery, context, true));
-            }
-            std::shared_ptr<Plan> union_plan = std::make_shared<UnionPlan>(std::move(subplans), query->union_cols);
-            if (!query->order_cols.empty()) {
-                union_plan = std::make_shared<SortPlan>(T_Sort, std::move(union_plan), query->order_cols);
-            }
-            plannerRoot = std::make_shared<DMLPlan>(T_select, union_plan, std::string(), std::vector<Value>(),
-                                                    std::vector<Condition>(), std::vector<SetClause>());
-            std::dynamic_pointer_cast<DMLPlan>(plannerRoot)->output_cols_ = query->cols;
-            attach_runtime_cache(plannerRoot);
-            return plannerRoot;
-        }
-
-        std::shared_ptr<Plan> projection;
-        auto final_output_cols = query->cols;
-        if (query->is_semi_join) {
-            std::vector<std::string> empty_index;
-            auto base_table = [&](const std::string &visible) -> const std::string & {
-                auto it = query->alias_to_table.find(visible);
-                return it == query->alias_to_table.end() ? visible : it->second;
-            };
-            auto left_scan = std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, base_table(query->tables[0]),
-                                                        std::vector<Condition>(), empty_index, query->tables[0]);
-            auto right_scan = std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, base_table(query->tables[1]),
-                                                         std::vector<Condition>(), empty_index, query->tables[1]);
-            auto semi = std::make_shared<SemiJoinPlan>(left_scan, right_scan, query->semi_conds);
-            projection = std::make_shared<ProjectionPlan>(T_Projection, semi, query->cols);
-        } else {
-            projection = generate_select_plan(std::move(query), context);
-        }
-        plannerRoot = std::make_shared<DMLPlan>(T_select, projection, std::string(), std::vector<Value>(),
-                                                std::vector<Condition>(), std::vector<SetClause>());
-        std::dynamic_pointer_cast<DMLPlan>(plannerRoot)->output_cols_ = std::move(final_output_cols);
-    } else if (auto x = std::dynamic_pointer_cast<ast::CreateTable>(query->parse)) {
+    if (auto x = std::dynamic_pointer_cast<ast::CreateTable>(query->parse)) {
         // create table;
         std::vector<ColDef> col_defs;
         for (auto &field : x->fields) {
@@ -1645,10 +666,8 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context 
         plannerRoot = std::make_shared<DDLPlan>(T_DropIndex, x->tab_name, x->col_names, std::vector<ColDef>());
     } else if (auto x = std::dynamic_pointer_cast<ast::InsertStmt>(query->parse)) {
         // insert;
-        plannerRoot = std::make_shared<DMLPlan>(T_Insert, std::shared_ptr<Plan>(),  x->tab_name,
+        plannerRoot = std::make_shared<DMLPlan>(T_Insert, std::shared_ptr<Plan>(),  x->tab_name,  
                                                     query->values, std::vector<Condition>(), std::vector<SetClause>());
-    } else if (auto x = std::dynamic_pointer_cast<ast::LoadStmt>(query->parse)) {
-        plannerRoot = std::make_shared<DMLPlan>(T_Load, x->tab_name, query->load_file);
     } else if (auto x = std::dynamic_pointer_cast<ast::DeleteStmt>(query->parse)) {
         // delete;
         // 生成表扫描方式
@@ -1656,18 +675,18 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context 
         // 只有一张表，不需要进行物理优化了
         // int index_no = get_indexNo(x->tab_name, query->conds);
         std::vector<std::string> index_col_names;
-        bool index_exist = get_index_cols(x->tab_name, x->tab_name, query->conds, index_col_names);
-
+        bool index_exist = get_index_cols(x->tab_name, query->conds, index_col_names);
+        
         if (index_exist == false) {  // 该表没有索引
             index_col_names.clear();
-            table_scan_executors =
+            table_scan_executors = 
                 std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, x->tab_name, query->conds, index_col_names);
         } else {  // 存在索引
             table_scan_executors =
                 std::make_shared<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name, query->conds, index_col_names);
         }
 
-        plannerRoot = std::make_shared<DMLPlan>(T_Delete, table_scan_executors, x->tab_name,
+        plannerRoot = std::make_shared<DMLPlan>(T_Delete, table_scan_executors, x->tab_name,  
                                                 std::vector<Value>(), query->conds, std::vector<SetClause>());
     } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(query->parse)) {
         // update;
@@ -1676,77 +695,76 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context 
         // 只有一张表，不需要进行物理优化了
         // int index_no = get_indexNo(x->tab_name, query->conds);
         std::vector<std::string> index_col_names;
-        bool index_exist = get_index_cols(x->tab_name, x->tab_name, query->conds, index_col_names);
+        bool index_exist = get_index_cols(x->tab_name, query->conds, index_col_names);
 
         if (index_exist == false) {  // 该表没有索引
         index_col_names.clear();
-            table_scan_executors =
+            table_scan_executors = 
                 std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, x->tab_name, query->conds, index_col_names);
         } else {  // 存在索引
             table_scan_executors =
                 std::make_shared<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name, query->conds, index_col_names);
         }
         plannerRoot = std::make_shared<DMLPlan>(T_Update, table_scan_executors, x->tab_name,
-                                                     std::vector<Value>(), query->conds,
+                                                     std::vector<Value>(), query->conds, 
                                                      query->set_clauses);
-    } else if (auto x = std::dynamic_pointer_cast<ast::ExplainStmt>(query->parse)) {
-        plannerRoot = std::make_shared<ExplainPlan>(make_explain_lines(x->select, sm_manager_));
-    } else if (auto x = std::dynamic_pointer_cast<ast::UnionStmt>(query->parse)) {
-        std::vector<std::shared_ptr<Plan>> subplans;
-        for (auto &subquery : query->union_queries) {
-            subplans.push_back(generate_select_plan(subquery, context, true));
-        }
-        std::shared_ptr<Plan> union_plan = std::make_shared<UnionPlan>(std::move(subplans), query->union_cols);
-        if (!query->order_cols.empty()) {
-            union_plan = std::make_shared<SortPlan>(T_Sort, std::move(union_plan), query->order_cols);
-        }
-        plannerRoot = std::make_shared<DMLPlan>(T_select, union_plan, std::string(), std::vector<Value>(),
-                                                std::vector<Condition>(), std::vector<SetClause>());
-        std::dynamic_pointer_cast<DMLPlan>(plannerRoot)->output_cols_ = query->cols;
     } else if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(query->parse)) {
-        if (!query->union_queries.empty()) {
-            std::vector<std::shared_ptr<Plan>> subplans;
-            for (auto &subquery : query->union_queries) {
-                subplans.push_back(generate_select_plan(subquery, context, true));
-            }
-            std::shared_ptr<Plan> union_plan = std::make_shared<UnionPlan>(std::move(subplans), query->union_cols);
-            if (!query->order_cols.empty()) {
-                union_plan = std::make_shared<SortPlan>(T_Sort, std::move(union_plan), query->order_cols);
-            }
-            plannerRoot = std::make_shared<DMLPlan>(T_select, union_plan, std::string(), std::vector<Value>(),
-                                                    std::vector<Condition>(), std::vector<SetClause>());
-            std::dynamic_pointer_cast<DMLPlan>(plannerRoot)->output_cols_ = query->cols;
-            attach_runtime_cache(plannerRoot);
-            return plannerRoot;
-        }
 
-        std::shared_ptr<plannerInfo> root = std::make_shared<plannerInfo>(x);
-        // 生成select语句的查询执行计划
-        std::shared_ptr<Plan> projection;
-        auto final_output_cols = query->cols;
-        if (query->is_semi_join) {
-            std::vector<std::string> empty_index;
-            auto base_table = [&](const std::string &visible) -> const std::string & {
-                auto it = query->alias_to_table.find(visible);
-                return it == query->alias_to_table.end() ? visible : it->second;
-            };
-            auto left_scan = std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, base_table(query->tables[0]),
-                                                        std::vector<Condition>(), empty_index, query->tables[0]);
-            auto right_scan = std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, base_table(query->tables[1]),
-                                                         std::vector<Condition>(), empty_index, query->tables[1]);
-            auto semi = std::make_shared<SemiJoinPlan>(left_scan, right_scan, query->semi_conds);
-            projection = std::make_shared<ProjectionPlan>(T_Projection, semi, query->cols);
+        // 保存标志 (在 std::move(query) 之前)
+        bool is_explain = query->is_explain_analyze;
+        bool is_star = query->is_select_star;
+
+        // Task 6: UNION 查询特殊处理
+        if (query->is_union) {
+            // 为每个 UNION 分支生成子计划
+            std::vector<std::shared_ptr<Plan>> branch_plans;
+            for (auto &bq : query->union_branches) {
+                // 为分支生成物理计划 (scan) 并添加投影
+                auto scan_plan = make_one_rel(bq);
+                std::shared_ptr<Plan> branch_plan;
+                if (bq->is_select_star) {
+                    // SELECT *: 不需要额外投影, scan 返回所有列
+                    branch_plan = scan_plan;
+                } else {
+                    // 非 SELECT *: 需要投影到分支的 SELECT 列表
+                    branch_plan = std::make_shared<ProjectionPlan>(T_Projection,
+                        std::move(scan_plan), bq->cols);
+                }
+                branch_plans.push_back(branch_plan);
+            }
+
+            // 创建 UnionPlan
+            auto union_plan = std::make_shared<UnionPlan>(
+                std::move(branch_plans), query->union_cols);
+
+            // 应用外层 ORDER BY
+            auto sorted = generate_sort_plan(query, std::move(union_plan));
+
+            // 应用外层 LIMIT
+            if (query->has_limit && query->limit >= 0) {
+                sorted = std::make_shared<LimitPlan>(T_Limit, std::move(sorted), query->limit);
+            }
+
+            // 应用投影 (SELECT *)
+            auto sel_cols = query->cols;
+            auto proj = std::make_shared<ProjectionPlan>(T_Projection, std::move(sorted), std::move(sel_cols));
+
+            auto dml = std::make_shared<DMLPlan>(T_select, proj, std::string(), std::vector<Value>(),
+                                                        std::vector<Condition>(), std::vector<SetClause>());
+            dml->is_explain_analyze = is_explain;
+            dml->is_select_star = is_star;
+            plannerRoot = dml;
         } else {
-            projection = generate_select_plan(std::move(query), context);
+            // 生成select语句的查询执行计划
+            std::shared_ptr<Plan> projection = generate_select_plan(std::move(query), context);
+            auto dml = std::make_shared<DMLPlan>(T_select, projection, std::string(), std::vector<Value>(),
+                                                        std::vector<Condition>(), std::vector<SetClause>());
+            dml->is_explain_analyze = is_explain;
+            dml->is_select_star = is_star;
+            plannerRoot = dml;
         }
-        plannerRoot = std::make_shared<DMLPlan>(T_select, projection, std::string(), std::vector<Value>(),
-                                                    std::vector<Condition>(), std::vector<SetClause>());
-        std::dynamic_pointer_cast<DMLPlan>(plannerRoot)->output_cols_ = std::move(final_output_cols);
-    } else if (auto x = std::dynamic_pointer_cast<ast::ShowIndex>(query->parse)) {
-        plannerRoot = std::make_shared<OtherPlan>(T_ShowIndex, x->tab_name);
     } else {
         throw InternalError("Unexpected AST root");
     }
-    attach_runtime_cache(plannerRoot);
     return plannerRoot;
 }

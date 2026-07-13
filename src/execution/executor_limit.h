@@ -1,37 +1,60 @@
-#pragma once
+/* Copyright (c) 2023 Renmin University of China
+RMDB is licensed under Mulan PSL v2.
+You can use this software according to the terms and conditions of the Mulan PSL v2.
+You may obtain a copy of Mulan PSL v2 at:
+        http://license.coscl.org.cn/MulanPSL2
+THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+See the Mulan PSL v2 for more details. */
 
+#pragma once
+#include "execution_defs.h"
+#include "execution_manager.h"
 #include "executor_abstract.h"
+#include "index/ix.h"
+#include "system/sm.h"
 
 class LimitExecutor : public AbstractExecutor {
    private:
     std::unique_ptr<AbstractExecutor> prev_;
     int limit_;
-    int produced_;
+    size_t count_;     // how many output so far
+    size_t len_;
+    std::vector<ColMeta> cols_;
 
    public:
     LimitExecutor(std::unique_ptr<AbstractExecutor> prev, int limit) {
         prev_ = std::move(prev);
         limit_ = limit;
-        produced_ = 0;
+        count_ = 0;
+        cols_ = prev_->cols();
+        len_ = prev_->tupleLen();
+    }
+
+    size_t tupleLen() const override { return len_; }
+
+    const std::vector<ColMeta> &cols() const override {
+        return cols_;
     }
 
     void beginTuple() override {
-        produced_ = 0;
         prev_->beginTuple();
+        count_ = 0;
     }
 
     void nextTuple() override {
-        produced_++;
         prev_->nextTuple();
+        count_++;
     }
 
-    bool is_end() const override { return produced_ >= limit_ || prev_->is_end(); }
-    size_t tupleLen() const override { return prev_->tupleLen(); }
-    const std::vector<ColMeta> &cols() const override { return prev_->cols(); }
-    std::string getType() override { return "LimitExecutor"; }
-    ColMeta get_col_offset(const TabCol &target) override { return prev_->get_col_offset(target); }
+    bool is_end() const override {
+        return prev_->is_end() || count_ >= static_cast<size_t>(limit_);
+    }
+
+    std::unique_ptr<RmRecord> Next() override {
+        return prev_->Next();
+    }
+
     Rid &rid() override { return _abstract_rid; }
-    std::unique_ptr<RmRecord> Next() override { return prev_->Next(); }
-    const TupleView *CurrentTupleView() const override { return prev_->CurrentTupleView(); }
-    const RmRecord *CurrentTuple() const override { return prev_->CurrentTuple(); }
 };

@@ -12,35 +12,29 @@ See the Mulan PSL v2 for more details. */
 
 
 auto Watermark::AddTxn(timestamp_t read_ts) -> void {
-    std::lock_guard<std::mutex> guard(latch_);
-    current_reads_.push_back(read_ts);
-    if (current_reads_.size() == 1 || read_ts < watermark_) {
-        watermark_ = read_ts;
+    current_reads_[read_ts]++;
+    if (!current_reads_.empty()) {
+        watermark_ = current_reads_.begin()->first;
     }
 }
 
 auto Watermark::RemoveTxn(timestamp_t read_ts) -> void {
-    std::lock_guard<std::mutex> guard(latch_);
-    auto iter = std::find(current_reads_.begin(), current_reads_.end(), read_ts);
-    if (iter == current_reads_.end()) {
-        return;
+    auto it = current_reads_.find(read_ts);
+    if (it != current_reads_.end()) {
+        if (--(it->second) == 0) {
+            current_reads_.erase(it);
+        }
     }
-    *iter = current_reads_.back();
-    current_reads_.pop_back();
-    watermark_ = current_reads_.empty()
-                     ? commit_ts_
-                     : *std::min_element(current_reads_.begin(), current_reads_.end());
+    watermark_ = current_reads_.empty() ? commit_ts_ : current_reads_.begin()->first;
 }
 
-auto Watermark::UpdateCommitTs(timestamp_t commit_ts) -> void {
-    std::lock_guard<std::mutex> guard(latch_);
+void Watermark::UpdateCommitTs(timestamp_t commit_ts) {
     commit_ts_ = commit_ts;
     if (current_reads_.empty()) {
         watermark_ = commit_ts_;
     }
 }
 
-auto Watermark::GetWatermark() -> timestamp_t {
-    std::lock_guard<std::mutex> guard(latch_);
+timestamp_t Watermark::GetWatermark() {
     return watermark_;
 }

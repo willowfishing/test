@@ -13,4 +13,15 @@ namespace ast {
 
 std::shared_ptr<TreeNode> parse_tree;
 
+// Union map: populated during parsing, consumed by analyzer
+static std::map<std::string, std::shared_ptr<UnionStmt>> g_union_map;
+
+std::map<std::string, std::shared_ptr<UnionStmt>>& get_union_map() {
+    return g_union_map;
+}
+
+void clear_union_map() {
+    g_union_map.clear();
+}
+
 }

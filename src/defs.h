@@ -39,6 +39,14 @@ struct Rid {
     friend bool operator!=(const Rid &x, const Rid &y) { return !(x == y); }
 };
 
+// Hash specialization for Rid (needed for unordered_set/unordered_map)
+template <>
+struct std::hash<Rid> {
+    size_t operator()(const Rid &rid) const {
+        return std::hash<int64_t>()((static_cast<int64_t>(rid.page_no) << 32) | rid.slot_no);
+    }
+};
+
 enum ColType {
     TYPE_INT, TYPE_FLOAT, TYPE_STRING
 };

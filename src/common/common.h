@@ -22,9 +22,11 @@ See the Mulan PSL v2 for more details. */
 struct TabCol {
     std::string tab_name;
     std::string col_name;
+    std::string display_tab_name;
 
     friend bool operator<(const TabCol &x, const TabCol &y) {
-        return std::make_pair(x.tab_name, x.col_name) < std::make_pair(y.tab_name, y.col_name);
+        return std::make_pair(x.display_tab_name.empty() ? x.tab_name : x.display_tab_name, x.col_name) <
+               std::make_pair(y.display_tab_name.empty() ? y.tab_name : y.display_tab_name, y.col_name);
     }
 };
 
@@ -56,18 +58,6 @@ struct Value {
     void init_raw(int len) {
         assert(raw == nullptr);
         raw = std::make_shared<RmRecord>(len);
-        write_raw_data(len);
-    }
-
-    void init_raw(int len, std::shared_ptr<RmRecord> raw_buffer) {
-        assert(raw == nullptr);
-        raw = std::move(raw_buffer);
-        raw->Resize(len);
-        write_raw_data(len);
-    }
-
-private:
-    void write_raw_data(int len) {
         if (type == TYPE_INT) {
             assert(len == sizeof(int));
             *(int *)(raw->data) = int_val;
@@ -94,13 +84,9 @@ struct Condition {
     Value rhs_val;    // right-hand side value
 };
 
-enum class SetOp { ASSIGN, ADD, SUB, MUL, DIV };
-
 struct SetClause {
     TabCol lhs;
-    SetOp op{SetOp::ASSIGN};
-    bool rhs_is_col{false};
-    TabCol rhs_col;
-    bool rhs_has_val{false};
     Value rhs;
+    bool is_self_ref = false;
+    std::string self_ref_col;
 };

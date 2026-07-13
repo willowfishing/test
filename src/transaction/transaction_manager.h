@@ -11,18 +11,10 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <atomic>
-#include <chrono>
-#include <cstdint>
-#include <array>
-#include <condition_variable>
-#include <deque>
 #include <unordered_map>
 #include <optional>
 #include <functional>
-#include <memory>
 #include <shared_mutex>
-#include <utility>
-#include <vector>
 
 #include "transaction.h"
 #include "watermark.h"
@@ -54,64 +46,8 @@ struct VersionUndoLink {
     }
 };
 
-class RmRecordPageCursor;
-class TransactionManager;
-
-class TransactionDrainGuard {
-   public:
-    TransactionDrainGuard() = default;
-    ~TransactionDrainGuard();
-
-    TransactionDrainGuard(const TransactionDrainGuard &) = delete;
-    TransactionDrainGuard &operator=(const TransactionDrainGuard &) = delete;
-
-    TransactionDrainGuard(TransactionDrainGuard &&other) noexcept;
-    TransactionDrainGuard &operator=(TransactionDrainGuard &&other) noexcept;
-
-    explicit operator bool() const { return manager_ != nullptr; }
-
-   private:
-    friend class TransactionManager;
-    explicit TransactionDrainGuard(TransactionManager *manager) : manager_(manager) {}
-    void reset();
-
-    TransactionManager *manager_{nullptr};
-};
-
 class TransactionManager{
 public:
-    enum class UniqueKeyConflictResult { NONE, ABORT, FAILURE };
-    enum class ReadCommittedIndexEntryState { CURRENT_KEY_VISIBLE, INVISIBLE, NEEDS_HEAP };
-    struct PageVersionInfo;
-    struct TableVersionInfo;
-    struct ReadCommittedTupleHint {
-        bool valid = false;
-        page_id_t page_no = INVALID_PAGE_ID;
-        int slot_no = -1;
-        PageVersionInfo *page_info = nullptr;
-        uint64_t visibility_epoch = 0;
-        bool has_meta = false;
-        TupleMeta meta{0, false};
-        bool has_version_link = false;
-        VersionUndoLink version_link{};
-
-        void Reset() {
-            valid = false;
-            page_no = INVALID_PAGE_ID;
-            slot_no = -1;
-            page_info = nullptr;
-            visibility_epoch = 0;
-            has_meta = false;
-            meta = TupleMeta{0, false};
-            has_version_link = false;
-            version_link = VersionUndoLink{};
-        }
-
-        bool Matches(const Rid &rid) const {
-            return valid && page_no == rid.page_no && slot_no == rid.slot_no && page_info != nullptr;
-        }
-    };
-
     explicit TransactionManager(LockManager *lock_manager, SmManager *sm_manager,
                              ConcurrencyMode concurrency_mode = ConcurrencyMode::TWO_PHASE_LOCKING) {
         sm_manager_ = sm_manager;
@@ -121,114 +57,17 @@ public:
     
     ~TransactionManager() = default;
 
-    Transaction* begin(Transaction* txn, LogManager* log_manager, IsolationLevel isolation_level);
+    Transaction* begin(Transaction* txn, LogManager* log_manager);
 
     void commit(Transaction* txn, LogManager* log_manager);
-    void capture_snapshot(Transaction* txn);
 
     void abort(Transaction* txn, LogManager* log_manager);
-
-    void PhysicalizeCommittedDeletes();
-
-    bool UpdateTupleMeta(const std::string &tab_name, Rid rid, std::optional<TupleMeta> meta,
-                         std::function<bool(std::optional<TupleMeta>)> &&check = nullptr);
-
-    std::optional<TupleMeta> GetTupleMeta(const std::string &tab_name, Rid rid);
-
-    TupleMeta GetTupleMetaOrDefault(const std::string &tab_name, Rid rid);
-
-    std::shared_ptr<PageVersionInfo> GetPageVersionInfo(const std::string &tab_name, page_id_t page_no);
-    std::shared_ptr<TableVersionInfo> GetTableVersionInfo(const std::string &tab_name);
-    std::shared_ptr<TableVersionInfo> GetOrCreateTableVersionInfo(const std::string &tab_name);
-    std::shared_ptr<PageVersionInfo> GetPageVersionInfoOnTable(
-        const std::shared_ptr<TableVersionInfo> &table_info, page_id_t page_no);
-    std::shared_ptr<PageVersionInfo> GetPageVersionInfoOnTable(
-        const std::shared_ptr<TableVersionInfo> &table_info, page_id_t page_no, uint64_t *page_map_epoch);
-    PageVersionInfo *GetPageVersionInfoOnTableRaw(
-        const std::shared_ptr<TableVersionInfo> &table_info, page_id_t page_no, uint64_t *page_map_epoch = nullptr);
-
-    std::optional<RmRecord> GetVisibleTuple(const std::string &tab_name, const Rid &rid, Transaction *txn,
-                                            TupleMeta *visible_meta = nullptr);
-
-    bool GetVisibleTupleInto(const std::string &tab_name, const Rid &rid, Transaction *txn, RmRecord *out_record,
-                            TupleMeta *visible_meta = nullptr);
-
-    bool GetReadCommittedTupleInto(const std::string &tab_name, const Rid &rid, Transaction *txn,
-                                   RmRecord *out_record, TupleMeta *visible_meta = nullptr,
-                                   RmRecordPageCursor *page_cursor = nullptr,
-                                   const ReadCommittedTupleHint *hint = nullptr);
-
-    ReadCommittedIndexEntryState ClassifyReadCommittedIndexEntry(const std::string &tab_name, const Rid &rid,
-                                                                 Transaction *txn);
-
-    ReadCommittedIndexEntryState ClassifyReadCommittedIndexEntryOnPage(
-        const std::shared_ptr<PageVersionInfo> &page_info, const Rid &rid, Transaction *txn);
-    ReadCommittedIndexEntryState ClassifyReadCommittedIndexEntryOnPage(
-        PageVersionInfo *page_info, const Rid &rid, Transaction *txn,
-        ReadCommittedTupleHint *hint = nullptr);
-    ReadCommittedIndexEntryState ClassifyReadCommittedIndexEntryState(std::optional<TupleMeta> meta,
-                                                                      bool has_version_link,
-                                                                      Transaction *txn) const;
-    ReadCommittedIndexEntryState ClassifyReadCommittedIndexEntryState(bool has_meta,
-                                                                      const TupleMeta &meta,
-                                                                      bool has_version_link,
-                                                                      Transaction *txn) const;
-    ReadCommittedIndexEntryState ClassifySnapshotIndexEntryOnPage(
-        PageVersionInfo *page_info, const Rid &rid, Transaction *txn,
-        ReadCommittedTupleHint *hint = nullptr);
-    ReadCommittedIndexEntryState ClassifySnapshotIndexEntryState(bool has_meta,
-                                                                  const TupleMeta &meta,
-                                                                  bool has_version_link,
-                                                                  Transaction *txn) const;
-    bool IsReadCommittedPageCleanVisible(const std::shared_ptr<PageVersionInfo> &page_info) const;
-    bool IsReadCommittedPageCleanVisible(const PageVersionInfo *page_info) const;
-    bool IsSnapshotPageCleanVisible(const PageVersionInfo *page_info, Transaction *txn) const;
-
-    void EnsureWriteConflictFree(Transaction *txn, const std::string &tab_name, const Rid &rid);
-
-    void EnsureWriteConflictFree(Transaction *txn, const TupleMeta &current_meta);
-
-    void EnsureKeyConflictFree(Transaction *txn, const std::string &tab_name, const TabMeta &tab,
-                               const RmRecord &record, const Rid *self_rid = nullptr);
-
-    UniqueKeyConflictResult ClassifyUniqueIndexConflict(Transaction *txn, const std::string &tab_name,
-                                                        const IndexMeta &index, const char *key,
-                                                        const std::vector<Rid> &matches,
-                                                        const Rid *self_rid = nullptr);
-
-    static void record_serializable_read(Transaction* txn, const std::string &tab_name, const Rid &rid);
-
-    static void record_serializable_predicate_read(Transaction* txn, const std::string &tab_name,
-                                                   const std::vector<ColMeta> &cols,
-                                                   const std::vector<Condition> &conds);
-
-    static void record_serializable_write(Transaction* txn, const std::string &tab_name, const Rid &rid,
-                                          const RmRecord *old_record, const RmRecord *new_record,
-                                          const std::vector<ColMeta> *cols);
 
     ConcurrencyMode get_concurrency_mode() { return concurrency_mode_; }
 
     void set_concurrency_mode(ConcurrencyMode concurrency_mode) { concurrency_mode_ = concurrency_mode; }
 
     LockManager* get_lock_manager() { return lock_manager_; }
-
-    std::vector<CheckpointTxnInfo> CollectActiveTxnCheckpointInfo(Transaction *exclude_txn = nullptr);
-
-    TransactionDrainGuard BlockNewTransactionsAndWait();
-
-    TransactionDrainGuard TryBlockNewTransactionsIfIdle();
-
-    TransactionDrainGuard BlockNewTransactionsAndWaitFor(std::chrono::milliseconds timeout);
-
-    size_t ActiveTransactionCount() const;
-
-    std::shared_lock<std::shared_mutex> EnterStatementExecution() {
-        return std::shared_lock<std::shared_mutex>(checkpoint_latch_);
-    }
-
-    std::unique_lock<std::shared_mutex> EnterCheckpointExecution() {
-        return std::unique_lock<std::shared_mutex>(checkpoint_latch_);
-    }
 
     /**
      * @description: 获取事务ID为txn_id的事务对象
@@ -237,11 +76,13 @@ public:
      */    
     Transaction* get_transaction(txn_id_t txn_id) {
         if(txn_id == INVALID_TXN_ID) return nullptr;
-        
-        std::shared_lock<std::shared_mutex> lock(txn_map_mutex_);
-        auto txn_iter = TransactionManager::txn_map.find(txn_id);
-        assert(txn_iter != TransactionManager::txn_map.end());
-        auto *res = txn_iter->second;
+
+        std::unique_lock<std::mutex> lock(latch_);
+        auto it = TransactionManager::txn_map.find(txn_id);
+        if (it == TransactionManager::txn_map.end()) {
+            return nullptr;
+        }
+        auto *res = it->second;
         lock.unlock();
         assert(res != nullptr);
         assert(res->get_thread_id() == std::this_thread::get_id());
@@ -249,39 +90,96 @@ public:
         return res;
     }
 
+    // Cross-thread safe transaction lookup (no thread_id assert)
+    Transaction* get_transaction_safe(txn_id_t txn_id) {
+        if(txn_id == INVALID_TXN_ID) return nullptr;
+        std::unique_lock<std::mutex> lock(latch_);
+        auto it = TransactionManager::txn_map.find(txn_id);
+        if (it == TransactionManager::txn_map.end()) return nullptr;
+        return it->second;
+    }
+
     static std::unordered_map<txn_id_t, Transaction *> txn_map;     // 全局事务表，存放事务ID与事务对象的映射关系
-    static std::shared_mutex txn_map_mutex_;
+    std::shared_mutex txn_map_mutex_;
     /** ------------------------以下函数仅可能在MVCC当中使用------------------------------------------*/
 
     /**
     * @brief 更新一个撤销链接，该链接将表堆元组与第一个撤销日志连接起来。
     * 在更新之前，将调用 `check` 函数以确保有效性。
     */
-    bool UpdateUndoLink(const std::string &tab_name, Rid rid, std::optional<UndoLink> prev_link,
+    bool UpdateUndoLink(Rid rid, std::optional<UndoLink> prev_link,
                         std::function<bool(std::optional<UndoLink>)> &&check = nullptr);
 
     /**
      * @brief 更新一个撤销链接，该链接将表堆元组与第一个撤销日志连接起来。
      * 在更新之前，将调用 `check` 函数以确保有效性。
      */
-    bool UpdateVersionLink(const std::string &tab_name, Rid rid, std::optional<VersionUndoLink> prev_version,
+    bool UpdateVersionLink(Rid rid, std::optional<VersionUndoLink> prev_version,
                            std::function<bool(std::optional<VersionUndoLink>)> &&check = nullptr);
 
-    void InstallTupleVersion(const std::string &tab_name, Rid rid, const VersionUndoLink &version,
-                             const TupleMeta &meta);
-
     /** @brief 获取表堆元组的第一个撤销日志。 */
-    std::optional<UndoLink> GetUndoLink(const std::string &tab_name, Rid rid);
+    std::optional<UndoLink> GetUndoLink(Rid rid);
 
     /** @brief 获取表堆元组的第一个撤销日志。*/
-    std::optional<VersionUndoLink> GetVersionLink(const std::string &tab_name, Rid rid);
+    std::optional<VersionUndoLink> GetVersionLink(Rid rid);
+
+    /** @brief Try to claim write intent on a record. Returns false if another txn already claimed it. */
+    bool TryClaimWrite(const Rid &rid, txn_id_t txn_id) {
+        std::shared_ptr<PageVersionInfo> page_info;
+        {
+            std::unique_lock<std::shared_mutex> wlock(version_info_mutex_);
+            auto it = version_info_.find(rid.page_no);
+            if (it == version_info_.end()) {
+                page_info = std::make_shared<PageVersionInfo>();
+                version_info_[rid.page_no] = page_info;
+            } else {
+                page_info = it->second;
+            }
+        }
+        std::unique_lock<std::shared_mutex> page_lock(page_info->mutex_);
+        auto it = page_info->prev_version_.find(rid.slot_no);
+        if (it != page_info->prev_version_.end() && it->second.in_progress_) {
+            if (it->second.prev_.prev_txn_ != txn_id) {
+                // Check if holder is still active
+                auto *holder = get_transaction_safe(it->second.prev_.prev_txn_);
+                if (!holder || holder->get_state() == TransactionState::COMMITTED ||
+                    holder->get_state() == TransactionState::ABORTED) {
+                    // Holder is gone — clear the stale claim and proceed
+                    it->second.in_progress_ = false;
+                } else {
+                    return false;
+                }
+            } else {
+                return true;
+            }
+        }
+        VersionUndoLink claim;
+        claim.in_progress_ = true;
+        claim.prev_.prev_txn_ = txn_id;
+        page_info->prev_version_[rid.slot_no] = claim;
+        return true;
+    }
+
+    /** @brief Release write intent on a record after commit/abort. */
+    void ReleaseWriteClaim(const Rid &rid, txn_id_t txn_id) {
+        std::shared_ptr<PageVersionInfo> page_info;
+        {
+            std::unique_lock<std::shared_mutex> wlock(version_info_mutex_);
+            auto it = version_info_.find(rid.page_no);
+            if (it == version_info_.end()) return;
+            page_info = it->second;
+        }
+        std::unique_lock<std::shared_mutex> page_lock(page_info->mutex_);
+        auto vit = page_info->prev_version_.find(rid.slot_no);
+        if (vit != page_info->prev_version_.end() && vit->second.in_progress_ &&
+            vit->second.prev_.prev_txn_ == txn_id) {
+            vit->second.in_progress_ = false;
+        }
+    }
 
     /** @brief 访问事务撤销日志缓冲区并获取撤销日志。如果事务不存在，返回 nullopt。
      * 如果索引超出范围仍然会抛出异常。 */
     std::optional<UndoLog> GetUndoLogOptional(UndoLink link);
-
-    /** Append an undo log while retaining any cross-transaction predecessor reference. */
-    UndoLink AppendUndoLog(Transaction *txn, UndoLog log);
 
     /** @brief 访问事务撤销日志缓冲区并获取撤销日志。除非访问当前事务缓冲区，
      * 否则应该始终调用此函数以获取撤销日志，而不是手动检索事务 shared_ptr 并访问缓冲区。 */
@@ -290,381 +188,232 @@ public:
     /** @brief 获取系统中的最低读时间戳。 */
     timestamp_t GetWatermark();
 
+    /** @brief Check if a tuple version is visible to the given transaction under MVCC. */
+    bool IsTupleVisible(const TupleMeta &meta, Transaction *txn) const {
+        if (txn == nullptr) return true;  // no transaction context → all visible
+        // Own write is always visible
+        if (meta.writer_txn_ == txn->get_transaction_id()) return true;
+        // Committed by another transaction: visible if committed before my snapshot
+        auto it = txn_map.find(meta.writer_txn_);
+        if (it != txn_map.end()) {
+            Transaction *writer = it->second;
+            if (writer->get_state() == TransactionState::COMMITTED) {
+                // Committed → check if commit_ts <= my snapshot
+                if (writer->get_commit_ts() <= txn->get_start_ts() && !meta.is_deleted_) {
+                    return true;
+                }
+            }
+            // In-progress or aborted → not visible
+        }
+        // Writer not found (perhaps aborted and cleaned up) → check by timestamp
+        if (meta.ts_ <= txn->get_start_ts() && !meta.is_deleted_ && meta.writer_txn_ == INVALID_TXN_ID) {
+            return true;
+        }
+        return false;
+    }
+
+    /** @brief Walk version chain to find a record version visible to the given txn. */
+    std::unique_ptr<RmRecord> GetVisibleVersion(const Rid &rid, RmFileHandle *fh, Transaction *txn) {
+        try {
+            auto [slot_meta, slot_rec] = fh->get_meta_and_record(rid);
+            if (slot_meta.writer_txn_ == txn->get_transaction_id()) {
+                return std::move(slot_rec);
+            }
+            if (IsTupleVisible(slot_meta, txn)) {
+                return std::move(slot_rec);
+            }
+            // If slot version was committed before our snapshot, use the slot directly
+            // (don't walk undo chain — the slot IS the visible committed state)
+            if (slot_meta.writer_txn_ != INVALID_TXN_ID &&
+                slot_meta.writer_txn_ != txn->get_transaction_id()) {
+                auto it = txn_map.find(slot_meta.writer_txn_);
+                if (it != txn_map.end() && it->second->get_state() == TransactionState::COMMITTED &&
+                    it->second->get_commit_ts() <= txn->get_start_ts()) {
+                    if (slot_meta.is_deleted_) return nullptr;  // deleted in snapshot
+                    return std::move(slot_rec);  // committed version visible
+                }
+            }
+            auto vlink = GetVersionLink(rid);
+            if (!vlink.has_value()) return nullptr;
+            UndoLink link = vlink->prev_;
+            int max_steps = 10;
+            while (link.IsValid() && max_steps-- > 0) {
+                auto undo = GetUndoLogOptional(link);
+                if (!undo.has_value()) break;
+                if (undo->ts_ <= txn->get_start_ts()) {
+                    if (undo->is_deleted_) return nullptr;
+                    if (undo->tuple_test_ != nullptr && undo->tuple_test_->size == fh->get_file_hdr().record_size) {
+                        auto rec = std::make_unique<RmRecord>(fh->get_file_hdr().record_size);
+                        memcpy(rec->data, undo->tuple_test_->data, fh->get_file_hdr().record_size);
+                        return rec;
+                    }
+                    return nullptr;
+                }
+                link = undo->prev_version_;
+            }
+            return nullptr;
+        } catch (...) {
+            return nullptr;  // don't crash on version chain errors
+        }
+    }
+
+    // SSI: check predicate reads when inserting/updating into a table
+    void CheckAndAddPredicateDep(const std::string &tab_name, Transaction *txn) {
+        std::unique_lock<std::mutex> lock(latch_);
+        for (auto &[tid, other] : txn_map) {
+            if (other == txn) continue;
+            if (other->get_isolation_level() != IsolationLevel::SERIALIZABLE) continue;
+            if (other->get_state() == TransactionState::COMMITTED ||
+                other->get_state() == TransactionState::ABORTED) continue;
+            auto pred = other->get_predicate_reads();
+            if (pred->count(tab_name)) {
+                other->add_pred_rw_out(txn->get_transaction_id());
+                txn->add_pred_rw_in(other->get_transaction_id());
+            }
+        }
+    }
+
+    // SSI: global read set (RID -> set of txn_ids that read it)
+    std::unordered_map<Rid, std::unordered_set<txn_id_t>> global_read_set_;
+    std::mutex global_read_set_mutex_;
+
+    // DELETE-INSERT conflict tracking: table_fd -> key -> set of deleting txn_ids
+    struct DeleteKey {
+        int fd;
+        std::string key_data;
+        bool operator==(const DeleteKey &o) const { return fd == o.fd && key_data == o.key_data; }
+    };
+    struct DeleteKeyHash {
+        size_t operator()(const DeleteKey &k) const {
+            return std::hash<int>()(k.fd) ^ std::hash<std::string>()(k.key_data);
+        }
+    };
+    std::unordered_map<DeleteKey, std::unordered_set<txn_id_t>, DeleteKeyHash> pending_deletes_;
+    std::mutex pending_deletes_mutex_;
+
+    void AddPendingDelete(int fd, const std::string &key_data, txn_id_t txn_id) {
+        std::lock_guard<std::mutex> lock(pending_deletes_mutex_);
+        pending_deletes_[{fd, key_data}].insert(txn_id);
+    }
+    void RemovePendingDelete(int fd, const std::string &key_data, txn_id_t txn_id) {
+        std::lock_guard<std::mutex> lock(pending_deletes_mutex_);
+        auto it = pending_deletes_.find({fd, key_data});
+        if (it != pending_deletes_.end()) {
+            it->second.erase(txn_id);
+            if (it->second.empty()) pending_deletes_.erase(it);
+        }
+    }
+    bool HasPendingDelete(int fd, const std::string &key_data, txn_id_t my_txn_id) {
+        std::lock_guard<std::mutex> lock(pending_deletes_mutex_);
+        auto it = pending_deletes_.find({fd, key_data});
+        if (it != pending_deletes_.end()) {
+            for (auto tid : it->second) {
+                if (tid != my_txn_id) {
+                    auto *t = get_transaction_safe(tid);
+                    if (t && t->get_state() != TransactionState::COMMITTED &&
+                        t->get_state() != TransactionState::ABORTED)
+                        return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    void AddToGlobalReadSet(const Rid &rid, txn_id_t txn_id) {
+        std::lock_guard<std::mutex> lock(global_read_set_mutex_);
+        global_read_set_[rid].insert(txn_id);
+    }
+
+    void RemoveTxnFromGlobalReadSet(txn_id_t txn_id) {
+        std::lock_guard<std::mutex> lock(global_read_set_mutex_);
+        for (auto &[rid, readers] : global_read_set_) {
+            readers.erase(txn_id);
+        }
+    }
+
+    std::unordered_set<txn_id_t> GetReaders(const Rid &rid) {
+        std::lock_guard<std::mutex> lock(global_read_set_mutex_);
+        auto it = global_read_set_.find(rid);
+        if (it != global_read_set_.end()) return it->second;
+        return {};
+    }
+
+    // SSI: check for dangerous structure after adding rw dependency
+    bool CheckSSIDangerous(Transaction *txn) {
+        if (txn->get_isolation_level() != IsolationLevel::SERIALIZABLE) return false;
+        // Unified self-loop check: combine pred + write-path deps
+        for (auto tin : txn->pred_rw_in_) {
+            for (auto tout : txn->pred_rw_out_) {
+                if (tin == tout) return true;
+            }
+            for (auto tout : txn->rw_out_) {
+                if (tin == tout) return true;
+            }
+        }
+        for (auto tin : txn->rw_in_) {
+            for (auto tout : txn->pred_rw_out_) {
+                if (tin == tout) return true;
+            }
+        }
+        auto my_ws = txn->get_write_set();
+        auto my_rs = txn->get_read_set();
+        if (my_ws->empty() || my_rs->empty()) return false;
+        std::unique_lock<std::mutex> lock(latch_);
+        for (auto &[tid, other] : txn_map) {
+            if (other == txn) continue;
+            if (other->get_isolation_level() != IsolationLevel::SERIALIZABLE) continue;
+            if (other->get_state() == TransactionState::COMMITTED ||
+                other->get_state() == TransactionState::ABORTED) continue;
+            auto other_ws = other->get_write_set();
+            auto other_rs = other->get_read_set();
+            if (other_ws->empty() || other_rs->empty()) continue;
+            // RID-level crossed deps
+            bool i_read_other = false, other_read_me = false;
+            for (auto &owr : *other_ws) if (my_rs->count(owr->GetRid())) { i_read_other = true; break; }
+            for (auto &wr : *my_ws) if (other_rs->count(wr->GetRid())) { other_read_me = true; break; }
+            if (i_read_other && other_read_me) return true;
+            // Predicate-level phantom: I have predicate on other's write table,
+            // OR other has predicate on my write table (combined with RID-level)
+            auto my_pred = txn->get_predicate_reads();
+            auto other_pred = other->get_predicate_reads();
+            auto my_wt = txn->get_write_tables();
+            auto other_wt = other->get_write_tables();
+            bool i_pred_other = false, other_pred_me = false;
+            for (auto &t : *other_wt) if (!my_pred->empty() && my_pred->count(t)) { i_pred_other = true; break; }
+            for (auto &t : *my_wt) if (!other_pred->empty() && other_pred->count(t)) { other_pred_me = true; break; }
+            // Phantom: I read (predicate) other's write AND other read (RID or predicate) my write
+            if (i_pred_other && other_read_me) return true;
+            if (i_read_other && other_pred_me) return true;
+            if (i_pred_other && other_pred_me) return true;
+        }
+        return false;
+    }
+
     /** @brief 垃圾回收。仅在所有事务都未访问时调用。 */
     void GarbageCollection();
 
     struct PageVersionInfo {
         std::shared_mutex mutex_;
-        std::atomic<int> active_meta_count_{0};
-        std::atomic<int> uncommitted_meta_count_{0};
-        std::atomic<int> deleted_count_{0};
-        std::atomic<int> version_link_count_{0};
-        std::atomic<timestamp_t> max_committed_meta_ts_{0};
-        std::atomic<uint64_t> visibility_epoch_{1};
-        std::atomic<uint32_t> dirty_slot_count_{0};
-        uint32_t slot_count_{0};
-        uint32_t slot_word_count_{0};
-        std::unique_ptr<std::atomic<uint64_t>[]> dirty_slot_words_;
-        uint32_t dirty_slot_word_count_{0};
-        std::unique_ptr<uint64_t[]> tuple_meta_valid_words_;
-        std::unique_ptr<TupleMeta[]> tuple_meta_values_;
-        std::unique_ptr<uint64_t[]> version_valid_words_;
-        std::unique_ptr<VersionUndoLink[]> version_values_;
-
-        void InitDirtySlots(uint32_t slot_count) {
-            if (slot_count == 0 || dirty_slot_words_ != nullptr) {
-                return;
-            }
-            uint32_t word_count = (slot_count + 63) / 64;
-            auto words = std::make_unique<std::atomic<uint64_t>[]>(word_count);
-            for (uint32_t i = 0; i < word_count; ++i) {
-                words[i].store(0, std::memory_order_relaxed);
-            }
-            slot_count_ = slot_count;
-            slot_word_count_ = word_count;
-            dirty_slot_word_count_ = word_count;
-            dirty_slot_words_ = std::move(words);
-        }
-
-        bool CanTrackSlot(slot_offset_t slot_no) const {
-            return slot_no < slot_count_;
-        }
-
-        static uint64_t SlotBit(slot_offset_t slot_no) {
-            return uint64_t{1} << (slot_no & 63);
-        }
-
-        void EnsureTupleMetaStorage() {
-            if (tuple_meta_values_ != nullptr) {
-                return;
-            }
-            tuple_meta_valid_words_ = std::make_unique<uint64_t[]>(slot_word_count_);
-            tuple_meta_values_ = std::make_unique<TupleMeta[]>(slot_count_);
-        }
-
-        bool HasTupleMeta(slot_offset_t slot_no) const {
-            if (!CanTrackSlot(slot_no) || tuple_meta_valid_words_ == nullptr) {
-                return false;
-            }
-            return (tuple_meta_valid_words_[slot_no / 64] & SlotBit(slot_no)) != 0;
-        }
-
-        const TupleMeta *GetTupleMeta(slot_offset_t slot_no) const {
-            return HasTupleMeta(slot_no) ? &tuple_meta_values_[slot_no] : nullptr;
-        }
-
-        TupleMeta *GetMutableTupleMeta(slot_offset_t slot_no) {
-            return HasTupleMeta(slot_no) ? &tuple_meta_values_[slot_no] : nullptr;
-        }
-
-        bool SetTupleMeta(slot_offset_t slot_no, const TupleMeta &meta) {
-            assert(CanTrackSlot(slot_no));
-            EnsureTupleMetaStorage();
-            uint64_t &word = tuple_meta_valid_words_[slot_no / 64];
-            uint64_t bit = SlotBit(slot_no);
-            bool existed = (word & bit) != 0;
-            tuple_meta_values_[slot_no] = meta;
-            word |= bit;
-            return existed;
-        }
-
-        bool ClearTupleMeta(slot_offset_t slot_no) {
-            if (!HasTupleMeta(slot_no)) {
-                return false;
-            }
-            tuple_meta_valid_words_[slot_no / 64] &= ~SlotBit(slot_no);
-            return true;
-        }
-
-        void ReleaseTupleMetaStorageIfEmpty() {
-            if (active_meta_count_.load(std::memory_order_relaxed) == 0) {
-                tuple_meta_values_.reset();
-                tuple_meta_valid_words_.reset();
-            }
-        }
-
-        void EnsureVersionStorage() {
-            if (version_values_ != nullptr) {
-                return;
-            }
-            version_valid_words_ = std::make_unique<uint64_t[]>(slot_word_count_);
-            version_values_ = std::make_unique<VersionUndoLink[]>(slot_count_);
-        }
-
-        bool HasVersion(slot_offset_t slot_no) const {
-            if (!CanTrackSlot(slot_no) || version_valid_words_ == nullptr) {
-                return false;
-            }
-            return (version_valid_words_[slot_no / 64] & SlotBit(slot_no)) != 0;
-        }
-
-        const VersionUndoLink *GetVersion(slot_offset_t slot_no) const {
-            return HasVersion(slot_no) ? &version_values_[slot_no] : nullptr;
-        }
-
-        VersionUndoLink *GetMutableVersion(slot_offset_t slot_no) {
-            return HasVersion(slot_no) ? &version_values_[slot_no] : nullptr;
-        }
-
-        bool SetVersion(slot_offset_t slot_no, const VersionUndoLink &version) {
-            assert(CanTrackSlot(slot_no));
-            EnsureVersionStorage();
-            uint64_t &word = version_valid_words_[slot_no / 64];
-            uint64_t bit = SlotBit(slot_no);
-            bool existed = (word & bit) != 0;
-            version_values_[slot_no] = version;
-            word |= bit;
-            return existed;
-        }
-
-        bool ClearVersion(slot_offset_t slot_no) {
-            if (!HasVersion(slot_no)) {
-                return false;
-            }
-            version_valid_words_[slot_no / 64] &= ~SlotBit(slot_no);
-            return true;
-        }
-
-        void ReleaseVersionStorageIfEmpty() {
-            if (version_link_count_.load(std::memory_order_relaxed) == 0) {
-                version_values_.reset();
-                version_valid_words_.reset();
-            }
-        }
-
-        bool CanTrackDirtySlot(slot_offset_t slot_no) const {
-            uint32_t word_idx = static_cast<uint32_t>(slot_no / 64);
-            return dirty_slot_words_ != nullptr && word_idx < dirty_slot_word_count_;
-        }
-
-        bool MarkDirtySlot(slot_offset_t slot_no) {
-            uint32_t word_idx = static_cast<uint32_t>(slot_no / 64);
-            if (!CanTrackDirtySlot(slot_no)) {
-                return false;
-            }
-            uint64_t bit = 1ull << (slot_no & 63);
-            uint64_t old = dirty_slot_words_[word_idx].fetch_or(bit, std::memory_order_acq_rel);
-            if ((old & bit) != 0) {
-                return false;
-            }
-            dirty_slot_count_.fetch_add(1, std::memory_order_acq_rel);
-            return true;
-        }
-
-        bool ClearDirtySlot(slot_offset_t slot_no) {
-            uint32_t word_idx = static_cast<uint32_t>(slot_no / 64);
-            if (!CanTrackDirtySlot(slot_no)) {
-                return false;
-            }
-            uint64_t bit = 1ull << (slot_no & 63);
-            uint64_t old = dirty_slot_words_[word_idx].fetch_and(~bit, std::memory_order_acq_rel);
-            if ((old & bit) == 0) {
-                return false;
-            }
-            dirty_slot_count_.fetch_sub(1, std::memory_order_acq_rel);
-            return true;
-        }
-
-        bool IsSlotClean(slot_offset_t slot_no) const {
-            uint32_t word_idx = static_cast<uint32_t>(slot_no / 64);
-            if (dirty_slot_words_ == nullptr || word_idx >= dirty_slot_word_count_) {
-                return false;
-            }
-            uint64_t bit = 1ull << (slot_no & 63);
-            return (dirty_slot_words_[word_idx].load(std::memory_order_acquire) & bit) == 0;
-        }
-
-        uint32_t DirtySlotCount() const {
-            return dirty_slot_count_.load(std::memory_order_acquire);
-        }
-    };
-
-    struct TableVersionInfo {
-        static constexpr page_id_t kExactDirtyPageLimit = 1 << 20;
-        static constexpr size_t kExactDirtyPageWordCount = static_cast<size_t>(kExactDirtyPageLimit) / 64;
-        static constexpr size_t kDensePageChunkBits = 10;
-        static constexpr size_t kDensePageChunkSize = 1 << kDensePageChunkBits;
-        static constexpr size_t kDensePageChunkMask = kDensePageChunkSize - 1;
-        static constexpr size_t kDensePageChunkCount =
-            static_cast<size_t>(kExactDirtyPageLimit) / kDensePageChunkSize;
-
-        struct PageInfoChunk {
-            std::array<std::atomic<PageVersionInfo *>, kDensePageChunkSize> pages_{};
-
-            PageInfoChunk() {
-                for (auto &page : pages_) {
-                    page.store(nullptr, std::memory_order_relaxed);
-                }
-            }
-        };
-
-        TableVersionInfo() {
-            for (auto &word : dirty_page_filter_) {
-                word.store(0, std::memory_order_relaxed);
-            }
-            for (auto &word : exact_dirty_pages_) {
-                word.store(0, std::memory_order_relaxed);
-            }
-            for (auto &chunk : page_info_chunks_) {
-                chunk.store(nullptr, std::memory_order_relaxed);
-            }
-        }
-
-        std::shared_mutex mutex_;
-        std::atomic<uint64_t> page_map_epoch_{0};
-        std::atomic<uint32_t> dirty_page_count_{0};
-        std::atomic<uint64_t> dirty_slot_total_{0};
-        std::array<std::atomic<uint64_t>, 1024> dirty_page_filter_{};
-        std::array<std::atomic<uint64_t>, kExactDirtyPageWordCount> exact_dirty_pages_{};
-        std::array<std::atomic<PageInfoChunk *>, kDensePageChunkCount> page_info_chunks_{};
-        std::vector<std::unique_ptr<PageInfoChunk>> page_info_chunk_owners_;
-        std::unordered_map<page_id_t, std::shared_ptr<PageVersionInfo>> pages_;
-
-        bool maybe_has_page_version_info(page_id_t page_no) const {
-            uint64_t hash = static_cast<uint64_t>(static_cast<uint32_t>(page_no)) * 11400714819323198485ull;
-            size_t bucket = static_cast<size_t>(hash & (dirty_page_filter_.size() - 1));
-            uint64_t bit = 1ull << ((hash >> 10) & 63);
-            return (dirty_page_filter_[bucket].load(std::memory_order_acquire) & bit) != 0;
-        }
-
-        void mark_page_version_info(page_id_t page_no) {
-            uint64_t hash = static_cast<uint64_t>(static_cast<uint32_t>(page_no)) * 11400714819323198485ull;
-            size_t bucket = static_cast<size_t>(hash & (dirty_page_filter_.size() - 1));
-            uint64_t bit = 1ull << ((hash >> 10) & 63);
-            dirty_page_filter_[bucket].fetch_or(bit, std::memory_order_release);
-        }
-
-        bool tracks_exact_dirty_page(page_id_t page_no) const {
-            return page_no >= 0 && page_no < kExactDirtyPageLimit;
-        }
-
-        bool is_page_dirty_exact(page_id_t page_no) const {
-            if (!tracks_exact_dirty_page(page_no)) {
-                return true;
-            }
-            size_t word_idx = static_cast<size_t>(page_no) / 64;
-            uint64_t bit = 1ull << (static_cast<uint32_t>(page_no) & 63);
-            return (exact_dirty_pages_[word_idx].load(std::memory_order_acquire) & bit) != 0;
-        }
-
-        bool mark_page_dirty_exact(page_id_t page_no) {
-            if (!tracks_exact_dirty_page(page_no)) {
-                return false;
-            }
-            size_t word_idx = static_cast<size_t>(page_no) / 64;
-            uint64_t bit = 1ull << (static_cast<uint32_t>(page_no) & 63);
-            uint64_t old = exact_dirty_pages_[word_idx].fetch_or(bit, std::memory_order_acq_rel);
-            if ((old & bit) != 0) {
-                return false;
-            }
-            dirty_page_count_.fetch_add(1, std::memory_order_acq_rel);
-            return true;
-        }
-
-        bool clear_page_dirty_exact(page_id_t page_no) {
-            if (!tracks_exact_dirty_page(page_no)) {
-                return false;
-            }
-            size_t word_idx = static_cast<size_t>(page_no) / 64;
-            uint64_t bit = 1ull << (static_cast<uint32_t>(page_no) & 63);
-            uint64_t old = exact_dirty_pages_[word_idx].fetch_and(~bit, std::memory_order_acq_rel);
-            if ((old & bit) == 0) {
-                return false;
-            }
-            dirty_page_count_.fetch_sub(1, std::memory_order_acq_rel);
-            return true;
-        }
-
-        PageVersionInfo *lookup_page_info_dense(page_id_t page_no) const {
-            if (!tracks_exact_dirty_page(page_no)) {
-                return nullptr;
-            }
-            size_t chunk_idx = static_cast<size_t>(page_no) >> kDensePageChunkBits;
-            size_t chunk_offset = static_cast<size_t>(page_no) & kDensePageChunkMask;
-            auto *chunk = page_info_chunks_[chunk_idx].load(std::memory_order_acquire);
-            if (chunk == nullptr) {
-                return nullptr;
-            }
-            return chunk->pages_[chunk_offset].load(std::memory_order_acquire);
-        }
-
-        void publish_page_info_dense(page_id_t page_no, PageVersionInfo *page_info) {
-            if (!tracks_exact_dirty_page(page_no) || page_info == nullptr) {
-                return;
-            }
-            size_t chunk_idx = static_cast<size_t>(page_no) >> kDensePageChunkBits;
-            size_t chunk_offset = static_cast<size_t>(page_no) & kDensePageChunkMask;
-            auto *chunk = page_info_chunks_[chunk_idx].load(std::memory_order_acquire);
-            if (chunk == nullptr) {
-                auto owner = std::make_unique<PageInfoChunk>();
-                chunk = owner.get();
-                page_info_chunk_owners_.push_back(std::move(owner));
-                page_info_chunks_[chunk_idx].store(chunk, std::memory_order_release);
-            }
-            chunk->pages_[chunk_offset].store(page_info, std::memory_order_release);
-        }
-
-        uint32_t DirtyPageCount() const {
-            return dirty_page_count_.load(std::memory_order_acquire);
-        }
-
-        uint64_t DirtySlotTotal() const {
-            return dirty_slot_total_.load(std::memory_order_acquire);
-        }
+        /** 存储所有槽的先前版本信息。注意：不要使用 `[x]` 来访问它，因为
+         * 即使不存在也会创建新元素。请使用 `find` 来代替。
+         */
+        std::unordered_map<slot_offset_t, VersionUndoLink> prev_version_;
     };
 
     /** 保护版本信息 */
     std::shared_mutex version_info_mutex_;
-    /** 存储每张表堆中每个元组的先前版本。 */
-    std::unordered_map<std::string, std::shared_ptr<TableVersionInfo>> version_info_;
-    inline static std::atomic<uint64_t> next_version_cache_id_{1};
-    const uint64_t version_cache_id_{next_version_cache_id_.fetch_add(1, std::memory_order_relaxed)};
-    std::atomic<uint64_t> version_info_epoch_{1};
+    /** 存储表堆中每个元组的先前版本。 */
+    std::unordered_map<page_id_t, std::shared_ptr<PageVersionInfo>> version_info_;
 
 
 private:
-    friend class TransactionDrainGuard;
-
-    struct RetiredTuple {
-        std::string tab_name;
-        Rid rid;
-    };
-
-    struct RetiredTransaction {
-        timestamp_t commit_ts{INVALID_TS};
-        std::vector<RetiredTuple> tuples;
-    };
-
     ConcurrencyMode concurrency_mode_;      // 事务使用的并发控制算法，目前只需要考虑2PL
     std::atomic<txn_id_t> next_txn_id_{0};  // 用于分发事务ID
     std::atomic<timestamp_t> next_timestamp_{0};    // 用于分发事务时间戳
-    std::shared_mutex checkpoint_latch_;  // 静态检查点期间阻止新语句进入并等待正在执行语句结束
-    mutable std::mutex admission_mutex_;
-    std::condition_variable admission_cv_;
-    bool transaction_admission_blocked_{false};
-    size_t active_transaction_count_{0};
+    std::mutex latch_;  // 用于txn_map的并发
     SmManager *sm_manager_;
     LockManager *lock_manager_;
 
-    std::shared_ptr<PageVersionInfo> GetOrCreatePageVersionInfo(const std::string &tab_name, page_id_t page_no);
-    std::shared_ptr<PageVersionInfo> GetOrCreatePageVersionInfoOnTable(
-        const std::shared_ptr<TableVersionInfo> &table_info, const std::string &tab_name, page_id_t page_no);
-    void RetainUndoReference(const UndoLink &link);
-    void ReleaseUndoReference(const UndoLink &link);
-    void EnqueueRetiredTuples(timestamp_t commit_ts, std::vector<RetiredTuple> tuples);
-    bool ReclaimRetiredTuple(timestamp_t commit_ts, const RetiredTuple &retired);
-    void QueueFinishedTransactionForGc(Transaction *txn);
-    void GarbageCollectFinishedTransactions();
-    void FinishTransactionAdmission(Transaction *txn);
-    void CancelTransactionAdmissionReservation();
-    void ReleaseTransactionDrain();
-
     std::atomic<timestamp_t> last_commit_ts_{0};    // 最后提交的时间戳,仅用于MVCC
     Watermark running_txns_{0};             // 存储所有正在运行事务的读取时间戳，以便于垃圾回收，仅用于MVCC
-    std::mutex gc_run_mutex_;
-    std::mutex gc_mutex_;
-    std::deque<RetiredTransaction> retired_txn_gc_queue_;
-    std::atomic<size_t> retired_tuple_count_{0};
-    std::deque<txn_id_t> finished_txn_gc_queue_;
-    size_t finished_txn_gc_since_last_{0};
 };

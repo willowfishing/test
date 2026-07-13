@@ -10,9 +10,6 @@ See the Mulan PSL v2 for more details. */
 #undef NDEBUG
 
 #include <cassert>
-#include <iostream>
-#include <string>
-#include <vector>
 
 #include "parser.h"
 

@@ -43,9 +43,11 @@ class RmManager {
         file_hdr.record_size = record_size;
         file_hdr.num_pages = 1;
         file_hdr.first_free_page_no = RM_NO_PAGE;
-        // We have: sizeof(hdr) + (n + 7) / 8 + n * record_size <= PAGE_SIZE
+        // We have: sizeof(hdr) + (n + 7) / 8 + n * (record_size + RM_TUPLE_META_SIZE) <= PAGE_SIZE
+        // Slot = TupleMeta + record data
+        int slot_stride = record_size + RM_TUPLE_META_SIZE;
         file_hdr.num_records_per_page =
-            (BITMAP_WIDTH * (PAGE_SIZE - 1 - (int)sizeof(RmFileHdr)) + 1) / (1 + record_size * BITMAP_WIDTH);
+            (BITMAP_WIDTH * (PAGE_SIZE - 1 - (int)sizeof(RmFileHdr)) + 1) / (1 + slot_stride * BITMAP_WIDTH);
         file_hdr.bitmap_size = (file_hdr.num_records_per_page + BITMAP_WIDTH - 1) / BITMAP_WIDTH;
 
         // 将file header写入磁盘文件（名为file name，文件描述符为fd）中的第0页
@@ -79,7 +81,6 @@ class RmManager {
                                   sizeof(file_handle->file_hdr_));
         // 缓冲区的所有页刷到磁盘，注意这句话必须写在close_file前面
         buffer_pool_manager_->flush_all_pages(file_handle->fd_);
-        disk_manager_->sync_file(file_handle->fd_);
         disk_manager_->close_file(file_handle->fd_);
     }
 };

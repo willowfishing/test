@@ -9,97 +9,117 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
-#include "common/index_runtime.h"
-#include "execution_common.h"
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
-#include "executor_scan_cache.h"
 #include "index/ix.h"
-#include "recovery/log_manager.h"
 #include "system/sm.h"
-#include "transaction/transaction_manager.h"
 
 class DeleteExecutor : public AbstractExecutor {
    private:
-    const TabMeta *tab_ = nullptr;  // 表的元数据
+    TabMeta tab_;                   // 表的元数据
     std::vector<Condition> conds_;  // delete的条件
     RmFileHandle *fh_;              // 表的数据文件句柄
     std::vector<Rid> rids_;         // 需要删除的记录的位置
     std::string tab_name_;          // 表名称
     SmManager *sm_manager_;
-    std::vector<rmdb::IndexBinding> index_bindings_;
-    std::vector<std::string> index_key_scratch_;
-    std::vector<std::string> changed_cols_;
 
    public:
     DeleteExecutor(SmManager *sm_manager, const std::string &tab_name, std::vector<Condition> conds,
-                   std::vector<Rid> rids, Context *context,
-                   std::shared_ptr<const PlanRuntimeCache> runtime_cache = nullptr) {
+                   std::vector<Rid> rids, Context *context) {
         sm_manager_ = sm_manager;
         tab_name_ = tab_name;
-        const bool use_cache = runtime_cache != nullptr && runtime_cache->has_table;
-        tab_ = use_cache ? runtime_cache->tab : &sm_manager_->db_.get_table(tab_name);
-        fh_ = use_cache ? runtime_cache->fh : sm_manager_->fhs_.at(tab_name).get();
+        tab_ = sm_manager_->db_.get_table(tab_name);
+        fh_ = sm_manager_->fhs_.at(tab_name).get();
         conds_ = conds;
         rids_ = rids;
         context_ = context;
-        index_bindings_ = runtime_cache != nullptr && runtime_cache->has_index_bindings
-                              ? runtime_cache->index_bindings
-                              : rmdb::bind_table_indexes(sm_manager_, tab_name_, *tab_);
-        index_key_scratch_.resize(index_bindings_.size());
-        for (size_t i = 0; i < index_bindings_.size(); ++i) {
-            index_key_scratch_[i].resize(index_bindings_[i].meta->col_tot_len);
-        }
-        changed_cols_.reserve(tab_->cols.size());
-        for (const auto &col : tab_->cols) {
-            changed_cols_.push_back(col.name);
-        }
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        if (!rids_.empty()) {
-            rmdb::bump_scan_cache_columns(tab_name_, changed_cols_);
-        }
+        // Sort rids for consistent lock ordering (deadlock prevention)
+        std::sort(rids_.begin(), rids_.end(), [](const Rid &a, const Rid &b) {
+            if (a.page_no != b.page_no) return a.page_no < b.page_no;
+            return a.slot_no < b.slot_no;
+        });
         for (auto &rid : rids_) {
-            if (context_ != nullptr && context_->lock_mgr_ != nullptr && context_->txn_ != nullptr &&
-                !context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd())) {
-                throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
-            }
-            std::unique_ptr<RmRecord> rec;
-            try {
-                rec = fh_->get_record(rid, context_);
-            } catch (RMDBError &) {
-                throw;
-            }
-            if (context_ != nullptr && context_->txn_mgr_ != nullptr) {
-                context_->txn_mgr_->EnsureWriteConflictFree(context_->txn_, tab_name_, rid);
-                auto visible_old = context_->txn_mgr_->GetVisibleTuple(tab_name_, rid, context_->txn_);
-                if (!visible_old.has_value()) {
+            // Write-write conflict detection via atomic claiming (MVCC)
+            if (context_ && context_->txn_ && context_->txn_mgr_) {
+                TupleMeta meta = fh_->get_meta(rid);
+                if (meta.writer_txn_ != INVALID_TXN_ID &&
+                    meta.writer_txn_ != context_->txn_->get_transaction_id()) {
+                    auto *writer = context_->txn_mgr_->get_transaction_safe(meta.writer_txn_);
+                    if (writer && writer->get_state() == TransactionState::COMMITTED &&
+                        writer->get_commit_ts() > context_->txn_->get_start_ts()) {
+                        throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                            AbortReason::DEADLOCK_PREVENTION);
+                    }
+                }
+                if (!context_->txn_mgr_->TryClaimWrite(rid, context_->txn_->get_transaction_id())) {
                     throw TransactionAbortException(context_->txn_->get_transaction_id(),
-                                                    AbortReason::DEADLOCK_PREVENTION);
+                        AbortReason::DEADLOCK_PREVENTION);
+                }
+                // SSI: rw-out dependency
+                if (context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+                    auto readers = context_->txn_mgr_->GetReaders(rid);
+                    for (auto reader_id : readers) {
+                        if (reader_id != context_->txn_->get_transaction_id()) {
+                            auto *reader = context_->txn_mgr_->get_transaction_safe(reader_id);
+                            if (reader && reader->get_state() != TransactionState::COMMITTED &&
+                                reader->get_state() != TransactionState::ABORTED) {
+                                reader->add_rw_in(context_->txn_->get_transaction_id());
+                                context_->txn_->add_rw_out(reader_id);
+                            }
+                        }
+                    }
                 }
             }
-            TransactionManager::record_serializable_write(context_ == nullptr ? nullptr : context_->txn_,
-                                                          tab_name_, rid, rec.get(), nullptr, &tab_->cols);
+            // Save old record for rollback and version chain
+            auto old_rec = fh_->get_record(rid, context_);
+            if (context_ && context_->txn_ && context_->txn_mgr_) {
+                TupleMeta old_meta = fh_->get_meta(rid);
+                auto old_data = new RmRecord(fh_->get_file_hdr().record_size);
+                memcpy(old_data->data, old_rec->data, fh_->get_file_hdr().record_size);
+                UndoLog undo;
+                undo.is_deleted_ = old_meta.is_deleted_;
+                undo.ts_ = old_meta.ts_;
+                undo.tuple_test_ = old_data;
+                auto prev_link = context_->txn_mgr_->GetVersionLink(rid);
+                if (prev_link.has_value()) {
+                    undo.prev_version_ = prev_link->prev_;
+                }
+                auto link = context_->txn_->AppendUndoLog(undo);
+                context_->txn_mgr_->UpdateVersionLink(rid,
+                    VersionUndoLink{link, true});
+            }
+            RmRecord rec_copy(fh_->get_file_hdr().record_size);
+            memcpy(rec_copy.data, old_rec->data, rec_copy.size);
+
+            // Remove from indexes first
+            for (auto &index : tab_.indexes) {
+                std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols);
+                if (!sm_manager_->ihs_.count(ix_name)) continue;
+                auto ih = sm_manager_->ihs_.at(ix_name).get();
+                char *key = new char[index.col_tot_len];
+                int offset = 0;
+                for (size_t i = 0; i < index.col_num; ++i) {
+                    memcpy(key + offset, old_rec->data + index.cols[i].offset, index.cols[i].len);
+                    offset += index.cols[i].len;
+                }
+                // Register pending delete for INSERT conflict detection
+                if (context_ && context_->txn_ && context_->txn_mgr_) {
+                    context_->txn_mgr_->AddPendingDelete(fh_->GetFd(),
+                        std::string(key, index.col_tot_len), context_->txn_->get_transaction_id());
+                }
+                ih->delete_entry(key, context_->txn_);
+                delete[] key;
+            }
+            fh_->delete_record(rid, context_);
+
+            // 记录写操作到事务
             if (context_ != nullptr && context_->txn_ != nullptr) {
-                if (context_->txn_mgr_ != nullptr) {
-                    TupleMeta old_meta = context_->txn_mgr_->GetTupleMetaOrDefault(tab_name_, rid);
-                    auto old_version = context_->txn_mgr_->GetVersionLink(tab_name_, rid);
-                    auto undo_image = std::make_shared<RmRecord>(*rec);
-                    UndoLog undo_log{old_meta.is_deleted_, {}, {}, undo_image, old_meta.ts_,
-                                     old_version.has_value() ? old_version->prev_ : UndoLink{}};
-                    UndoLink undo_link = context_->txn_mgr_->AppendUndoLog(context_->txn_, std::move(undo_log));
-                    context_->txn_mgr_->UpdateVersionLink(tab_name_, rid, VersionUndoLink{undo_link, true});
-                    context_->txn_mgr_->UpdateTupleMeta(
-                        tab_name_, rid, TupleMeta{TXN_START_ID + context_->txn_->get_transaction_id(), true});
-                }
-                context_->txn_->emplace_write_record(WType::DELETE_TUPLE, tab_name_, rid, *rec);
-            }
-            if (context_ != nullptr && context_->log_mgr_ != nullptr && context_->txn_ != nullptr) {
-                DeleteLogRecord log_record(context_->txn_->get_transaction_id(), *rec, rid, tab_name_);
-                log_record.prev_lsn_ = context_->txn_->get_prev_lsn();
-                context_->txn_->set_prev_lsn(context_->log_mgr_->add_log_to_buffer(&log_record));
+                WriteRecord *wr = new WriteRecord(WType::DELETE_TUPLE, tab_name_, rid, rec_copy);
+                context_->txn_->append_write_record(wr);
             }
         }
         return nullptr;

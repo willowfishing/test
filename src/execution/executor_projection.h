@@ -20,10 +20,7 @@ class ProjectionExecutor : public AbstractExecutor {
     std::unique_ptr<AbstractExecutor> prev_;        // 投影节点的儿子节点
     std::vector<ColMeta> cols_;                     // 需要投影的字段
     size_t len_;                                    // 字段总长度
-    std::vector<size_t> sel_idxs_;
-    mutable RmRecord current_record_;
-    mutable TupleView current_view_;
-    mutable std::vector<const char *> current_cells_;
+    std::vector<size_t> sel_idxs_;                  
 
    public:
     ProjectionExecutor(std::unique_ptr<AbstractExecutor> prev, const std::vector<TabCol> &sel_cols) {
@@ -42,53 +39,34 @@ class ProjectionExecutor : public AbstractExecutor {
         len_ = curr_offset;
     }
 
-    void beginTuple() override { prev_->beginTuple(); }
+    size_t tupleLen() const override { return len_; }
 
-    void nextTuple() override { prev_->nextTuple(); }
+    const std::vector<ColMeta> &cols() const override {
+        return cols_;
+    }
+
+    void beginTuple() override {
+        prev_->beginTuple();
+    }
+
+    void nextTuple() override {
+        prev_->nextTuple();
+    }
+
+    bool is_end() const override {
+        return prev_->is_end();
+    }
 
     std::unique_ptr<RmRecord> Next() override {
-        auto tuple = prev_->ReadTupleView();
-        if (!tuple) {
-            return nullptr;
+        auto prev_rec = prev_->Next();
+        auto proj_rec = std::make_unique<RmRecord>(len_);
+        for (size_t i = 0; i < sel_idxs_.size(); i++) {
+            memcpy(proj_rec->data + cols_[i].offset,
+                   prev_rec->data + prev_->cols()[sel_idxs_[i]].offset,
+                   cols_[i].len);
         }
-        auto rec = std::make_unique<RmRecord>(static_cast<int>(len_));
-        auto &prev_cols = prev_->cols();
-        for (size_t i = 0; i < sel_idxs_.size(); ++i) {
-            const auto &prev_col = prev_cols[sel_idxs_[i]];
-            memcpy(rec->data + cols_[i].offset, tuple.view->cell_at(prev_col, sel_idxs_[i]), prev_col.len);
-        }
-        return rec;
+        return proj_rec;
     }
 
-    const TupleView *CurrentTupleView() const override {
-        auto prev_view = prev_->CurrentTupleView();
-        if (prev_view == nullptr) {
-            return nullptr;
-        }
-        auto &prev_cols = prev_->cols();
-        current_cells_.resize(sel_idxs_.size());
-        for (size_t i = 0; i < sel_idxs_.size(); ++i) {
-            const auto &prev_col = prev_cols[sel_idxs_[i]];
-            current_cells_[i] = prev_view->cell_at(prev_col, sel_idxs_[i]);
-        }
-        current_view_.record = nullptr;
-        current_view_.cells = &current_cells_;
-        return &current_view_;
-    }
-
-    const RmRecord *CurrentTuple() const override {
-        auto view = CurrentTupleView();
-        if (view == nullptr) {
-            return nullptr;
-        }
-        materialize_tuple_view(*view, cols_, &current_record_, len_);
-        return &current_record_;
-    }
-
-    bool is_end() const override { return prev_->is_end(); }
-    size_t tupleLen() const override { return len_; }
-    const std::vector<ColMeta> &cols() const override { return cols_; }
-    std::string getType() override { return "ProjectionExecutor"; }
-    ColMeta get_col_offset(const TabCol &target) override { return *get_col(cols_, target); }
     Rid &rid() override { return _abstract_rid; }
 };

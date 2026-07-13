@@ -11,6 +11,11 @@ void yyerror(YYLTYPE *locp, const char* s) {
 }
 
 using namespace ast;
+
+// 全局变量：收集 JOIN ON 条件
+static std::vector<std::shared_ptr<BinaryExpr>> g_on_conds;
+// 全局变量：收集 UNION 子查询 (共享 ast.cpp 中的 g_union_map)
+// 通过 ast::get_union_map() 访问
 %}
 
 // request a pure (reentrant) parser
@@ -22,8 +27,9 @@ using namespace ast;
 
 // keywords
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
-WHERE UPDATE SET TRANSACTION ISOLATION LEVEL SNAPSHOT SERIALIZABLE SELECT INT CHAR FLOAT DATETIME INDEX AND JOIN SEMI ON GROUP HAVING LIMIT AS EXPLAIN ANALYZE UNION EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE STATIC_CHECKPOINT LOAD
-%token MAX MIN COUNT SUM AVG
+WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN ON EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE EXPLAIN ANALYZE
+%token COUNT MAX MIN SUM AVG GROUP HAVING LIMIT AS UNION
+%token TRANSACTION ISOLATION SNAPSHOT LEVEL SERIALIZABLE
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
 
@@ -34,9 +40,7 @@ WHERE UPDATE SET TRANSACTION ISOLATION LEVEL SNAPSHOT SERIALIZABLE SELECT INT CH
 %token <sv_bool> VALUE_BOOL
 
 // specify types for non-terminal symbol
-%type <sv_node> stmt dbStmt ddl dml txnStmt setStmt selectStmt
-%type <sv_select_stmt> plainSelectStmt unionSelect
-%type <sv_select_stmts> unionSelectList
+%type <sv_node> stmt dbStmt ddl dml txnStmt setStmt
 %type <sv_field> field
 %type <sv_fields> fieldList
 %type <sv_type_len> type
@@ -45,28 +49,26 @@ WHERE UPDATE SET TRANSACTION ISOLATION LEVEL SNAPSHOT SERIALIZABLE SELECT INT CH
 %type <sv_val> value
 %type <sv_vals> valueList
 %type <sv_str> tbName colName
-%type <sv_strs> tableList colNameList
+%type <sv_strs> colNameList
 %type <sv_col> col
-%type <sv_cols> colList selector
-%type <sv_select_item> selectItem aggregateItem havingLhs
-%type <sv_select_items> selectItemList newSelector
-%type <sv_table_ref> tableRef
-%type <sv_from> fromList
-%type <sv_join_conds> optJoinOnClause
-%type <sv_having> havingCondition
-%type <sv_havings> havingClause optHavingClause
-%type <sv_cols> optGroupClause
+%type <sv_cols> colList
+%type <sv_cols> selector
 %type <sv_set_clause> setClause
 %type <sv_set_clauses> setClauses
 %type <sv_cond> condition
 %type <sv_conds> whereClause optWhereClause
 %type <sv_orderby>  order_clause opt_order_clause
-%type <sv_orderby_item> order_item
-%type <sv_orderby_items> order_item_list
 %type <sv_orderby_dir> opt_asc_desc
-%type <sv_agg_type> aggName
-%type <sv_int> optLimitClause
 %type <sv_setKnobType> set_knob_type
+%type <sv_int> opt_limit
+%type <sv_cols> opt_group_by
+%type <sv_conds> opt_having
+
+// tableRef returns pair<table_name, alias> as two strings via sv_strs
+%type <sv_strs> tableRefs tableRef
+
+// UNION support
+%type <sv_node> selectWithin unionQuery
 
 %%
 start:
@@ -124,9 +126,11 @@ dbStmt:
     {
         $$ = std::make_shared<ShowTables>();
     }
-    |   SHOW INDEX FROM tbName
+    | SHOW INDEX FROM tbName
     {
-        $$ = std::make_shared<ShowIndex>($4);
+        auto *n = new ShowIndex();
+        n->tab_name = $4;
+        $$ = std::shared_ptr<ShowIndex>(n);
     }
     ;
 
@@ -137,11 +141,11 @@ setStmt:
     }
     |   SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION
     {
-        $$ = std::make_shared<SetTransactionIsolation>(false);
+        $$ = std::make_shared<SetIsolationLevel>(IsoLevelSyntax::SNAPSHOT_ISOLATION);
     }
     |   SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
     {
-        $$ = std::make_shared<SetTransactionIsolation>(true);
+        $$ = std::make_shared<SetIsolationLevel>(IsoLevelSyntax::SERIALIZABLE);
     }
     ;
 
@@ -166,20 +170,12 @@ ddl:
     {
         $$ = std::make_shared<DropIndex>($3, $5);
     }
-    |   CREATE STATIC_CHECKPOINT
-    {
-        $$ = std::make_shared<CreateCheckpoint>();
-    }
     ;
 
 dml:
         INSERT INTO tbName VALUES '(' valueList ')'
     {
         $$ = std::make_shared<InsertStmt>($3, $6);
-    }
-    |   LOAD VALUE_STRING INTO tbName
-    {
-        $$ = std::make_shared<LoadStmt>($2, $4);
     }
     |   DELETE FROM tbName optWhereClause
     {
@@ -189,50 +185,85 @@ dml:
     {
         $$ = std::make_shared<UpdateStmt>($2, $4, $5);
     }
-    |   selectStmt
+    |   SELECT selector FROM tableRefs optWhereClause opt_group_by opt_having opt_order_clause opt_limit
     {
-        $$ = $1;
+        auto conds = $5;
+        for (auto &cond : g_on_conds) {
+            conds.push_back(cond);
+        }
+        g_on_conds.clear();
+        std::vector<std::string> tables;
+        std::vector<std::string> aliases;
+        for (size_t i = 0; i < $4.size(); i += 2) {
+            tables.push_back($4[i]);
+            if (i + 1 < $4.size()) {
+                aliases.push_back($4[i+1]);
+            } else {
+                aliases.push_back("");
+            }
+        }
+        auto stmt = std::make_shared<SelectStmt>($2, tables, aliases, std::move(conds), $8, $6, $7, $9);
+        $$ = stmt;
+    }
+    |   EXPLAIN ANALYZE SELECT selector FROM tableRefs optWhereClause opt_group_by opt_having opt_order_clause opt_limit
+    {
+        auto conds = $7;
+        for (auto &cond : g_on_conds) {
+            conds.push_back(cond);
+        }
+        g_on_conds.clear();
+        std::vector<std::string> tables;
+        std::vector<std::string> aliases;
+        for (size_t i = 0; i < $6.size(); i += 2) {
+            tables.push_back($6[i]);
+            if (i + 1 < $6.size()) {
+                aliases.push_back($6[i+1]);
+            } else {
+                aliases.push_back("");
+            }
+        }
+        auto select = std::make_shared<SelectStmt>($4, tables, aliases, std::move(conds), $10, $8, $9, $11);
+        select->is_explain_analyze = true;
+        $$ = select;
     }
     ;
 
-selectStmt:
-        plainSelectStmt
+// selectWithin: SELECT body without ORDER BY/LIMIT (only used inside unionQuery)
+selectWithin:
+        SELECT selector FROM tableRefs optWhereClause opt_group_by opt_having
     {
-        $$ = $1;
-    }
-    |   EXPLAIN plainSelectStmt
-    {
-        $$ = std::make_shared<ExplainStmt>($2);
-    }
-    |   EXPLAIN ANALYZE plainSelectStmt
-    {
-        $$ = std::make_shared<ExplainStmt>($3);
-    }
-    ;
-
-plainSelectStmt:
-        SELECT newSelector FROM fromList optWhereClause optGroupClause optHavingClause opt_order_clause optLimitClause
-    {
-        $5.insert($5.end(), $4->join_conds.begin(), $4->join_conds.end());
-        $$ = std::make_shared<SelectStmt>($2, $4->table_refs, $5, $6, $7, $8, $9, $4->is_semi_join, $4->semi_conds);
-    }
-    ;
-
-unionSelectList:
-        unionSelect
-    {
-        $$ = std::vector<std::shared_ptr<SelectStmt>>{$1};
-    }
-    |   unionSelectList UNION unionSelect
-    {
-        $1.push_back($3);
-        $$ = $1;
+        auto conds = $5;
+        for (auto &cond : g_on_conds) {
+            conds.push_back(cond);
+        }
+        g_on_conds.clear();
+        std::vector<std::string> tables;
+        std::vector<std::string> aliases;
+        for (size_t i = 0; i < $4.size(); i += 2) {
+            tables.push_back($4[i]);
+            if (i + 1 < $4.size()) {
+                aliases.push_back($4[i+1]);
+            } else {
+                aliases.push_back("");
+            }
+        }
+        auto stmt = std::make_shared<SelectStmt>($2, tables, aliases, std::move(conds), nullptr, $6, $7, -1);
+        $$ = std::static_pointer_cast<TreeNode>(stmt);
     }
     ;
 
-unionSelect:
-        plainSelectStmt
+unionQuery:
+        selectWithin UNION selectWithin
     {
+        auto u = std::make_shared<UnionStmt>();
+        u->selects.push_back(std::static_pointer_cast<SelectStmt>($1));
+        u->selects.push_back(std::static_pointer_cast<SelectStmt>($3));
+        $$ = std::static_pointer_cast<TreeNode>(u);
+    }
+    |   unionQuery UNION selectWithin
+    {
+        auto u = std::static_pointer_cast<UnionStmt>($1);
+        u->selects.push_back(std::static_pointer_cast<SelectStmt>($3));
         $$ = $1;
     }
     ;
@@ -279,10 +310,6 @@ type:
     {
         $$ = std::make_shared<TypeLen>(SV_TYPE_FLOAT, sizeof(float));
     }
-    |   DATETIME
-    {
-        $$ = std::make_shared<TypeLen>(SV_TYPE_STRING, 19);
-    }
     ;
 
 valueList:
@@ -301,25 +328,9 @@ value:
     {
         $$ = std::make_shared<IntLit>($1);
     }
-    |   '+' VALUE_INT
-    {
-        $$ = std::make_shared<IntLit>($2);
-    }
-    |   '-' VALUE_INT
-    {
-        $$ = std::make_shared<IntLit>(-$2);
-    }
     |   VALUE_FLOAT
     {
         $$ = std::make_shared<FloatLit>($1);
-    }
-    |   '+' VALUE_FLOAT
-    {
-        $$ = std::make_shared<FloatLit>($2);
-    }
-    |   '-' VALUE_FLOAT
-    {
-        $$ = std::make_shared<FloatLit>(-$2);
     }
     |   VALUE_STRING
     {
@@ -339,7 +350,7 @@ condition:
     ;
 
 optWhereClause:
-        /* epsilon */ { $$ = {}; }
+        /* epsilon */ { $$ = std::vector<std::shared_ptr<BinaryExpr>>(); }
     |   WHERE whereClause
     {
         $$ = $2;
@@ -347,7 +358,7 @@ optWhereClause:
     ;
 
 whereClause:
-        condition 
+        condition
     {
         $$ = std::vector<std::shared_ptr<BinaryExpr>>{$1};
     }
@@ -362,9 +373,77 @@ col:
     {
         $$ = std::make_shared<Col>($1, $3);
     }
+    |   tbName '.' colName AS IDENTIFIER
+    {
+        auto c = std::make_shared<Col>($1, $3); c->alias = $5; $$ = c;
+    }
     |   colName
     {
         $$ = std::make_shared<Col>("", $1);
+    }
+    |   colName AS IDENTIFIER
+    {
+        auto c = std::make_shared<Col>("", $1); c->alias = $3; $$ = c;
+    }
+    |   COUNT '(' '*' ')'
+    {
+        auto a = std::make_shared<AggFunc>(); a->agg_type = 0; a->is_star = true;
+        auto c = std::make_shared<Col>("", "COUNT(*)"); c->agg = a; $$ = c;
+    }
+    |   COUNT '(' '*' ')' AS IDENTIFIER
+    {
+        auto a = std::make_shared<AggFunc>(); a->agg_type = 0; a->is_star = true;
+        auto c = std::make_shared<Col>("", "COUNT(*)"); c->agg = a; c->alias = $6; $$ = c;
+    }
+    |   COUNT '(' col ')'
+    {
+        auto a = std::make_shared<AggFunc>(); a->agg_type = 0; a->col = $3;
+        auto c = std::make_shared<Col>($3->tab_name, "COUNT(" + $3->col_name + ")"); c->agg = a; $$ = c;
+    }
+    |   COUNT '(' col ')' AS IDENTIFIER
+    {
+        auto a = std::make_shared<AggFunc>(); a->agg_type = 0; a->col = $3;
+        auto c = std::make_shared<Col>($3->tab_name, "COUNT(" + $3->col_name + ")"); c->agg = a; c->alias = $6; $$ = c;
+    }
+    |   MAX '(' col ')'
+    {
+        auto a = std::make_shared<AggFunc>(); a->agg_type = 1; a->col = $3;
+        auto c = std::make_shared<Col>($3->tab_name, "MAX(" + $3->col_name + ")"); c->agg = a; $$ = c;
+    }
+    |   MAX '(' col ')' AS IDENTIFIER
+    {
+        auto a = std::make_shared<AggFunc>(); a->agg_type = 1; a->col = $3;
+        auto c = std::make_shared<Col>($3->tab_name, "MAX(" + $3->col_name + ")"); c->agg = a; c->alias = $6; $$ = c;
+    }
+    |   MIN '(' col ')'
+    {
+        auto a = std::make_shared<AggFunc>(); a->agg_type = 2; a->col = $3;
+        auto c = std::make_shared<Col>($3->tab_name, "MIN(" + $3->col_name + ")"); c->agg = a; $$ = c;
+    }
+    |   MIN '(' col ')' AS IDENTIFIER
+    {
+        auto a = std::make_shared<AggFunc>(); a->agg_type = 2; a->col = $3;
+        auto c = std::make_shared<Col>($3->tab_name, "MIN(" + $3->col_name + ")"); c->agg = a; c->alias = $6; $$ = c;
+    }
+    |   SUM '(' col ')'
+    {
+        auto a = std::make_shared<AggFunc>(); a->agg_type = 3; a->col = $3;
+        auto c = std::make_shared<Col>($3->tab_name, "SUM(" + $3->col_name + ")"); c->agg = a; $$ = c;
+    }
+    |   SUM '(' col ')' AS IDENTIFIER
+    {
+        auto a = std::make_shared<AggFunc>(); a->agg_type = 3; a->col = $3;
+        auto c = std::make_shared<Col>($3->tab_name, "SUM(" + $3->col_name + ")"); c->agg = a; c->alias = $6; $$ = c;
+    }
+    |   AVG '(' col ')'
+    {
+        auto a = std::make_shared<AggFunc>(); a->agg_type = 4; a->col = $3;
+        auto c = std::make_shared<Col>($3->tab_name, "AVG(" + $3->col_name + ")"); c->agg = a; $$ = c;
+    }
+    |   AVG '(' col ')' AS IDENTIFIER
+    {
+        auto a = std::make_shared<AggFunc>(); a->agg_type = 4; a->col = $3;
+        auto c = std::make_shared<Col>($3->tab_name, "AVG(" + $3->col_name + ")"); c->agg = a; c->alias = $6; $$ = c;
     }
     ;
 
@@ -433,25 +512,25 @@ setClause:
     {
         $$ = std::make_shared<SetClause>($1, $3);
     }
-    |   colName '=' colName
-    {
-        $$ = std::make_shared<SetClause>($1, $3);
-    }
     |   colName '=' colName '+' value
     {
-        $$ = std::make_shared<SetClause>($1, $3, $5, SET_OP_ADD);
+        auto sc = std::make_shared<SetClause>($1, $5);
+        sc->is_self_ref = true;
+        sc->self_ref_col = $3;
+        $$ = sc;
     }
     |   colName '=' colName '-' value
     {
-        $$ = std::make_shared<SetClause>($1, $3, $5, SET_OP_SUB);
-    }
-    |   colName '=' colName '*' value
-    {
-        $$ = std::make_shared<SetClause>($1, $3, $5, SET_OP_MUL);
-    }
-    |   colName '=' colName '/' value
-    {
-        $$ = std::make_shared<SetClause>($1, $3, $5, SET_OP_DIV);
+        // Negate the value and treat as addition
+        if (auto il = std::dynamic_pointer_cast<ast::IntLit>($5)) {
+            il->val = -il->val;
+        } else if (auto fl = std::dynamic_pointer_cast<ast::FloatLit>($5)) {
+            fl->val = -fl->val;
+        }
+        auto sc = std::make_shared<SetClause>($1, $5);
+        sc->is_self_ref = true;
+        sc->self_ref_col = $3;
+        $$ = sc;
     }
     ;
 
@@ -461,184 +540,105 @@ selector:
         $$ = {};
     }
     |   colList
-    ;
-
-newSelector:
-        '*'
-    {
-        $$ = {};
-    }
-    |   selectItemList
-    ;
-
-selectItemList:
-        selectItem
-    {
-        $$ = std::vector<std::shared_ptr<SelectItem>>{$1};
-    }
-    |   selectItemList ',' selectItem
-    {
-        $$.push_back($3);
-    }
-    ;
-
-selectItem:
-        col
-    {
-        $$ = std::make_shared<SelectItem>($1);
-    }
-    |   col AS colName
-    {
-        $$ = std::make_shared<SelectItem>($1, $3);
-    }
-    |   aggregateItem
     {
         $$ = $1;
     }
-    |   aggregateItem AS colName
+    ;
+
+opt_group_by:
+        /* epsilon */ { $$ = std::vector<std::shared_ptr<Col>>(); }
+    |   GROUP BY colList
     {
-        $1->alias = $3;
-        $$ = $1;
+        $$ = $3;
     }
     ;
 
-aggregateItem:
-        aggName '(' col ')'
-    {
-        $$ = std::make_shared<SelectItem>($1, $3, false);
-    }
-    |   COUNT '(' col ')'
-    {
-        $$ = std::make_shared<SelectItem>(AGG_COUNT, $3, false);
-    }
-    |   COUNT '(' '*' ')'
-    {
-        $$ = std::make_shared<SelectItem>(AGG_COUNT, nullptr, true);
-    }
-    ;
-
-aggName:
-        MAX
-    {
-        $$ = AGG_MAX;
-    }
-    |   MIN
-    {
-        $$ = AGG_MIN;
-    }
-    |   SUM
-    {
-        $$ = AGG_SUM;
-    }
-    |   AVG
-    {
-        $$ = AGG_AVG;
-    }
-    ;
-
-tableList:
-        tbName
-    {
-        $$ = std::vector<std::string>{$1};
-    }
-    |   tableList ',' tbName
-    {
-        $$.push_back($3);
-    }
-    |   tableList JOIN tbName
-    {
-        $$.push_back($3);
-    }
-    ;
-
-fromList:
-        tableRef
-    {
-        $$ = std::make_shared<FromClause>();
-        $$->table_refs.push_back($1);
-    }
-    |   fromList ',' tableRef
-    {
-        $$ = $1;
-        $$->table_refs.push_back($3);
-    }
-    |   fromList JOIN tableRef optJoinOnClause
-    {
-        $$ = $1;
-        $$->table_refs.push_back($3);
-        $$->join_conds.insert($$->join_conds.end(), $4.begin(), $4.end());
-    }
-    |   tableRef SEMI JOIN tableRef ON condition
-    {
-        $$ = std::make_shared<FromClause>();
-        $$->table_refs.push_back($1);
-        $$->table_refs.push_back($4);
-        $$->is_semi_join = true;
-        $$->semi_conds.push_back($6);
-    }
-    ;
-
-optJoinOnClause:
-        ON whereClause
+opt_having:
+        /* epsilon */ { $$ = std::vector<std::shared_ptr<BinaryExpr>>(); }
+    |   HAVING whereClause
     {
         $$ = $2;
     }
-    |   /* epsilon */ { $$ = {}; }
     ;
 
+opt_limit:
+        /* epsilon */ { $$ = -1; }
+    |   LIMIT VALUE_INT
+    {
+        $$ = $2;
+    }
+    ;
+
+// 支持表别名的表引用列表
+tableRefs:
+        tableRef
+    {
+        $$ = $1;
+    }
+    |   tableRefs ',' tableRef
+    {
+        $$.insert($$.end(), $3.begin(), $3.end());
+    }
+    |   tableRefs JOIN tableRef ON whereClause
+    {
+        // 把 ON 条件保存到全局变量中
+        for (auto &cond : $5) {
+            g_on_conds.push_back(cond);
+        }
+        $$.insert($$.end(), $3.begin(), $3.end());
+    }
+    |   tableRefs JOIN tableRef
+    {
+        $$.insert($$.end(), $3.begin(), $3.end());
+    }
+    ;
+
+// tableRef 始终返回 {table_name, alias}，无别名时 alias 为空
+// 对于 UNION 派生表，table_name 为别名，alias 为空，UnionStmt 存入 g_union_map
 tableRef:
         tbName
     {
-        $$ = std::make_shared<TableRef>($1, "");
+        $$ = std::vector<std::string>{$1, ""};
     }
     |   tbName tbName
     {
-        $$ = std::make_shared<TableRef>($1, $2);
+        // 表名 + 别名：table_name alias_name
+        $$ = std::vector<std::string>{$1, $2};
     }
     |   tbName AS tbName
     {
-        $$ = std::make_shared<TableRef>($1, $3);
+        // 表名 + AS 别名
+        $$ = std::vector<std::string>{$1, $3};
     }
-    |   '(' unionSelectList ')' AS tbName
+    |   '(' unionQuery ')' tbName
     {
-        $$ = std::make_shared<TableRef>($2, $5);
+        ast::get_union_map()[$4] = std::static_pointer_cast<UnionStmt>($2);
+        $$ = std::vector<std::string>{$4, $4};
     }
-    |   '(' unionSelectList ')' tbName
+    |   '(' unionQuery ')' AS tbName
     {
-        $$ = std::make_shared<TableRef>($2, $4);
+        ast::get_union_map()[$5] = std::static_pointer_cast<UnionStmt>($2);
+        $$ = std::vector<std::string>{$5, $5};
     }
     ;
 
 opt_order_clause:
-    ORDER BY order_clause      
-    { 
-        $$ = $3; 
+    ORDER BY order_clause
+    {
+        $$ = $3;
     }
     |   /* epsilon */ { $$ = nullptr; }
     ;
 
 order_clause:
-      order_item_list
-    { 
-        $$ = std::make_shared<OrderBy>($1);
-    }
-    ;
-
-order_item_list:
-      order_item
+      col  opt_asc_desc
     {
-        $$ = std::vector<std::shared_ptr<OrderByItem>>{$1};
+        $$ = std::make_shared<OrderBy>($1, $2);
     }
-    | order_item_list ',' order_item
+    |   order_clause ',' col opt_asc_desc
     {
-        $$.push_back($3);
-    }
-    ;
-
-order_item:
-      col opt_asc_desc
-    {
-        $$ = std::make_shared<OrderByItem>($1, $2);
+        $1->append($3, $4);
+        $$ = $1;
     }
     ;
 
@@ -646,55 +646,6 @@ opt_asc_desc:
     ASC          { $$ = OrderBy_ASC;     }
     |  DESC      { $$ = OrderBy_DESC;    }
     |       { $$ = OrderBy_DEFAULT; }
-    ;    
-
-optGroupClause:
-    GROUP BY colList
-    {
-        $$ = $3;
-    }
-    |   /* epsilon */ { $$ = {}; }
-    ;
-
-optHavingClause:
-    HAVING havingClause
-    {
-        $$ = $2;
-    }
-    |   /* epsilon */ { $$ = {}; }
-    ;
-
-havingClause:
-    havingCondition
-    {
-        $$ = std::vector<std::shared_ptr<HavingExpr>>{$1};
-    }
-    | havingClause AND havingCondition
-    {
-        $$.push_back($3);
-    }
-    ;
-
-havingCondition:
-    havingLhs op value
-    {
-        $$ = std::make_shared<HavingExpr>($1, $2, $3);
-    }
-    ;
-
-havingLhs:
-    aggregateItem
-    {
-        $$ = $1;
-    }
-    ;
-
-optLimitClause:
-    LIMIT VALUE_INT
-    {
-        $$ = $2;
-    }
-    |   /* epsilon */ { $$ = -1; }
     ;
 
 set_knob_type:
