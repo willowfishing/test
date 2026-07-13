@@ -1,90 +1,117 @@
 #pragma once
 
-#include <set>
+#include <algorithm>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include "executor_abstract.h"
 
+// UNION (without ALL): convert every child tuple to the analyzed common
+// schema, then retain only the first occurrence of each complete tuple.
 class UnionExecutor : public AbstractExecutor {
    private:
-    std::vector<std::unique_ptr<AbstractExecutor>> children_;
+    std::vector<std::unique_ptr<AbstractExecutor>> branches_;
     std::vector<ColMeta> cols_;
-    size_t len_;
-    std::vector<RmRecord> tuples_;
-    size_t cursor_ = 0;
+    size_t len_{0};
+    std::vector<std::unique_ptr<RmRecord>> results_;
+    size_t pos_{0};
+    std::shared_ptr<RuntimeStat> runtime_;
 
-    void copy_cell(RmRecord *dst, const ColMeta &dst_col, const TupleView &src, const ColMeta &src_col,
-                   size_t src_idx) const {
-        char *dst_data = dst->data + dst_col.offset;
-        const char *src_data = src.cell_at(src_col, src_idx);
-        if (dst_col.type == src_col.type) {
-            memset(dst_data, 0, dst_col.len);
-            memcpy(dst_data, src_data, std::min(dst_col.len, src_col.len));
-            return;
+    std::unique_ptr<RmRecord> convert_tuple(
+        const RmRecord &source, const std::vector<ColMeta> &source_cols) const {
+        if (source_cols.size() != cols_.size()) {
+            throw RMDBError("UNION branch column count changed during execution");
         }
-        if (dst_col.type == TYPE_FLOAT && src_col.type == TYPE_INT) {
-            *reinterpret_cast<float *>(dst_data) = static_cast<float>(*reinterpret_cast<const int *>(src_data));
-            return;
+        auto output = std::make_unique<RmRecord>(static_cast<int>(len_));
+        std::memset(output->data, 0, len_);
+        for (size_t i = 0; i < cols_.size(); ++i) {
+            const auto &src = source_cols[i];
+            const auto &dst = cols_[i];
+            const char *src_data = source.data + src.offset;
+            char *dst_data = output->data + dst.offset;
+
+            if (dst.type == TYPE_FLOAT) {
+                float value;
+                if (src.type == TYPE_INT) {
+                    value = static_cast<float>(
+                        *reinterpret_cast<const int *>(src_data));
+                } else if (src.type == TYPE_FLOAT) {
+                    value = *reinterpret_cast<const float *>(src_data);
+                } else {
+                    throw IncompatibleTypeError(coltype2str(dst.type),
+                                                coltype2str(src.type));
+                }
+                // SQL numeric equality treats -0.0 and +0.0 as equal. A
+                // canonical zero also makes byte-based duplicate removal safe.
+                if (value == 0.0F) value = 0.0F;
+                *reinterpret_cast<float *>(dst_data) = value;
+            } else if (dst.type == TYPE_INT) {
+                if (src.type != TYPE_INT) {
+                    throw IncompatibleTypeError(coltype2str(dst.type),
+                                                coltype2str(src.type));
+                }
+                *reinterpret_cast<int *>(dst_data) =
+                    *reinterpret_cast<const int *>(src_data);
+            } else {
+                if (src.type != TYPE_STRING) {
+                    throw IncompatibleTypeError(coltype2str(dst.type),
+                                                coltype2str(src.type));
+                }
+                std::memcpy(dst_data, src_data,
+                            std::min(static_cast<size_t>(src.len),
+                                     static_cast<size_t>(dst.len)));
+            }
         }
-        throw IncompatibleTypeError(coltype2str(dst_col.type), coltype2str(src_col.type));
+        return output;
     }
 
    public:
-    UnionExecutor(std::vector<std::unique_ptr<AbstractExecutor>> children, std::vector<ColMeta> cols) {
-        children_ = std::move(children);
-        cols_ = std::move(cols);
-        len_ = cols_.empty() ? 0 : cols_.back().offset + cols_.back().len;
+    UnionExecutor(std::vector<std::unique_ptr<AbstractExecutor>> branches,
+                  std::vector<ColMeta> output_cols,
+                  std::shared_ptr<RuntimeStat> runtime)
+        : branches_(std::move(branches)), cols_(std::move(output_cols)),
+          runtime_(std::move(runtime)) {
+        if (!runtime_) runtime_ = std::make_shared<RuntimeStat>();
+        for (const auto &col : cols_) {
+            len_ = std::max(len_, static_cast<size_t>(col.offset + col.len));
+        }
     }
 
     void beginTuple() override {
-        tuples_.clear();
-        std::set<std::string> seen;
-        for (auto &child : children_) {
-            child->beginTuple();
-            const auto &src_cols = child->cols();
-            if (src_cols.size() != cols_.size()) {
-                throw RMDBError("union column count mismatch");
-            }
-            for (; !child->is_end(); child->nextTuple()) {
-                auto src = child->ReadTupleView();
-                if (!src) {
-                    break;
-                }
-                RmRecord out(static_cast<int>(len_));
-                for (size_t i = 0; i < cols_.size(); ++i) {
-                    copy_cell(&out, cols_[i], *src.view, src_cols[i], i);
-                }
-                std::string key(out.data, len_);
-                if (seen.insert(key).second) {
-                    tuples_.push_back(std::move(out));
+        results_.clear();
+        pos_ = 0;
+        std::unordered_set<std::string> seen;
+        for (auto &branch : branches_) {
+            const auto &source_cols = branch->cols();
+            for (branch->beginTuple(); !branch->is_end(); branch->nextTuple()) {
+                auto tuple = branch->Next();
+                if (!tuple) continue;
+                auto converted = convert_tuple(*tuple, source_cols);
+                std::string key(converted->data, len_);
+                if (seen.insert(std::move(key)).second) {
+                    results_.push_back(std::move(converted));
                 }
             }
         }
-        cursor_ = 0;
     }
 
     void nextTuple() override {
-        if (cursor_ < tuples_.size()) {
-            cursor_++;
-        }
+        if (pos_ < results_.size()) ++pos_;
     }
+
+    bool is_end() const override { return pos_ >= results_.size(); }
 
     std::unique_ptr<RmRecord> Next() override {
-        if (cursor_ >= tuples_.size()) {
-            return nullptr;
-        }
-        auto rec = std::make_unique<RmRecord>(static_cast<int>(len_));
-        memcpy(rec->data, tuples_[cursor_].data, len_);
-        return rec;
+        if (is_end()) return nullptr;
+        ++runtime_->rows;
+        return std::make_unique<RmRecord>(*results_[pos_]);
     }
 
-    const RmRecord *CurrentTuple() const override {
-        return cursor_ >= tuples_.size() ? nullptr : &tuples_[cursor_];
-    }
-
-    bool is_end() const override { return cursor_ >= tuples_.size(); }
     size_t tupleLen() const override { return len_; }
     const std::vector<ColMeta> &cols() const override { return cols_; }
-    std::string getType() override { return "UnionExecutor"; }
-    ColMeta get_col_offset(const TabCol &target) override { return *get_col(cols_, target); }
     Rid &rid() override { return _abstract_rid; }
 };

@@ -35,7 +35,7 @@ See the Mulan PSL v2 for more details. */
 #include "gtest/gtest.h"
 #include "replacer/lru_replacer.h"
 #include "storage/disk_manager.h"
-#include "transaction/transaction_manager.h"
+
 
 const std::string TEST_DB_NAME = "BufferPoolManagerTest_db";  // 以数据库名作为根目录
 const std::string TEST_FILE_NAME = "basic";                   // 测试文件的名字
@@ -661,85 +661,4 @@ TEST(RecordManagerTest, SimpleTest) {
     // clean up
     rm_manager->close_file(file_handle.get());
     rm_manager->destroy_file(filename);
-}
-
-TEST(RecordManagerTest, RecoveryInsertPreservesFreeList) {
-    auto local_disk_manager = std::make_unique<DiskManager>();
-    auto local_buffer_pool_manager = std::make_unique<BufferPoolManager>(64, local_disk_manager.get());
-    auto local_rm_manager =
-        std::make_unique<RmManager>(local_disk_manager.get(), local_buffer_pool_manager.get());
-    const std::string filename = "recovery_free_list.txt";
-    if (local_disk_manager->is_file(filename)) {
-        local_disk_manager->destroy_file(filename);
-    }
-
-    local_rm_manager->create_file(filename, RM_MAX_RECORD_SIZE);
-    auto file_handle = local_rm_manager->open_file(filename);
-    std::vector<char> record(RM_MAX_RECORD_SIZE, 'x');
-    const int records_per_page = file_handle->file_hdr_.num_records_per_page;
-    std::vector<Rid> records;
-    for (int i = 0; i < records_per_page * 3; ++i) {
-        records.push_back(file_handle->insert_record(record.data(), nullptr));
-    }
-
-    Rid page1_hole = records[0];
-    Rid page2_hole = records[records_per_page];
-    Rid page3_hole = records[records_per_page * 2];
-    file_handle->delete_record(page1_hole, nullptr);
-    file_handle->delete_record(page2_hole, nullptr);
-    file_handle->delete_record(page3_hole, nullptr);
-
-    // Recovery can fill a non-head free page by RID. Keep its successor linked
-    // until the normal allocator reaches and removes the now-full stale node.
-    file_handle->insert_record(page2_hole, record.data());
-    EXPECT_EQ(file_handle->insert_record(record.data(), nullptr).page_no, page3_hole.page_no);
-    EXPECT_EQ(file_handle->insert_record(record.data(), nullptr).page_no, page1_hole.page_no);
-
-    local_rm_manager->close_file(file_handle.get());
-    local_rm_manager->destroy_file(filename);
-}
-
-TEST(BufferPoolBackgroundFlushTest, FlushUnpinnedPagesInBatches) {
-    auto local_disk_manager = std::make_unique<DiskManager>();
-    const std::string filename = "background_flush.txt";
-    if (local_disk_manager->is_file(filename)) {
-        local_disk_manager->destroy_file(filename);
-    }
-    local_disk_manager->create_file(filename);
-    int fd = local_disk_manager->open_file(filename);
-    auto local_buffer_pool_manager = std::make_unique<BufferPoolManager>(8, local_disk_manager.get());
-
-    std::vector<PageId> page_ids;
-    for (int i = 0; i < 3; ++i) {
-        PageId page_id{fd, INVALID_PAGE_ID};
-        Page *page = local_buffer_pool_manager->new_page(&page_id);
-        ASSERT_NE(page, nullptr);
-        memset(page->get_data(), 'a' + i, PAGE_SIZE);
-        ASSERT_TRUE(local_buffer_pool_manager->unpin_page(page_id, true));
-        page_ids.push_back(page_id);
-    }
-
-    size_t cursor = 0;
-    bool pass_complete = false;
-    size_t flushed = 0;
-    while (!pass_complete) {
-        flushed += local_buffer_pool_manager->flush_unpinned_pages_batch(1, 2, &cursor, &pass_complete);
-    }
-    EXPECT_EQ(flushed, page_ids.size());
-    for (size_t i = 0; i < page_ids.size(); ++i) {
-        std::vector<char> data(PAGE_SIZE);
-        local_disk_manager->read_page(fd, page_ids[i].page_no, data.data(), PAGE_SIZE);
-        EXPECT_EQ(data[0], 'a' + static_cast<int>(i));
-    }
-
-    local_disk_manager->close_file(fd);
-    local_disk_manager->destroy_file(filename);
-}
-
-TEST(TransactionManagerTest, TableVersionCacheObservesCreation) {
-    TransactionManager manager(nullptr, nullptr);
-    EXPECT_EQ(manager.GetTableVersionInfo("cached_table"), nullptr);
-    auto created = manager.GetOrCreateTableVersionInfo("cached_table");
-    ASSERT_NE(created, nullptr);
-    EXPECT_EQ(manager.GetTableVersionInfo("cached_table"), created);
 }

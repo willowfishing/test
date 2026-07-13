@@ -10,13 +10,8 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
-#include <array>
-#include <condition_variable>
-#include <list>
 #include <mutex>
-#include <unordered_map>
-#include <vector>
-
+#include <condition_variable>
 #include "transaction/transaction.h"
 
 static const std::string GroupLockModeStr[10] = {"NON_LOCK", "IS", "IX", "S", "X", "SIX"};
@@ -37,13 +32,13 @@ class LockManager {
         txn_id_t txn_id_;   // 申请加锁的事务ID
         LockMode lock_mode_;    // 事务申请加锁的类型
         bool granted_;          // 该事务是否已经被赋予锁
-        std::condition_variable cv_;
     };
 
     /* 数据项上的加锁队列 */
     class LockRequestQueue {
     public:
         std::list<LockRequest> request_queue_;  // 加锁队列
+        std::condition_variable cv_;            // 条件变量，用于唤醒正在等待加锁的申请，在no-wait策略下无需使用
         GroupLockMode group_lock_mode_ = GroupLockMode::NON_LOCK;   // 加锁队列的锁模式
     };
 
@@ -66,28 +61,7 @@ public:
 
     bool unlock(Transaction* txn, LockDataId lock_data_id);
 
-    bool unlock_all(Transaction *txn);
-
 private:
-    static constexpr size_t LOCK_SHARD_COUNT = 128;
-
-    class alignas(64) LockTableShard {
-    public:
-        std::mutex latch_;
-        std::unordered_map<lock_data_key_t, LockRequestQueue> lock_table_;
-    };
-
-    GroupLockMode recompute_group_lock_mode(const LockRequestQueue &queue) const;
-    bool can_grant_request(const LockRequestQueue &queue,
-                           std::list<LockRequest>::const_iterator request_iter) const;
-    void notify_grantable_waiters(LockRequestQueue &queue) const;
-    static size_t shard_index(lock_data_key_t lock_key);
-    LockTableShard &shard_for(lock_data_key_t lock_key);
-    bool set_wait_edges_and_detect_cycle(txn_id_t waiting_txn, const std::vector<txn_id_t> &blockers);
-    void clear_wait_edges(txn_id_t txn_id);
-    void remove_txn_from_wait_graph(txn_id_t txn_id);
-
-    std::array<LockTableShard, LOCK_SHARD_COUNT> lock_table_shards_;
-    std::mutex wait_graph_latch_;
-    std::unordered_map<txn_id_t, std::vector<txn_id_t>> wait_edges_;
+    std::mutex latch_;      // 用于锁表的并发
+    std::unordered_map<LockDataId, LockRequestQueue> lock_table_;   // 全局锁表
 };

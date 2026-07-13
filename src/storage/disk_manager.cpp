@@ -11,71 +11,11 @@ See the Mulan PSL v2 for more details. */
 #include "storage/disk_manager.h"
 
 #include <assert.h>    // for assert
-#include <algorithm>
-#include <cerrno>
 #include <string.h>    // for memset
 #include <sys/stat.h>  // for stat
-#include <unistd.h>
+#include <unistd.h>    // for lseek
 
 #include "defs.h"
-#include "common/perf_stats.h"
-
-namespace {
-void write_all_at(int fd, const char *data, size_t num_bytes, off_t offset, const char *context) {
-    size_t bytes_written = 0;
-    while (bytes_written < num_bytes) {
-        ssize_t result = pwrite(fd, data + bytes_written, num_bytes - bytes_written,
-                                offset + static_cast<off_t>(bytes_written));
-        if (result < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            throw UnixError();
-        }
-        if (result == 0) {
-            throw InternalError(context);
-        }
-        bytes_written += static_cast<size_t>(result);
-    }
-}
-
-size_t read_at_most(int fd, char *data, size_t num_bytes, off_t offset) {
-    size_t bytes_read = 0;
-    while (bytes_read < num_bytes) {
-        ssize_t result = pread(fd, data + bytes_read, num_bytes - bytes_read,
-                               offset + static_cast<off_t>(bytes_read));
-        if (result < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            throw UnixError();
-        }
-        if (result == 0) {
-            break;
-        }
-        bytes_read += static_cast<size_t>(result);
-    }
-    return bytes_read;
-}
-
-void sync_fd(int fd) {
-    while (fdatasync(fd) < 0) {
-        if (errno == EINTR) {
-            continue;
-        }
-        throw UnixError();
-    }
-}
-
-void truncate_fd(int fd) {
-    while (ftruncate(fd, 0) < 0) {
-        if (errno == EINTR) {
-            continue;
-        }
-        throw UnixError();
-    }
-}
-}  // namespace
 
 DiskManager::DiskManager() { memset(fd2pageno_, 0, MAX_FD * (sizeof(std::atomic<page_id_t>) / sizeof(char))); }
 
@@ -87,10 +27,15 @@ DiskManager::DiskManager() { memset(fd2pageno_, 0, MAX_FD * (sizeof(std::atomic<
  * @param {int} num_bytes 要写入磁盘的数据大小
  */
 void DiskManager::write_page(int fd, page_id_t page_no, const char *offset, int num_bytes) {
-    off_t file_offset = static_cast<off_t>(page_no) * PAGE_SIZE;
-    write_all_at(fd, offset, num_bytes, file_offset, "DiskManager::write_page Error");
-    if (perf_stats_ != nullptr) {
-        perf_stats_->RecordDiskWrite(static_cast<size_t>(num_bytes), false);
+    // 1. lseek()定位到文件头，通过(fd,page_no)可以定位指定页面及其在磁盘文件中的偏移量
+    off_t off = static_cast<off_t>(page_no) * PAGE_SIZE;
+    if (lseek(fd, off, SEEK_SET) == -1) {
+        throw UnixError();
+    }
+    // 2. 调用write()函数
+    ssize_t bytes_written = write(fd, offset, num_bytes);
+    if (bytes_written != num_bytes) {
+        throw InternalError("DiskManager::write_page Error");
     }
 }
 
@@ -102,13 +47,15 @@ void DiskManager::write_page(int fd, page_id_t page_no, const char *offset, int 
  * @param {int} num_bytes 读取的数据量大小
  */
 void DiskManager::read_page(int fd, page_id_t page_no, char *offset, int num_bytes) {
-    off_t file_offset = static_cast<off_t>(page_no) * PAGE_SIZE;
-    size_t bytes_read = read_at_most(fd, offset, static_cast<size_t>(num_bytes), file_offset);
-    if (perf_stats_ != nullptr) {
-        perf_stats_->RecordDiskRead(bytes_read, false);
+    // 1. lseek()定位到文件头，通过(fd,page_no)可以定位指定页面及其在磁盘文件中的偏移量
+    off_t off = static_cast<off_t>(page_no) * PAGE_SIZE;
+    if (lseek(fd, off, SEEK_SET) == -1) {
+        throw UnixError();
     }
-    if (bytes_read < static_cast<size_t>(num_bytes)) {
-        memset(offset + bytes_read, 0, static_cast<size_t>(num_bytes) - bytes_read);
+    // 2. 调用read()函数
+    ssize_t bytes_read = read(fd, offset, num_bytes);
+    if (bytes_read != num_bytes) {
+        throw InternalError("DiskManager::read_page Error");
     }
 }
 
@@ -162,16 +109,17 @@ bool DiskManager::is_file(const std::string &path) {
  * @param {string} &path
  */
 void DiskManager::create_file(const std::string &path) {
+    // 不能重复创建相同文件
     if (is_file(path)) {
         throw FileExistsError(path);
     }
+    // 调用open()函数，使用O_CREAT模式
     int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
     if (fd == -1) {
         throw UnixError();
     }
-    if (close(fd) == -1) {
-        throw UnixError();
-    }
+    // 创建后关闭文件，后续通过open_file来打开
+    close(fd);
 }
 
 /**
@@ -179,13 +127,16 @@ void DiskManager::create_file(const std::string &path) {
  * @param {string} &path 文件所在路径
  */
 void DiskManager::destroy_file(const std::string &path) {
+    // 文件不存在则报错
     if (!is_file(path)) {
         throw FileNotFoundError(path);
     }
+    // 不能删除未关闭的文件
     if (path2fd_.count(path)) {
         throw FileNotClosedError(path);
     }
-    if (unlink(path.c_str()) == -1) {
+    // 调用unlink()函数
+    if (unlink(path.c_str()) != 0) {
         throw UnixError();
     }
 }
@@ -197,19 +148,22 @@ void DiskManager::destroy_file(const std::string &path) {
  * @param {string} &path 文件所在路径
  */
 int DiskManager::open_file(const std::string &path) {
+    // 文件必须存在才能打开
     if (!is_file(path)) {
         throw FileNotFoundError(path);
     }
+    // 不能重复打开相同文件
     if (path2fd_.count(path)) {
         throw FileNotClosedError(path);
     }
+    // 调用open()函数，使用O_RDWR模式
     int fd = open(path.c_str(), O_RDWR);
     if (fd == -1) {
         throw UnixError();
     }
+    // 更新文件打开列表
     path2fd_[path] = fd;
     fd2path_[fd] = path;
-    fd2pageno_[fd] = static_cast<page_id_t>((get_file_size(path) + PAGE_SIZE - 1) / PAGE_SIZE);
     return fd;
 }
 
@@ -218,17 +172,26 @@ int DiskManager::open_file(const std::string &path) {
  * @param {int} fd 打开的文件的文件句柄
  */
 void DiskManager::close_file(int fd) {
+    // 不能关闭未打开的文件
     if (!fd2path_.count(fd)) {
         throw FileNotOpenError(fd);
     }
+    // 更新文件打开列表
     std::string path = fd2path_[fd];
-    if (close(fd) == -1) {
-        throw UnixError();
-    }
     fd2path_.erase(fd);
     path2fd_.erase(path);
-    if (log_fd_ == fd) {
-        log_fd_ = -1;
+    // 调用close()函数
+    if (close(fd) != 0) {
+        throw UnixError();
+    }
+}
+
+void DiskManager::sync_file(int fd) {
+    if (!fd2path_.count(fd)) {
+        throw FileNotOpenError(fd);
+    }
+    if (fsync(fd) != 0) {
+        throw UnixError();
     }
 }
 
@@ -238,7 +201,7 @@ void DiskManager::close_file(int fd) {
  * @return {int} 文件的大小
  * @param {string} &file_name 文件名
  */
-int64_t DiskManager::get_file_size(const std::string &file_name) {
+int DiskManager::get_file_size(const std::string &file_name) {
     struct stat stat_buf;
     int rc = stat(file_name.c_str(), &stat_buf);
     return rc == 0 ? stat_buf.st_size : -1;
@@ -276,26 +239,24 @@ int DiskManager::get_file_fd(const std::string &file_name) {
  * @param {int} size 读取的数据量大小
  * @param {int} offset 读取的内容在文件中的位置
  */
-size_t DiskManager::read_log(char *log_data, size_t size, lsn_t offset) {
-    if (offset < 0) {
-        return 0;
-    }
+int DiskManager::read_log(char *log_data, int size, int offset) {
     // read log file from the previous end
     if (log_fd_ == -1) {
-        log_fd_ = open_file(LOG_FILE_NAME);
+        // Recovery may already have opened db.log through get_file_fd() for
+        // mmap. Reuse that descriptor instead of trying to open the same path
+        // twice in DiskManager's file table.
+        log_fd_ = get_file_fd(LOG_FILE_NAME);
     }
-    int64_t file_size = get_file_size(LOG_FILE_NAME);
+    int file_size = get_file_size(LOG_FILE_NAME);
     if (offset > file_size) {
-        return 0;
+        return -1;
     }
 
-    size = std::min<size_t>(size, static_cast<size_t>(file_size - offset));
-    if (size == 0) return 0;
-    size_t bytes_read = read_at_most(log_fd_, log_data, size, static_cast<off_t>(offset));
+    size = std::min(size, file_size - offset);
+    if(size == 0) return 0;
+    lseek(log_fd_, offset, SEEK_SET);
+    ssize_t bytes_read = read(log_fd_, log_data, size);
     assert(bytes_read == size);
-    if (perf_stats_ != nullptr) {
-        perf_stats_->RecordDiskRead(bytes_read, true);
-    }
     return bytes_read;
 }
 
@@ -305,59 +266,49 @@ size_t DiskManager::read_log(char *log_data, size_t size, lsn_t offset) {
  * @param {char} *log_data 要写入的日志内容
  * @param {int} size 要写入的内容大小
  */
-void DiskManager::write_log(const char *log_data, size_t size, lsn_t offset) {
-    if (offset < 0) {
-        throw InternalError("DiskManager::write_log negative offset");
-    }
+void DiskManager::write_log(char *log_data, int size) {
     if (log_fd_ == -1) {
-        log_fd_ = open_file(LOG_FILE_NAME);
-    }
-
-    write_all_at(log_fd_, log_data, size, static_cast<off_t>(offset), "DiskManager::write_log Error");
-    if (perf_stats_ != nullptr) {
-        perf_stats_->RecordDiskWrite(size, true);
-    }
-}
-
-int DiskManager::ensure_log_fd() {
-    if (log_fd_ == -1) {
+        // Recovery may already have opened db.log through get_file_fd() for
+        // mmap. Reuse that descriptor instead of trying to open the same path
+        // twice in DiskManager's file table.
         log_fd_ = get_file_fd(LOG_FILE_NAME);
     }
-    return log_fd_;
+
+    // write from the file_end
+    lseek(log_fd_, 0, SEEK_END);
+    ssize_t bytes_write = write(log_fd_, log_data, size);
+    if (bytes_write != size) {
+        throw UnixError();
+    }
 }
 
-void DiskManager::sync_file(int fd) {
-    if (fd < 0) {
-        throw InternalError("DiskManager::sync_file invalid file descriptor");
-    }
-    sync_fd(fd);
-}
 
 void DiskManager::sync_log() {
-    sync_fd(ensure_log_fd());
-}
-
-void DiskManager::sync_all_data_files() {
-    for (const auto &entry : fd2path_) {
-        if (entry.first == log_fd_ || entry.second == LOG_FILE_NAME) {
-            continue;
-        }
-        sync_fd(entry.first);
+    if (log_fd_ == -1) {
+        // Recovery may already have opened db.log through get_file_fd() for
+        // mmap. Reuse that descriptor instead of trying to open the same path
+        // twice in DiskManager's file table.
+        log_fd_ = get_file_fd(LOG_FILE_NAME);
+    }
+    if (fsync(log_fd_) != 0) {
+        throw UnixError();
     }
 }
 
-void DiskManager::truncate_log() {
-    truncate_fd(ensure_log_fd());
-}
-
-void DiskManager::remove_file_if_exists(const std::string &path) {
-    while (unlink(path.c_str()) < 0) {
-        if (errno == EINTR) {
-            continue;
-        }
-        if (errno == ENOENT) {
-            return;
-        }
+void DiskManager::truncate_log(int64_t size) {
+    if (log_fd_ == -1) {
+        // Recovery may already have opened db.log through get_file_fd() for
+        // mmap. Reuse that descriptor instead of trying to open the same path
+        // twice in DiskManager's file table.
+        log_fd_ = get_file_fd(LOG_FILE_NAME);
+    }
+    if (ftruncate(log_fd_, static_cast<off_t>(size)) != 0) {
+        throw UnixError();
+    }
+    if (lseek(log_fd_, 0, SEEK_END) == -1) {
+        throw UnixError();
+    }
+    if (fsync(log_fd_) != 0) {
         throw UnixError();
     }
 }

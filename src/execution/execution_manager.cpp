@@ -9,30 +9,173 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "execution_manager.h"
+#include "recovery/log_recovery.h"
 
-#include <cerrno>
-#include <cctype>
-#include <cstdlib>
-#include <cstring>
-#include <fstream>
-#include <limits>
-#include <string_view>
-#include <vector>
-
-#include "common/index_runtime.h"
 #include "executor_delete.h"
 #include "executor_index_scan.h"
 #include "executor_insert.h"
 #include "executor_nestedloop_join.h"
 #include "executor_projection.h"
-#include "executor_scan_cache.h"
 #include "executor_seq_scan.h"
 #include "executor_update.h"
-#include "common/output_file.h"
-#include "common/schema_change.h"
 #include "index/ix.h"
 #include "record_printer.h"
-#include "recovery/log_manager.h"
+
+#include <algorithm>
+#include <iomanip>
+#include <set>
+#include <sstream>
+
+
+namespace {
+
+std::string comp_op_to_string(CompOp op) {
+    switch (op) {
+        case OP_EQ: return "=";
+        case OP_NE: return "<>";
+        case OP_LT: return "<";
+        case OP_GT: return ">";
+        case OP_LE: return "<=";
+        case OP_GE: return ">=";
+    }
+    return "?";
+}
+
+std::string value_to_string(const Value &value) {
+    if (value.type == TYPE_INT) return std::to_string(value.int_val);
+    if (value.type == TYPE_FLOAT) {
+        std::ostringstream out;
+        out << std::defaultfloat << value.float_val;
+        return out.str();
+    }
+    std::string escaped;
+    escaped.reserve(value.str_val.size());
+    for (char ch : value.str_val) {
+        if (ch == '\'') escaped.push_back('\'');
+        escaped.push_back(ch);
+    }
+    return "'" + escaped + "'";
+}
+
+std::string col_to_string(const TabCol &col) {
+    return col.tab_name + "." + col.col_name;
+}
+
+std::string condition_to_string(const Condition &cond) {
+    std::string result = col_to_string(cond.lhs_col) + comp_op_to_string(cond.op);
+    result += cond.is_rhs_val
+                  ? (cond.rhs_display.empty() ? value_to_string(cond.rhs_val)
+                                              : cond.rhs_display)
+                  : col_to_string(cond.rhs_col);
+    return result;
+}
+
+template <typename T>
+std::string join_strings(const std::vector<T> &items, const std::string &sep) {
+    std::ostringstream out;
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (i != 0) out << sep;
+        out << items[i];
+    }
+    return out.str();
+}
+
+std::vector<std::string> sorted_condition_strings(
+    const std::vector<Condition> &conds) {
+    std::vector<std::string> result;
+    result.reserve(conds.size());
+    for (const auto &cond : conds) result.push_back(condition_to_string(cond));
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+void collect_physical_tables(const std::shared_ptr<Plan> &plan,
+                             std::set<std::string> &tables) {
+    if (auto scan = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+        tables.insert(scan->tab_name_);
+    } else if (auto filter = std::dynamic_pointer_cast<FilterPlan>(plan)) {
+        collect_physical_tables(filter->subplan_, tables);
+    } else if (auto project = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+        collect_physical_tables(project->subplan_, tables);
+    } else if (auto join = std::dynamic_pointer_cast<JoinPlan>(plan)) {
+        collect_physical_tables(join->left_, tables);
+        collect_physical_tables(join->right_, tables);
+    } else if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
+        collect_physical_tables(sort->subplan_, tables);
+    } else if (auto aggregate = std::dynamic_pointer_cast<AggregatePlan>(plan)) {
+        collect_physical_tables(aggregate->subplan_, tables);
+    } else if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
+        collect_physical_tables(limit->subplan_, tables);
+    }
+}
+
+void format_plan_tree(const std::shared_ptr<Plan> &plan, int depth,
+                      std::ostringstream &out) {
+    if (auto project = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+        std::vector<std::string> columns;
+        if (project->display_all_) {
+            columns.push_back("*");
+        } else {
+            for (const auto &col : project->display_cols_) {
+                columns.push_back(col_to_string(col));
+            }
+            std::sort(columns.begin(), columns.end());
+        }
+        out << std::string(depth, '\t') << "Project(columns=["
+            << join_strings(columns, ", ") << "], rows="
+            << project->runtime_->rows << ")\n";
+        format_plan_tree(project->subplan_, depth + 1, out);
+        return;
+    }
+    if (auto filter = std::dynamic_pointer_cast<FilterPlan>(plan)) {
+        auto conditions = sorted_condition_strings(filter->conds_);
+        out << std::string(depth, '\t') << "Filter(condition=["
+            << join_strings(conditions, ", ") << "], rows="
+            << filter->runtime_->rows << ")\n";
+        format_plan_tree(filter->subplan_, depth + 1, out);
+        return;
+    }
+    if (auto scan = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+        out << std::string(depth, '\t') << "Scan(table=" << scan->tab_name_;
+        if (scan->tag == T_IndexScan) {
+            out << ", type=IndexScan, using_index=("
+                << join_strings(scan->index_col_names_, ",") << ")";
+        } else {
+            out << ", type=SeqScan";
+        }
+        out << ", rows=" << scan->runtime_->rows << ")\n";
+        return;
+    }
+    if (auto join = std::dynamic_pointer_cast<JoinPlan>(plan)) {
+        std::set<std::string> table_set;
+        collect_physical_tables(plan, table_set);
+        std::vector<std::string> tables(table_set.begin(), table_set.end());
+        auto conditions = sorted_condition_strings(join->conds_);
+        out << std::string(depth, '\t') << "Join(tables=["
+            << join_strings(tables, ", ") << "], condition=["
+            << join_strings(conditions, ", ") << "], rows="
+            << join->runtime_->rows << ")\n";
+        format_plan_tree(join->left_, depth + 1, out);
+        format_plan_tree(join->right_, depth + 1, out);
+        return;
+    }
+    if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
+        // EXPLAIN ANALYZE for task 4 has only four printable node types.
+        format_plan_tree(sort->subplan_, depth, out);
+        return;
+    }
+    if (auto aggregate = std::dynamic_pointer_cast<AggregatePlan>(plan)) {
+        format_plan_tree(aggregate->subplan_, depth, out);
+        return;
+    }
+    if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
+        format_plan_tree(limit->subplan_, depth, out);
+        return;
+    }
+    throw InternalError("Unexpected plan node in EXPLAIN ANALYZE");
+}
+
+}  // namespace
 
 const char *help_info = "Supported SQL syntax:\n"
                    "  command ;\n"
@@ -58,370 +201,42 @@ const char *help_info = "Supported SQL syntax:\n"
                    "selector:\n"
                    "  {* | column [, column ...]}\n";
 
-namespace {
-
-constexpr size_t kOutputColumnWidth = 16;
-
-void append_fixed_width_cell(std::string *row, std::string_view cell) {
-    row->append("| ");
-    if (cell.size() > kOutputColumnWidth) {
-        row->append(cell.data(), kOutputColumnWidth - 3);
-        row->append("...");
-    } else {
-        row->append(kOutputColumnWidth - cell.size(), ' ');
-        if (!cell.empty()) {
-            row->append(cell.data(), cell.size());
-        }
-    }
-    row->push_back(' ');
-}
-
-void append_output_file_cell(std::string *row, std::string_view cell) {
-    row->append(" ");
-    if (!cell.empty()) {
-        row->append(cell.data(), cell.size());
-    }
-    row->append(" |");
-}
-
-size_t format_int_cell(int value, char *out) {
-    char digits[16];
-    size_t digit_count = 0;
-    bool negative = value < 0;
-    unsigned int magnitude = 0;
-    if (negative) {
-        magnitude = static_cast<unsigned int>(-(value + 1)) + 1;
-    } else {
-        magnitude = static_cast<unsigned int>(value);
-    }
-    do {
-        digits[digit_count++] = static_cast<char>('0' + (magnitude % 10));
-        magnitude /= 10;
-    } while (magnitude != 0);
-
-    size_t pos = 0;
-    if (negative) {
-        out[pos++] = '-';
-    }
-    while (digit_count > 0) {
-        out[pos++] = digits[--digit_count];
-    }
-    return pos;
-}
-
-void append_cell_to_rows(const char *rec_buf, const ColMeta &col, std::string *client_row,
-                         std::string *file_row) {
-    char number_buf[64];
-    std::string_view cell;
-    if (col.type == TYPE_INT) {
-        size_t len = format_int_cell(*reinterpret_cast<const int *>(rec_buf), number_buf);
-        cell = std::string_view(number_buf, len);
-    } else if (col.type == TYPE_FLOAT) {
-        int len = snprintf(number_buf, sizeof(number_buf), "%.6f", *reinterpret_cast<const float *>(rec_buf));
-        cell = len <= 0 ? std::string_view()
-                        : std::string_view(number_buf, std::min(static_cast<size_t>(len), sizeof(number_buf) - 1));
-    } else if (col.type == TYPE_STRING) {
-        const void *nul = std::memchr(rec_buf, '\0', static_cast<size_t>(col.len));
-        size_t len = nul == nullptr ? static_cast<size_t>(col.len)
-                                    : static_cast<const char *>(nul) - rec_buf;
-        cell = std::string_view(rec_buf, len);
-    } else {
-        cell = std::string_view();
-    }
-    if (client_row != nullptr) {
-        append_fixed_width_cell(client_row, cell);
-    }
-    if (file_row != nullptr) {
-        append_output_file_cell(file_row, cell);
-    }
-}
-
-void append_client_row(std::string *row, Context *context) {
-    if (context->ellipsis_) {
-        return;
-    }
-    row->append("|\n");
-    if (*context->offset_ + RECORD_COUNT_LENGTH + row->length() < BUFFER_LENGTH) {
-        memcpy(context->data_send_ + *(context->offset_), row->data(), row->length());
-        *(context->offset_) += row->length();
-    } else {
-        context->ellipsis_ = true;
-    }
-}
-
-std::string normalize_load_file_name(std::string file_name) {
-    if (file_name.size() >= 2) {
-        char first = file_name.front();
-        char last = file_name.back();
-        if ((first == '\'' && last == '\'') || (first == '"' && last == '"')) {
-            file_name = file_name.substr(1, file_name.size() - 2);
-        }
-    }
-    return file_name;
-}
-
-std::vector<std::string> split_csv_line(std::string line) {
-    if (!line.empty() && line.back() == '\r') {
-        line.pop_back();
-    }
-    std::vector<std::string> fields;
-    std::string field;
-    bool in_quotes = false;
-    for (char ch : line) {
-        if (ch == '"') {
-            in_quotes = !in_quotes;
-        } else if (ch == ',' && !in_quotes) {
-            fields.push_back(field);
-            field.clear();
-        } else {
-            field.push_back(ch);
-        }
-    }
-    fields.push_back(field);
-    return fields;
-}
-
-void split_csv_line_views(std::string *line, std::vector<std::string_view> *fields) {
-    if (!line->empty() && line->back() == '\r') {
-        line->pop_back();
-    }
-    fields->clear();
-    bool in_quotes = false;
-    size_t write_pos = 0;
-    size_t field_start = 0;
-    for (size_t read_pos = 0; read_pos < line->size(); ++read_pos) {
-        char ch = (*line)[read_pos];
-        if (ch == '"') {
-            in_quotes = !in_quotes;
-        } else if (ch == ',' && !in_quotes) {
-            fields->emplace_back(line->data() + field_start, write_pos - field_start);
-            field_start = write_pos;
-        } else {
-            (*line)[write_pos++] = ch;
-        }
-    }
-    line->resize(write_pos);
-    fields->emplace_back(line->data() + field_start, write_pos - field_start);
-}
-
-std::string_view trim_numeric_field(std::string_view field) {
-    while (!field.empty() && std::isspace(static_cast<unsigned char>(field.front()))) {
-        field.remove_prefix(1);
-    }
-    while (!field.empty() && std::isspace(static_cast<unsigned char>(field.back()))) {
-        field.remove_suffix(1);
-    }
-    return field;
-}
-
-int parse_csv_int(std::string_view field) {
-    field = trim_numeric_field(field);
-    if (field.empty()) {
-        throw RMDBError("invalid int value in load");
-    }
-    bool negative = false;
-    size_t pos = 0;
-    if (field[pos] == '+' || field[pos] == '-') {
-        negative = field[pos] == '-';
-        ++pos;
-    }
-    if (pos == field.size()) {
-        throw RMDBError("invalid int value in load");
-    }
-    long long value = 0;
-    for (; pos < field.size(); ++pos) {
-        unsigned char ch = static_cast<unsigned char>(field[pos]);
-        if (!std::isdigit(ch)) {
-            throw RMDBError("invalid int value in load");
-        }
-        value = value * 10 + static_cast<int>(ch - '0');
-        long long limit = negative ? -(static_cast<long long>(std::numeric_limits<int>::min()))
-                                   : std::numeric_limits<int>::max();
-        if (value > limit) {
-            throw RMDBError("int value out of range in load");
-        }
-    }
-    long long signed_value = negative ? -value : value;
-    return static_cast<int>(signed_value);
-}
-
-Value csv_field_to_value(const std::string &field, ColType type) {
-    Value value;
-    if (type == TYPE_INT) {
-        value.set_int(std::stoi(field));
-    } else if (type == TYPE_FLOAT) {
-        value.set_float(std::stof(field));
-    } else if (type == TYPE_STRING) {
-        value.set_str(field);
-    } else {
-        throw RMDBError("unsupported column type in load");
-    }
-    return value;
-}
-
-void write_csv_field_to_record(std::string_view field, const ColMeta &col, char *record, std::string *parse_scratch) {
-    char *dst = record + col.offset;
-    if (col.type == TYPE_INT) {
-        int value = parse_csv_int(field);
-        memcpy(dst, &value, sizeof(value));
-    } else if (col.type == TYPE_FLOAT) {
-        field = trim_numeric_field(field);
-        parse_scratch->assign(field.data(), field.size());
-        char *end = nullptr;
-        errno = 0;
-        float value = std::strtof(parse_scratch->c_str(), &end);
-        if (end == parse_scratch->c_str() || *end != '\0' || errno == ERANGE) {
-            throw RMDBError("invalid float value in load");
-        }
-        memcpy(dst, &value, sizeof(value));
-    } else if (col.type == TYPE_STRING) {
-        if (field.size() > static_cast<size_t>(col.len)) {
-            throw StringOverflowError();
-        }
-        memset(dst, 0, static_cast<size_t>(col.len));
-        if (!field.empty()) {
-            memcpy(dst, field.data(), field.size());
-        }
-    } else {
-        throw RMDBError("unsupported column type in load");
-    }
-}
-
-size_t load_csv_rows_fast_no_index(RmFileHandle *fh, const TabMeta &tab, std::ifstream *input) {
-    std::string line;
-    std::vector<std::string_view> fields;
-    fields.reserve(tab.cols.size());
-    std::string parse_scratch;
-    parse_scratch.reserve(64);
-    BufferAccessStrategy cold_write_strategy(BufferAccessClass::ColdWrite);
-    return fh->bulk_insert_records([&](char *record) -> bool {
-        while (std::getline(*input, line)) {
-            if (line.empty() || line == "\r") {
-                continue;
-            }
-            split_csv_line_views(&line, &fields);
-            if (fields.size() != tab.cols.size()) {
-                throw RMDBError("csv column count mismatch for table " + tab.name);
-            }
-            for (size_t i = 0; i < fields.size(); ++i) {
-                write_csv_field_to_record(fields[i], tab.cols[i], record, &parse_scratch);
-            }
-            return true;
-        }
-        return false;
-    }, &cold_write_strategy);
-}
-
-void load_csv_rows(SmManager *sm_manager, const std::string &tab_name, const std::string &file_name, Context *context) {
-    if (!sm_manager->db_.is_table(tab_name)) {
-        throw TableNotFoundError(tab_name);
-    }
-    std::string normalized_file_name = normalize_load_file_name(file_name);
-    std::ifstream input(normalized_file_name);
-    if (!input.is_open()) {
-        throw RMDBError("failed to open csv file: " + normalized_file_name);
-    }
-
-    TabMeta &tab = sm_manager->db_.get_table(tab_name);
-    auto fh = sm_manager->fhs_.at(tab_name).get();
-    Context load_context(nullptr, nullptr, nullptr, nullptr);
-    std::string line;
-    std::getline(input, line);  // header
-    if (tab.indexes.empty()) {
-        load_csv_rows_fast_no_index(fh, tab, &input);
-        std::vector<std::string> changed_cols;
-        changed_cols.reserve(tab.cols.size());
-        for (const auto &col : tab.cols) {
-            changed_cols.push_back(col.name);
-        }
-        rmdb::bump_scan_cache_columns(tab_name, changed_cols);
-        fh->flush();
-        return;
-    }
-    while (std::getline(input, line)) {
-        if (line.empty() || line == "\r") {
-            continue;
-        }
-        auto fields = split_csv_line(line);
-        if (fields.size() != tab.cols.size()) {
-            throw RMDBError("csv column count mismatch for table " + tab_name);
-        }
-        std::vector<Value> values;
-        values.reserve(fields.size());
-        for (size_t i = 0; i < fields.size(); ++i) {
-            values.push_back(csv_field_to_value(fields[i], tab.cols[i].type));
-        }
-        // Load is trusted bulk import before benchmark transactions.  Reusing the session
-        // txn here makes every row pay SI conflict checks, write-set bookkeeping and WAL.
-        // A log-free local context keeps heap/index correctness and flushes once below.
-        InsertExecutor executor(sm_manager, tab_name, std::move(values), &load_context);
-        executor.Next();
-    }
-    std::vector<std::string> changed_cols;
-    changed_cols.reserve(tab.cols.size());
-    for (const auto &col : tab.cols) {
-        changed_cols.push_back(col.name);
-    }
-    rmdb::bump_scan_cache_columns(tab_name, changed_cols);
-    fh->flush();
-    auto index_bindings = rmdb::bind_table_indexes(sm_manager, tab_name, tab);
-    for (const auto &binding : index_bindings) {
-        binding.ih->flush();
-    }
-}
-
-}  // namespace
-
 // 主要负责执行DDL语句
 void QlManager::run_mutli_query(std::shared_ptr<Plan> plan, Context *context){
+    if (context != nullptr && context->txn_ != nullptr && context->txn_->get_txn_mode()) {
+        throw RMDBError("DDL statements are not allowed inside an explicit transaction");
+    }
     if (auto x = std::dynamic_pointer_cast<DDLPlan>(plan)) {
         switch(x->tag) {
             case T_CreateTable:
             {
                 sm_manager_->create_table(x->tab_name_, x->cols_, context);
-                rmdb::invalidate_sql_template_caches();
                 break;
             }
             case T_DropTable:
             {
                 sm_manager_->drop_table(x->tab_name_, context);
-                rmdb::invalidate_sql_template_caches();
                 break;
             }
             case T_CreateIndex:
             {
                 sm_manager_->create_index(x->tab_name_, x->tab_col_names_, context);
-                rmdb::invalidate_sql_template_caches();
                 break;
             }
             case T_DropIndex:
             {
                 sm_manager_->drop_index(x->tab_name_, x->tab_col_names_, context);
-                rmdb::invalidate_sql_template_caches();
                 break;
             }
             default:
                 throw InternalError("Unexpected field type");
-                break;  
+                break;
         }
-    } else if (auto x = std::dynamic_pointer_cast<DMLPlan>(plan)) {
-        if (x->tag == T_Load) {
-            load_csv_rows(sm_manager_, x->tab_name_, x->file_name_, context);
-            rmdb::invalidate_sql_template_caches();
-            return;
-        }
-        throw InternalError("Unexpected dml type in run_mutli_query");
     }
 }
 
 // 执行help; show tables; desc table; begin; commit; abort;语句
 void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Context *context) {
-    if (auto set_isolation = std::dynamic_pointer_cast<SetTransactionIsolationPlan>(plan)) {
-        if (context != nullptr && context->session_isolation_ != nullptr) {
-            *(context->session_isolation_) = set_isolation->isolation_level_;
-        }
-        return;
-    }
     if (auto x = std::dynamic_pointer_cast<OtherPlan>(plan)) {
         switch(x->tag) {
             case T_Help:
@@ -435,82 +250,60 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
                 sm_manager_->show_tables(context);
                 break;
             }
-            case T_ShowIndex:
-            {
-                sm_manager_->show_index(x->tab_name_, context);
-                break;
-            }
             case T_DescTable:
             {
                 sm_manager_->desc_table(x->tab_name_, context);
                 break;
             }
-            case T_Transaction_begin:
+            case T_ShowIndex:
             {
-                // 显示开启一个事务
-                if (context->txn_ != nullptr) {
-                    context->txn_->set_txn_mode(true);
-                    *txn_id = context->txn_->get_transaction_id();
-                }
-                break;
-            }  
-            case T_Transaction_commit:
-            {
-                if (context->txn_ != nullptr) {
-                    txn_mgr_->commit(context->txn_, context->log_mgr_);
-                    context->txn_ = nullptr;
-                }
-                *txn_id = INVALID_TXN_ID;
-                break;
-            }    
-            case T_Transaction_rollback:
-            {
-                if (context->txn_ != nullptr) {
-                    txn_mgr_->abort(context->txn_, context->log_mgr_);
-                    context->txn_ = nullptr;
-                }
-                *txn_id = INVALID_TXN_ID;
-                break;
-            }    
-            case T_Transaction_abort:
-            {
-                if (context->txn_ != nullptr) {
-                    txn_mgr_->abort(context->txn_, context->log_mgr_);
-                    context->txn_ = nullptr;
-                }
-                *txn_id = INVALID_TXN_ID;
+                sm_manager_->show_index(x->tab_name_, context);
                 break;
             }
-            case T_Checkpoint:
+            case T_Transaction_begin:
             {
-                // 1. Capture active transactions and their latest log positions.
-                Transaction *exclude_txn =
-                    context != nullptr && context->txn_ != nullptr && !context->txn_->get_txn_mode() ? context->txn_ : nullptr;
-                auto active_txns = txn_mgr_->CollectActiveTxnCheckpointInfo(exclude_txn);
-                // 2. Flush pending log buffer
-                if (context->log_mgr_ != nullptr) {
-                    context->log_mgr_->flush_log_to_disk();
+                if (context->txn_->get_txn_mode()) {
+                    throw RMDBError("Nested transactions are not supported");
                 }
-                // 3. Write checkpoint log record
-                CheckpointLogRecord ckpt_record(active_txns);
-                lsn_t ckpt_lsn = INVALID_LSN;
-                if (context->log_mgr_ != nullptr) {
-                    ckpt_lsn = context->log_mgr_->add_log_to_buffer(&ckpt_record);
-                    context->log_mgr_->flush_log_to_disk();
-                }
-                // 4. Flush all data pages to disk
-                for (auto &entry : sm_manager_->fhs_) {
-                    entry.second->flush();
-                }
-                for (auto &entry : sm_manager_->ihs_) {
-                    entry.second->flush();
-                }
-                // 5. Write restart file with checkpoint LSN
-                if (ckpt_lsn != INVALID_LSN) {
-                    std::ofstream chkpt_file("db.chkpt", std::ios::trunc);
-                    chkpt_file << ckpt_lsn;
-                    chkpt_file.close();
-                }
+                txn_mgr_->start_explicit(context->txn_);
+                break;
+            }
+            case T_Transaction_commit:
+            {
+                context->txn_ = txn_mgr_->get_transaction(*txn_id);
+                txn_mgr_->commit(context->txn_, context->log_mgr_);
+                break;
+            }
+            case T_Transaction_rollback:
+            {
+                context->txn_ = txn_mgr_->get_transaction(*txn_id);
+                txn_mgr_->abort(context->txn_, context->log_mgr_);
+                break;
+            }
+            case T_Transaction_abort:
+            {
+                context->txn_ = txn_mgr_->get_transaction(*txn_id);
+                txn_mgr_->abort(context->txn_, context->log_mgr_);
+                break;
+            }
+            case T_StaticCheckpoint:
+            {
+                if (recovery_manager_ == nullptr) throw InternalError("Recovery manager is not configured");
+                recovery_manager_->create_static_checkpoint(
+                    context->txn_ == nullptr ? INVALID_TXN_ID
+                                             : context->txn_->get_transaction_id());
+                break;
+            }
+            case T_SetIsolationSnapshot:
+            {
+                if (context->session_isolation_ == nullptr) throw InternalError("Missing session isolation state");
+                *context->session_isolation_ = IsolationLevel::SNAPSHOT_ISOLATION;
+                break;
+            }
+            case T_SetIsolationSerializable:
+            {
+                if (context->session_isolation_ == nullptr) throw InternalError("Missing session isolation state");
+                *context->session_isolation_ = IsolationLevel::SERIALIZABLE;
                 break;
             }
             default:
@@ -518,13 +311,6 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
                 break;
         }
 
-    } else if(auto x = std::dynamic_pointer_cast<ExplainPlan>(plan)) {
-        for (auto &line : x->lines_) {
-            std::string out = line + "\n";
-            memcpy(context->data_send_ + *(context->offset_), out.c_str(), out.length());
-            *(context->offset_) += out.length();
-            rmdb::append_output_file(out);
-        }
     } else if(auto x = std::dynamic_pointer_cast<SetKnobPlan>(plan)) {
         switch (x->set_knob_type_)
         {
@@ -545,79 +331,80 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
 }
 
 // 执行select语句，select语句的输出除了需要返回客户端外，还需要写入output.txt文件中
-void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> sel_cols, 
-                            Context *context) {
-    executorTreeRoot->beginTuple();
-
-    std::vector<std::string> captions;
-    captions.reserve(sel_cols.size());
-    for (auto &sel_col : sel_cols) {
-        captions.push_back(sel_col.col_name);
+void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot,
+                            std::vector<std::string> captions, Context *context) {
+    // Materialize the complete result before emitting any output. SERIALIZABLE
+    // dependency checks may abort while a scan is opened or advanced; in that
+    // case the statement must return only "abort" instead of leaving a partial
+    // header/result in output.txt.
+    std::vector<std::vector<std::string>> result_rows;
+    for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
+        auto tuple = executorTreeRoot->Next();
+        std::vector<std::string> columns;
+        columns.reserve(executorTreeRoot->cols().size());
+        for (auto &col : executorTreeRoot->cols()) {
+            std::string col_str;
+            char *rec_buf = tuple->data + col.offset;
+            if (col.type == TYPE_INT) {
+                col_str = std::to_string(*(int *)rec_buf);
+            } else if (col.type == TYPE_FLOAT) {
+                col_str = std::to_string(*(float *)rec_buf);
+            } else if (col.type == TYPE_STRING) {
+                col_str = std::string((char *)rec_buf, col.len);
+                col_str.resize(strlen(col_str.c_str()));
+            }
+            columns.push_back(std::move(col_str));
+        }
+        result_rows.push_back(std::move(columns));
     }
 
-    // Print header into buffer
-    RecordPrinter rec_printer(sel_cols.size());
+    RecordPrinter rec_printer(captions.size());
     rec_printer.print_separator(context);
     rec_printer.print_record(captions, context);
     rec_printer.print_separator(context);
-    // print header into file
-    if (rmdb::is_output_file_enabled()) {
-        std::string output = "|";
-        for(size_t i = 0; i < captions.size(); ++i) {
-            output += " " + captions[i] + " |";
-        }
-        output += "\n";
-        rmdb::append_output_file(output);
-    }
 
-    std::vector<ColMeta> output_cols;
-    std::vector<size_t> output_col_idxs;
-    output_cols.reserve(sel_cols.size());
-    output_col_idxs.reserve(sel_cols.size());
-    const auto &root_cols = executorTreeRoot->cols();
-    for (const auto &sel_col : sel_cols) {
-        auto pos = executorTreeRoot->get_col(root_cols, sel_col);
-        output_cols.push_back(*pos);
-        output_col_idxs.push_back(static_cast<size_t>(pos - root_cols.begin()));
-        const auto &col = output_cols.back();
-        if (col.offset < 0 || col.len < 0 ||
-            static_cast<size_t>(col.offset + col.len) > executorTreeRoot->tupleLen()) {
-            throw RMDBError("invalid output column offset");
-        }
+    std::fstream outfile("output.txt", std::ios::out | std::ios::app);
+    outfile << "|";
+    for (const auto &caption : captions) {
+        outfile << " " << caption << " |";
     }
+    outfile << "\n";
 
-    // Print records
-    size_t num_rec = 0;
-    const bool write_output_file = rmdb::is_output_file_enabled();
-    // 执行query_plan
-    for (; !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
-        auto tuple = executorTreeRoot->ReadTupleView();
-        if (!tuple) {
-            break;
+    for (const auto &columns : result_rows) {
+        rec_printer.print_record(columns, context);
+        outfile << "|";
+        for (const auto &column : columns) {
+            outfile << " " << column << " |";
         }
-        std::string client_row;
-        client_row.reserve(output_cols.size() * (kOutputColumnWidth + 3) + 2);
-        std::string file_row;
-        if (write_output_file) {
-            file_row.reserve(output_cols.size() * (kOutputColumnWidth + 3) + 2);
-            file_row.push_back('|');
-        }
-        for (size_t i = 0; i < output_cols.size(); ++i) {
-            const auto &col = output_cols[i];
-            append_cell_to_rows(tuple.view->cell_at(col, output_col_idxs[i]), col, &client_row,
-                                write_output_file ? &file_row : nullptr);
-        }
-        append_client_row(&client_row, context);
-        if (write_output_file) {
-            file_row.push_back('\n');
-            rmdb::append_output_file(file_row);
-        }
-        num_rec++;
+        outfile << "\n";
     }
-    // Print footer into buffer
+    outfile.close();
+
     rec_printer.print_separator(context);
-    // Print record count into buffer
-    RecordPrinter::print_record_count(num_rec, context);
+    RecordPrinter::print_record_count(result_rows.size(), context);
+}
+
+
+void QlManager::explain_analyze(
+    std::unique_ptr<AbstractExecutor> executorTreeRoot,
+    const std::shared_ptr<Plan> &plan, Context *context) {
+    for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end();
+         executorTreeRoot->nextTuple()) {
+        (void)executorTreeRoot->Next();
+    }
+
+    std::ostringstream formatted;
+    format_plan_tree(plan, 0, formatted);
+    const std::string text = formatted.str();
+
+    if (context->data_send_ != nullptr && context->offset_ != nullptr) {
+        memcpy(context->data_send_ + *context->offset_, text.data(), text.size());
+        *context->offset_ += static_cast<int>(text.size());
+        context->data_send_[*context->offset_] = '\0';
+    }
+
+    std::fstream outfile("output.txt", std::ios::out | std::ios::app);
+    outfile << text;
 }
 
 // 执行DML语句
