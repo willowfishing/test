@@ -238,6 +238,11 @@ class UpdateExecutor : public AbstractExecutor {
                    read_value.type == lhs_col->type && read_value.len == lhs_col->len;
         };
         auto can_rebase_after_committed_write = [&](const Rid &rid) {
+        // SI requires strict write-write conflict detection - no rebasing
+        if (context_ != nullptr && context_->session_isolation_ != nullptr &&
+            *context_->session_isolation_ == IsolationLevel::SNAPSHOT_ISOLATION) {
+            return false;
+        }
             if (set_clauses_.empty()) {
                 return false;
             }
