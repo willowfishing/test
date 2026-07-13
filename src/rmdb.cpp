@@ -490,8 +490,14 @@ QCmd parse_qcmd(const char *raw_sql) {
     if (stmt == "set output_file off") {
         return QCmd::DisableOutput;
     }
-    if (false) { (void)0; /* skip set transaction snapshot quick path */ }
-    if (false) { (void)0; /* skip set transaction serializable quick path */ }
+    if (stmt == "set transaction isolation level snapshot" ||
+        stmt == "set transaction isolation level snapshot isolation") {
+        return QCmd::UseSnapshotIso;
+    } }
+    if (stmt == "set transaction isolation level serializable" ||
+        stmt == "set transaction isolation level serializable isolation") {
+        return QCmd::UseSerialIso;
+    } }
     return QCmd::NoMatch;
 }
 
