@@ -133,9 +133,13 @@ void RecoveryManager::redo() {
 
         auto& fh = sm_manager_->fhs_.at(rec.table_name_);
 
-        // Verify page exists in the file
+        // Verify page exists and slot is valid
         if (rec.rid_.page_no <= RM_FILE_HDR_PAGE ||
             rec.rid_.page_no >= fh->get_file_hdr().num_pages) {
+            continue;
+        }
+        if (rec.rid_.slot_no < 0 ||
+            static_cast<unsigned>(rec.rid_.slot_no) >= static_cast<unsigned>(fh->get_file_hdr().num_records_per_page)) {
             continue;
         }
 

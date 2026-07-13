@@ -64,3 +64,7 @@ Break from Server Listen Loop
  Try to close all client-connection.
  DB has been closed.
 Server shuts down.
+Maybe the client has closed
+Maybe the client has closed
+Terminating current client_connection...
+Terminating current client_connection...

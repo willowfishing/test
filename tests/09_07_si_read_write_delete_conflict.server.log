@@ -74,10 +74,10 @@ The Server receive Crtl+C, will been closed
 Break from Server Listen Loop
  Try to close all client-connection.
 Maybe the client has closed
+Terminating current client_connection...Maybe the client has closed
 Terminating current client_connection...
-Maybe the client has closed
-Terminating current client_connection...
-Maybe the client has closed
-Terminating current client_connection...
+
  DB has been closed.
 Server shuts down.
+Maybe the client has closed
+Terminating current client_connection...
