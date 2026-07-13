@@ -133,6 +133,12 @@ void RecoveryManager::redo() {
 
         auto& fh = sm_manager_->fhs_.at(rec.table_name_);
 
+        // Verify page exists in the file
+        if (rec.rid_.page_no <= RM_FILE_HDR_PAGE ||
+            rec.rid_.page_no >= fh->get_file_hdr().num_pages) {
+            continue;
+        }
+
         // Fetch the page to check its LSN
         RmPageHandle ph = fh->fetch_page_handle(rec.rid_.page_no);
 

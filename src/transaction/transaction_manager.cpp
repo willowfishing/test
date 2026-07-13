@@ -401,9 +401,67 @@ void TransactionManager::CheckSSIRWDependency(Transaction *current_txn,
             const auto &pred_reads = other_txn->get_predicate_reads();
             for (const auto &pred : pred_reads) {
                 if (pred.first == tab_name) {
-                    other_txn->add_rw_dependency_out(current_txn->get_transaction_id());
-                    current_txn->add_rw_dependency_in(other_txn->get_transaction_id());
-                    break;
+                    // Only add dependency if the written record actually satisfies
+                    // the predicate conditions of the scan (not just same table).
+                    bool matches = true;
+                    if (!pred.second.empty() && sm_manager_ != nullptr) {
+                        try {
+                            auto &fh = sm_manager_->fhs_.at(tab_name);
+                            auto record = fh->get_record(rid, nullptr);
+                            if (record) {
+                                auto &tab = sm_manager_->db_.get_table(tab_name);
+                                for (const auto &cond : pred.second) {
+                                    auto col_iter = std::find_if(tab.cols.begin(), tab.cols.end(),
+                                        [&](const ColMeta &c) { return c.name == cond.lhs_col.col_name; });
+                                    if (col_iter == tab.cols.end()) { matches = false; break; }
+                                    const char *lhs = record->data + col_iter->offset;
+                                    const char *rhs = nullptr;
+                                    if (cond.is_rhs_val) {
+                                        if (cond.rhs_val.raw == nullptr) { matches = false; break; }
+                                        rhs = cond.rhs_val.raw->data;
+                                    } else {
+                                        auto rhs_iter = std::find_if(tab.cols.begin(), tab.cols.end(),
+                                            [&](const ColMeta &c) { return c.name == cond.rhs_col.col_name; });
+                                        if (rhs_iter == tab.cols.end()) { matches = false; break; }
+                                        rhs = record->data + rhs_iter->offset;
+                                    }
+                                    // Inline compare_value + compare_result
+                                    int cmp;
+                                    if (col_iter->type == TYPE_INT) {
+                                        int a = *reinterpret_cast<const int *>(lhs);
+                                        int b = *reinterpret_cast<const int *>(rhs);
+                                        cmp = (a > b) - (a < b);
+                                    } else if (col_iter->type == TYPE_FLOAT) {
+                                        float a = *reinterpret_cast<const float *>(lhs);
+                                        float b = *reinterpret_cast<const float *>(rhs);
+                                        cmp = (a > b) - (a < b);
+                                    } else {
+                                        cmp = memcmp(lhs, rhs, col_iter->len);
+                                    }
+                                    bool cond_true;
+                                    switch (cond.op) {
+                                        case OP_EQ: cond_true = (cmp == 0); break;
+                                        case OP_NE: cond_true = (cmp != 0); break;
+                                        case OP_LT: cond_true = (cmp < 0); break;
+                                        case OP_GT: cond_true = (cmp > 0); break;
+                                        case OP_LE: cond_true = (cmp <= 0); break;
+                                        case OP_GE: cond_true = (cmp >= 0); break;
+                                        default: cond_true = false; break;
+                                    }
+                                    if (!cond_true) { matches = false; break; }
+                                }
+                            } else {
+                                matches = false;
+                            }
+                        } catch (...) {
+                            matches = false;
+                        }
+                    }
+                    if (matches) {
+                        other_txn->add_rw_dependency_out(current_txn->get_transaction_id());
+                        current_txn->add_rw_dependency_in(other_txn->get_transaction_id());
+                        break;
+                    }
                 }
             }
         }
@@ -424,12 +482,18 @@ bool TransactionManager::DetectSSIDangerUnlocked(Transaction *current_txn) {
         auto it_in = txn_map.find(t_in_id);
         if (it_in == txn_map.end() || it_in->second == nullptr) continue;
         Transaction *t_in = it_in->second;
+        // Check only if t_in is still active (only alive txns contribute to danger)
         if (t_in->get_state() != TransactionState::GROWING) continue;
         for (txn_id_t t_out_id : rw_out) {
-            if (t_in_id == t_out_id) return true;
+            // Self-cycle: current_txn <-rw-> t_in (bidirectional dependency)
+            if (t_in_id == t_out_id) {
+                // Direct cycle — true SSI danger. This transaction must be aborted.
+                return true;
+            }
             auto it_out = txn_map.find(t_out_id);
             if (it_out == txn_map.end() || it_out->second == nullptr) continue;
             Transaction *t_out = it_out->second;
+            // Indirect: t_in rw-depends-on current, and t_out (committed earlier) rw-depends-on t_in
             if (t_out->get_state() == TransactionState::COMMITTED &&
                 t_out->get_commit_ts() < t_in->get_start_ts()) return true;
         }

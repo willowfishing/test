@@ -68,6 +68,14 @@ class SeqScanExecutor : public AbstractExecutor {
             snapshot_cursor_ = 0;
             while (snapshot_cursor_ < snapshot_records_.size()) {
                 rid_ = snapshot_records_[snapshot_cursor_].first;
+
+                // SSI: check for invisible writes from other active SER txns
+                if (context_->txn_mgr_ != nullptr &&
+                    context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+                    context_->txn_mgr_->CheckSSIInvisibleWrite(context_->txn_, tab_name_, rid_,
+                                                              snapshot_records_[snapshot_cursor_].second);
+                }
+
                 if (eval_conds(cols_, &snapshot_records_[snapshot_cursor_].second, fed_conds_)) {
                     if (context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
                         context_->txn_->add_read_record(tab_name_, rid_);
@@ -83,6 +91,15 @@ class SeqScanExecutor : public AbstractExecutor {
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
             auto rec = fh_->get_record(rid_, context_);
+
+            // SSI: check for invisible writes from other active SER txns
+            // This establishes rw-dependency from the reader to any writer
+            // whose write is visible but not committed.
+            if (context_ != nullptr && context_->txn_ != nullptr && context_->txn_mgr_ != nullptr &&
+                context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+                context_->txn_mgr_->CheckSSIInvisibleWrite(context_->txn_, tab_name_, rid_, *rec);
+            }
+
             if (eval_conds(cols_, rec.get(), fed_conds_)) {
                 if (context_ != nullptr && context_->txn_ != nullptr &&
                     context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
@@ -99,6 +116,14 @@ class SeqScanExecutor : public AbstractExecutor {
             if (snapshot_cursor_ < snapshot_records_.size()) snapshot_cursor_++;
             while (snapshot_cursor_ < snapshot_records_.size()) {
                 rid_ = snapshot_records_[snapshot_cursor_].first;
+
+                // SSI: check for invisible writes
+                if (context_->txn_mgr_ != nullptr &&
+                    context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+                    context_->txn_mgr_->CheckSSIInvisibleWrite(context_->txn_, tab_name_, rid_,
+                                                              snapshot_records_[snapshot_cursor_].second);
+                }
+
                 if (eval_conds(cols_, &snapshot_records_[snapshot_cursor_].second, fed_conds_)) {
                     if (context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
                         context_->txn_->add_read_record(tab_name_, rid_);
@@ -114,6 +139,13 @@ class SeqScanExecutor : public AbstractExecutor {
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
             auto rec = fh_->get_record(rid_, context_);
+
+            // SSI: check for invisible writes
+            if (context_ != nullptr && context_->txn_ != nullptr && context_->txn_mgr_ != nullptr &&
+                context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+                context_->txn_mgr_->CheckSSIInvisibleWrite(context_->txn_, tab_name_, rid_, *rec);
+            }
+
             if (eval_conds(cols_, rec.get(), fed_conds_)) {
                 if (context_ != nullptr && context_->txn_ != nullptr &&
                     context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {

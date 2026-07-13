@@ -148,6 +148,8 @@ void *client_handler(void *sock_fd) {
                     std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context);
                     portal->run(portalStmt, ql_manager.get(), &txn_id, context);
                     portal->drop();
+                    // Sync session isolation level from context (may have been changed by SET TRANSACTION)
+                    session_isolation_level = context->get_isolation_level();
                 } catch (TransactionAbortException &e) {
                     // Sync session isolation level back from context
                     session_isolation_level = context->get_isolation_level();
@@ -167,6 +169,9 @@ void *client_handler(void *sock_fd) {
                     outfile << str;
                     outfile.close();
                 } catch (RMDBError &e) {
+                    // Sync session isolation level back from context
+                    session_isolation_level = context->get_isolation_level();
+
                     // 遇到异常，需要打印failure到output.txt文件中，并发异常信息返回给客户端
                     std::cerr << e.what() << std::endl;
 

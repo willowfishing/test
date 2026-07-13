@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm.h"
+#include "recovery/log_manager.h"
 
 class InsertExecutor : public AbstractExecutor {
    private:
@@ -67,6 +68,16 @@ class InsertExecutor : public AbstractExecutor {
         if (context_ != nullptr && context_->txn_ != nullptr) {
             context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, rid_));
             context_->txn_->upsert_snapshot_record(tab_name_, rid_, rec);
+
+            // WAL: log INSERT operation
+            if (context_->log_mgr_ != nullptr) {
+                auto *insert_log = new InsertLogRecord(
+                    context_->txn_->get_transaction_id(), rec, rid_, tab_name_);
+                insert_log->prev_lsn_ = context_->txn_->get_prev_lsn();
+                lsn_t lsn = context_->log_mgr_->add_log_to_buffer(insert_log);
+                context_->txn_->set_prev_lsn(lsn);
+                delete insert_log;
+            }
 
             // SSI: check rw-dependency for SERIALIZABLE
             if (context_->txn_mgr_ != nullptr &&
